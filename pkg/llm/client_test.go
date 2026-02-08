@@ -136,3 +136,26 @@ func TestBuildPrompt_MultiHunkIncludesAllResolutionIDs(t *testing.T) {
 		t.Fatalf("prompt missing resolution id 1 placeholder: %s", prompt)
 	}
 }
+
+func TestBuildPrompt_CherryPickIncludesPriorityInstruction(t *testing.T) {
+	req := &MergeRequest{
+		FileName:  "src/common.rs",
+		Language:  "rust",
+		Operation: "cherry-pick",
+		Hunks: []core.Hunk{
+			{StartLine: 1, EndLine: 3, Current: "A", Incoming: "B"},
+		},
+	}
+
+	prompt, err := BuildPrompt(req)
+	if err != nil {
+		t.Fatalf("BuildPrompt() error = %v", err)
+	}
+
+	if !strings.Contains(prompt, "Git operation: cherry-pick") {
+		t.Fatalf("prompt missing operation header: %s", prompt)
+	}
+	if !strings.Contains(prompt, "CHERRY-PICK PRIORITY") {
+		t.Fatalf("prompt missing cherry-pick priority instruction: %s", prompt)
+	}
+}

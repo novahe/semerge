@@ -38,6 +38,7 @@ type Provider interface {
 type MergeRequest struct {
 	FileName          string        `json:"file_name"`
 	Language          string        `json:"language"`
+	Operation         string        `json:"operation,omitempty"`
 	Hunks             []core.Hunk   `json:"hunks"`
 	Context           *core.Context `json:"context"`
 	Config            *LLMConfig    `json:"config"`
@@ -166,10 +167,12 @@ func (c *ClaudeClient) Resolve(ctx context.Context, request *MergeRequest) (*cor
 	}
 
 	// Create request
+	temperature := float32(0)
 	req := anthropic.MessagesRequest{
-		Model:     c.model,
-		MaxTokens: 8192,
-		Messages:  messages,
+		Model:       c.model,
+		MaxTokens:   8192,
+		Messages:    messages,
+		Temperature: &temperature,
 	}
 
 	// Call Claude API
@@ -287,6 +290,7 @@ You are an expert code merge conflict resolver. Analyze the following merge conf
 
 File: {{.FileName}}
 Language: {{.Language}}
+{{if .Operation}}Git operation: {{.Operation}}{{end}}
 
 {{if .Context}}
 === Code Context ===
@@ -354,6 +358,8 @@ You MUST fix the verification failures and return a corrected resolution for the
 4. IMPORTANT: When there are naming conflicts (e.g., variable names, function names), prefer the CURRENT branch's naming over the INCOMING branch
 5. Preserve behavior from both branches; do not remove critical assignments, validations, or state updates unless truly contradictory
 6. Prefer minimal, compositional merges: keep existing statements and ordering when possible; avoid inventing new conditions or side effects not present in either branch
+{{if eq .Operation "cherry-pick"}}6.1 CHERRY-PICK PRIORITY: prioritize preserving INCOMING patch intent. Do not silently keep CURRENT unchanged when INCOMING introduces behavior changes.
+{{end}}
 7. CRITICAL: Return ALL resolutions using XML tags with conflict IDs:
    - Format: <resolution id="0">...</resolution>
    - Return one <resolution id="N"> block for each conflict ID above

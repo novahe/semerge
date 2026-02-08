@@ -149,9 +149,25 @@ Run `make verify` before `git commit` to catch static issues early.
 
 ### E2E Tests
 
+Before running E2E tests, set the Anthropic-compatible environment variables (required by this project's E2E flow):
+
+```bash
+export ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export ANTHROPIC_API_KEY=<YOUR_DASHSCOPE_KEY>
+export ANTHROPIC_MODEL=qwen3-coder-plus
+```
+
+Or using your current values directly:
+
+```bash
+export ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export ANTHROPIC_API_KEY=sk-9a0d96d201024209bab23ae06716dcb5
+export ANTHROPIC_MODEL=qwen3-coder-plus
+```
+
 ```bash
 # Run all E2E tests
-make e2e
+make e2e-test
 
 # Run specific language tests
 make e2e-test TEST=go

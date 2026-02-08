@@ -75,6 +75,22 @@ corpus/
 
 ## Running Tests
 
+Before running E2E tests, set required Anthropic-compatible environment variables:
+
+```bash
+export ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export ANTHROPIC_API_KEY=<YOUR_DASHSCOPE_KEY>
+export ANTHROPIC_MODEL=qwen3-coder-plus
+```
+
+Or using your current values directly:
+
+```bash
+export ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export ANTHROPIC_API_KEY=sk-9a0d96d201024209bab23ae06716dcb5
+export ANTHROPIC_MODEL=qwen3-coder-plus
+```
+
 ```bash
 # Run all
 make e2e-test
