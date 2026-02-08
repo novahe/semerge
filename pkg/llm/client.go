@@ -35,11 +35,14 @@ type Provider interface {
 
 // MergeRequest contains all information needed for LLM merge resolution
 type MergeRequest struct {
-	FileName string        `json:"file_name"`
-	Language string        `json:"language"`
-	Hunks    []core.Hunk   `json:"hunks"`
-	Context  *core.Context `json:"context"`
-	Config   *LLMConfig    `json:"config"`
+	FileName          string        `json:"file_name"`
+	Language          string        `json:"language"`
+	Hunks             []core.Hunk   `json:"hunks"`
+	Context           *core.Context `json:"context"`
+	Config            *LLMConfig    `json:"config"`
+	Attempt           int           `json:"attempt,omitempty"`
+	RetryFeedback     string        `json:"retry_feedback,omitempty"`
+	PreviousCandidate string        `json:"previous_candidate,omitempty"`
 }
 
 // LLMConfig represents LLM configuration
@@ -115,8 +118,9 @@ func NewClaudeClient(config *LLMConfig) (*ClaudeClient, error) {
 	// Create client with optional base URL
 	var client *anthropic.Client
 	if config.BaseURL != "" {
+		baseURL := normalizeAnthropicBaseURL(config.BaseURL)
 		client = anthropic.NewClient(apiKey,
-			anthropic.WithBaseURL(config.BaseURL),
+			anthropic.WithBaseURL(baseURL),
 		)
 	} else {
 		client = anthropic.NewClient(apiKey)
@@ -126,6 +130,20 @@ func NewClaudeClient(config *LLMConfig) (*ClaudeClient, error) {
 		client: client,
 		model:  model,
 	}, nil
+}
+
+func normalizeAnthropicBaseURL(raw string) string {
+	baseURL := strings.TrimSpace(raw)
+	baseURL = strings.TrimRight(baseURL, "/")
+	if baseURL == "" {
+		return ""
+	}
+
+	if strings.HasSuffix(baseURL, "/v1") {
+		return baseURL
+	}
+
+	return baseURL + "/v1"
 }
 
 // Resolve resolves conflicts using Claude API
@@ -296,20 +314,17 @@ Code Skeleton:
 {{- end}}
 
 === Conflicts to Resolve ===
-{{range .Hunks}}
---- Conflict at lines {{.StartLine}}-{{.EndLine}} ---
+{{range $i, $h := .Hunks}}
+--- Conflict ID: {{$i}} (lines {{$h.StartLine}}-{{$h.EndLine}}) ---
 
-Ancestor (base version):
-{{.Ancestor}}
-
-Current (your changes):
-{{.Current}}
-
-Incoming (their changes):
-{{.Incoming}}
+<<<<<<< CURRENT
+{{$h.Current}}
+=======
+{{$h.Incoming}}
+>>>>>>> INCOMING
 
 Context around conflict:
-{{range .ContextLines}}  {{.}}
+{{range $h.ContextLines}}  {{.}}
 {{end}}
 
 ---
@@ -317,15 +332,35 @@ Context around conflict:
 
 === Instructions ===
 
+{{if gt .Attempt 1}}
+=== Previous Attempt Failed Verification ===
+Attempt: {{.Attempt}}
+
+{{if .RetryFeedback}}Verification feedback:
+{{.RetryFeedback}}
+{{end}}
+
+{{if .PreviousCandidate}}Previous failed candidate:
+{{.PreviousCandidate}}
+{{end}}
+
+You MUST fix the verification failures and return a corrected resolution for the same conflict.
+{{end}}
+
 1. Analyze the semantic intent of both branches
 2. Identify if changes are compatible or conflicting
 3. Provide a merged solution that preserves both intents
 4. IMPORTANT: When there are naming conflicts (e.g., variable names, function names), prefer the CURRENT branch's naming over the INCOMING branch
-5. CRITICAL: Return ONLY the resolved conflict zone code in the <resolution> tag, NOT the entire file
-   - Just the merged function/class/block with conflicts resolved
+5. Preserve behavior from both branches; do not remove critical assignments, validations, or state updates unless truly contradictory
+6. Prefer minimal, compositional merges: keep existing statements and ordering when possible; avoid inventing new conditions or side effects not present in either branch
+7. CRITICAL: Return ALL resolutions using XML tags with conflict IDs:
+   - Format: <resolution id="0">...</resolution>
+   - Return one <resolution id="N"> block for each conflict ID above
+   - Do NOT return the whole file
    - Do NOT include package declarations, imports, or unrelated code
+   - Do NOT include conflict markers like <<<<<<<, =======, >>>>>>>
 
-6. Return your response in the following XML format:
+8. Return your response in the following XML format:
 
 <analysis>
 Your detailed analysis of the conflict, including:
@@ -334,8 +369,8 @@ Your detailed analysis of the conflict, including:
 - Any dependencies or relationships affected
 </analysis>
 
-<resolution>
-Return ONLY the resolved code for the conflict region.
+<resolution id="0">
+Return ONLY the resolved code for that conflict region.
 Do NOT include package/imports/other functions.
 </resolution>
 
@@ -364,33 +399,69 @@ Step-by-step reasoning of your merge decision
 
 // ParseLLMResponse parses the LLM response into a MergeResult
 func ParseLLMResponse(text string) (*core.MergeResult, error) {
-	// Extract XML tags
-	resolution := extractXMLTag(text, "resolution")
-
-	if resolution == "" {
+	re := regexp.MustCompile(`(?s)<resolution\s+id="(\d+)">(.*?)</resolution>`)
+	matches := re.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
 		return &core.MergeResult{
 			Success:   false,
-			Errors:    []string{"No resolution provided by LLM"},
+			Errors:    []string{"No resolution blocks with id provided by LLM"},
 			Timestamp: time.Now(),
 		}, nil
 	}
 
+	resolvedMap := make(map[int]string, len(matches))
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+
+		var id int
+		if _, err := fmt.Sscanf(match[1], "%d", &id); err != nil {
+			return &core.MergeResult{
+				Success:   false,
+				Errors:    []string{fmt.Sprintf("Invalid resolution id: %q", match[1])},
+				Timestamp: time.Now(),
+			}, nil
+		}
+
+		if _, exists := resolvedMap[id]; exists {
+			return &core.MergeResult{
+				Success:   false,
+				Errors:    []string{fmt.Sprintf("Duplicate resolution id: %d", id)},
+				Timestamp: time.Now(),
+			}, nil
+		}
+
+		content := trimOuterNewlines(match[2])
+		if strings.TrimSpace(content) == "" {
+			return &core.MergeResult{
+				Success:   false,
+				Errors:    []string{fmt.Sprintf("Empty resolution for id: %d", id)},
+				Timestamp: time.Now(),
+			}, nil
+		}
+
+		resolvedMap[id] = content
+	}
+
 	return &core.MergeResult{
-		Success:   true,
-		Content:   resolution,
-		Timestamp: time.Now(),
+		Success:     true,
+		ResolvedMap: resolvedMap,
+		Timestamp:   time.Now(),
 	}, nil
 }
 
-// extractXMLTag extracts content from an XML tag
-func extractXMLTag(text, tag string) string {
-	pattern := fmt.Sprintf("<%s>(.*?)</%s>", tag, tag)
-	re := regexp.MustCompile("(?s)" + pattern) // (?s) enables dotall mode for multiline
+func extractFencedCodeBlock(text string) string {
+	re := regexp.MustCompile("(?s)```(?:[a-zA-Z0-9_+-]+)?\\n(.*?)```")
 	matches := re.FindStringSubmatch(text)
 	if len(matches) > 1 {
-		return strings.TrimSpace(matches[1])
+		return trimOuterNewlines(matches[1])
 	}
 	return ""
+}
+
+func trimOuterNewlines(text string) string {
+	return strings.Trim(text, "\n\r")
 }
 
 // isDebugEnabled checks if SEMERGE_DEBUG environment variable is set

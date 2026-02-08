@@ -4,117 +4,88 @@ End-to-end tests for semerge using a corpus-based approach.
 
 ## Directory Structure
 
-```
+```text
 e2e/
-├── runner/           # Test executor (Go test code)
-│   └── e2e_test.go  # Main test file
-├── corpus/          # Test corpus (Git repository)
-│   ├── .git/        # Git repository
-│   └── go/          # Language-specific test cases
-│       └── rename_struct/
-│           ├── base/           # Base code files
-│           │   └── main.go
-│           ├── patches/        # Patch files that create conflicts
-│           │   ├── remote-add-field.patch
-│           │   └── local-refactor.patch
-│           └── expect/         # Expected resolved output
-│               └── main.go
+├── runner/                # Test executor (Go test code)
+│   ├── .semerge.yaml      # Default semerge config for E2E
+│   └── e2e_test.go        # Main test file
+├── corpus/                # Test corpus (Git repository)
+│   └── go/
+│       └── <case>/
+│           ├── base/                  # Base code files
+│           ├── patches/               # Conflict-generating patches
+│           │   ├── remote-*.patch
+│           │   └── local-*.patch
+│           ├── .semerge.yaml          # Optional case-level config (higher priority)
+│           ├── .expect_resolve_failure# Optional: mark case expects resolve failure
+│           └── expect/                # Optional: expected resolved output
 ├── go.mod
 └── README.md
 ```
 
 ## How It Works
 
-1. **Test Discovery**: The runner automatically discovers all test cases in `corpus/*/`
-
-2. **Repository Cloning**: For each test, the corpus Git repository is cloned to a temporary directory
-
-3. **Branch Creation**: Two branches are created to simulate conflicting changes:
-   - `remote` branch: Applies `remote-*.patch`
-   - `local` branch: Applies `local-*.patch`
-
-4. **Merge Conflict**: The `remote` branch is merged into `local`, creating merge conflicts
-
-5. **Resolution**: Semerge is used to resolve the conflicts
-
-6. **Verification**: The resolved output is compared against the expected output in `expect/`
+1. **Test discovery**: Runner discovers cases in `corpus/<lang>/`.
+2. **Repository cloning**: Corpus repo is cloned into a temp directory.
+3. **Patch application**: Applies `remote-*.patch` and `local-*.patch` on separate branches.
+4. **Conflict creation**: Merges `remote` into `local` to create conflict files.
+5. **Resolution**: Calls `semerge resolve` per conflicted file.
+6. **Verification strategy**:
+   - If `expect/` exists for conflicted files: compare text first.
+   - If text mismatches: run syntax/behavior verification fallback.
+   - If no `expect/` exists: directly run syntax/behavior verification.
+7. **Expected-failure cases**:
+   - If `.expect_resolve_failure` exists, runner expects `semerge resolve` to fail and validates failure logs.
 
 ## Adding New Test Cases
 
-Create a new test case directory under `corpus/<lang>/`:
+Create a case under `corpus/<lang>/<test_name>/`:
 
-```
+```text
 corpus/
 └── <lang>/
     └── <test_name>/
-        ├── base/           # Starting code state
-        │   └── main.go
-        ├── patches/        # Patches that create conflict
+        ├── base/
+        ├── patches/
         │   ├── remote-<change>.patch
         │   └── local-<change>.patch
-        └── expect/         # Expected result after merge
-            └── main.go
+        ├── .semerge.yaml            # optional
+        ├── .expect_resolve_failure  # optional
+        └── expect/                  # optional
 ```
 
-### Test Case Structure
+### Notes
 
-- **base/**: Contains the original source files before any changes
-- **patches/**: Contains patch files prefixed by branch name
-  - `remote-*.patch`: Applied to `remote` branch
-  - `local-*.patch`: Applied to `local` branch
-  - When merged, these patches should create conflicts
-- **expect/**: Contains the expected resolved files
-
-### Creating Patches
-
-Use `git diff` to generate patches:
-
-```bash
-# Initialize a test git repo
-cd /tmp/test && git init
-git add base/main.go
-git commit -m "base"
-
-# Create remote branch change
-git checkout -b remote
-# ... edit file ...
-git diff master > remote-change.patch
-
-# Create local branch change
-git checkout master
-git checkout -b local
-# ... edit file differently ...
-git diff master > local-change.patch
-```
+- `base/`: Original source files before changes.
+- `base/*_test.go` (recommended): Unit tests used by E2E behavior verification.
+- `patches/`: Patch files prefixed by branch name.
+- `expect/` (optional): Golden outputs when strict text comparison is needed.
+- No `expect/`: Case is validated by syntax/behavior checks only.
+- `.semerge.yaml` (optional): Overrides runner default config for this case.
+- `.expect_resolve_failure` (optional): Marks negative cases where resolve should fail.
 
 ## Running Tests
 
 ```bash
-# Run all tests
+# Run all
 make e2e-test
 
-# Run specific language tests
+# Run language subset
 make e2e-test TEST=go
 
-# Run specific test case
-make e2e-test TEST=go/rename_struct
+# Run single case
+make e2e-test TEST=go/retry_verifier_once
 
-# Run with debug logging (shows LLM prompts/responses)
-DEBUG=1 make e2e-test TEST=go/rename_struct
+# Debug mode (verbose logs + keep temp repos)
+DEBUG=1 make e2e-test TEST=go/retry_verifier_once
 ```
-
-## Debug Mode
-
-Setting `DEBUG=1` enables verbose logging:
-- Shows created temporary directories (not cleaned up)
-- Displays ancestor/current/incoming file contents
-- Shows full LLM prompts and responses
-- Preserves test artifacts for inspection
 
 ## Implementation Details
 
-- **Go-git Library**: All Git operations use the `go-git/v5` library
-- **Parallel Execution**: Tests run in parallel using `t.Parallel()`
-- **Isolation**: Each test runs in a cloned repository to ensure isolation
-- **Conflict Detection**: Uses Git index stages (1=ancestor, 2=current, 3=incoming)
-- **Branch-based Patches**: Patch files are named with branch prefix (`remote-*` or `local-*`)
+- Uses `go-git/v5` for Git operations.
+- Runs tests in parallel with `t.Parallel()`.
+- Each case runs in an isolated cloned repo.
+- Conflict detection is based on Git index stage entries (1/2/3).
+- Supports case-level semerge config override.
+- Default runner config enables verifier with Go syntax-level check: `gofmt -e {file}`.
+- Supports positive and expected-failure E2E scenarios.
