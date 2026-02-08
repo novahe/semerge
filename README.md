@@ -139,6 +139,14 @@ git:
 make test
 ```
 
+### Static Checks (Before Commit)
+
+```bash
+make verify
+```
+
+Run `make verify` before `git commit` to catch static issues early.
+
 ### E2E Tests
 
 ```bash
@@ -179,6 +187,13 @@ git cherry-pick --continue
 ## Contributing
 
 Contributions are welcome! Please see `e2e/README.md` for test case contribution guidelines.
+
+Suggested local pre-commit routine:
+
+```bash
+make verify
+make test
+```
 
 ## License
 

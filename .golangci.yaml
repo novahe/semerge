@@ -1,0 +1,140 @@
+run:
+  timeout: 30m
+  relative-path-mode: gomod
+
+version: "2"
+
+formatters:
+  enable:
+    - gci
+  exclusions:
+    paths:
+      - third_party
+  settings:
+    gci:
+      sections:
+        - standard
+        - prefix(github.com/semerge/semerge)
+        - default
+      custom-order: true
+
+output:
+  formats:
+    text:
+      path: stderr
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  exclusions:
+    paths:
+      - third_party
+    rules:
+      - linters:
+          - gocritic
+        text: "ifElseChain: rewrite if-else to switch statement"
+      - linters:
+          - gocritic
+        text: "equalFold: consider replacing with !strings.EqualFold"
+      - linters:
+          - gocritic
+        text: "singleCaseSwitch: should rewrite switch statement to if statement"
+      - linters:
+          - revive
+          - staticcheck
+        text: comment on exported (method|function|type|const)|should have( a package)? comment|comment should be of the form|exported (.+) should have comment( \\(or a comment on this block\\))? or be unexported|package comment should be of the form \"(.+)...|comment on exported (.+) should be of the form \"(.+)...
+      - linters:
+          - unused
+        text: "func extractFencedCodeBlock is unused"
+        path: pkg/llm/client.go
+
+  default: none
+  enable:
+    - gocritic
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+    - unused
+
+  settings:
+    gocritic:
+      enabled-checks:
+        - boolExprSimplify
+        - equalFold
+      disabled-checks:
+        - appendAssign
+        - assignOp
+        - captLocal
+        - commentFormatting
+        - deprecatedComment
+        - elseif
+        - exitAfterDefer
+        - regexpMust
+        - sloppyLen
+        - typeSwitchVar
+        - underef
+        - unslice
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+    staticcheck:
+      checks:
+        - all
+        - -QF1001
+        - -QF1002
+        - -QF1003
+        - -QF1004
+        - -QF1006
+        - -QF1007
+        - -QF1008
+        - -QF1009
+        - -QF1011
+        - -QF1012
+        - -S1000
+        - -S1002
+        - -S1003
+        - -S1004
+        - -S1005
+        - -S1006
+        - -S1007
+        - -S1008
+        - -S1009
+        - -S1011
+        - -S1012
+        - -S1016
+        - -S1017
+        - -S1019
+        - -S1021
+        - -S1023
+        - -S1024
+        - -S1025
+        - -S1028
+        - -S1030
+        - -S1034
+        - -S1036
+        - -S1038
+        - -S1039
+        - -S1040
+        - -SA1006
+        - -SA1019
+        - -SA2002
+        - -SA4006
+        - -SA4011
+        - -ST1000
+        - -ST1001
+        - -ST1003
+        - -ST1005
+        - -ST1006
+        - -ST1008
+        - -ST1011
+        - -ST1012
+        - -ST1013
+        - -ST1016
+        - -ST1017
+        - -ST1020
+        - -ST1023

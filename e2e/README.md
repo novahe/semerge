@@ -39,6 +39,9 @@ e2e/
 
 ## Adding New Test Cases
 
+`e2e/corpus` is maintained as a separate Git repository (sub-repo).
+When adding or updating corpus cases, commit changes inside `e2e/corpus` first.
+
 Create a case under `corpus/<lang>/<test_name>/`:
 
 ```text
@@ -58,11 +61,17 @@ corpus/
 
 - `base/`: Original source files before changes.
 - `base/*_test.go` (recommended): Unit tests used by E2E behavior verification.
+- `base/verify.sh` (optional, Bash): custom behavior assertions executed after merge.
 - `patches/`: Patch files prefixed by branch name.
 - `expect/` (optional): Golden outputs when strict text comparison is needed.
 - No `expect/`: Case is validated by syntax/behavior checks only.
+- Bash behavior verification: runs `bash -n` on shell files; if `verify.sh` exists, executes it for functional assertions.
 - `.semerge.yaml` (optional): Overrides runner default config for this case.
 - `.expect_resolve_failure` (optional): Marks negative cases where resolve should fail.
+- Corpus contribution workflow:
+  1. Add/update files under `e2e/corpus/<lang>/<case>/`.
+  2. Commit in sub-repo: `git -C e2e/corpus add ... && git -C e2e/corpus commit -m "..."`.
+  3. In parent repo, commit the sub-repo pointer update.
 
 ## Running Tests
 

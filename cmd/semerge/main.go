@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"go/format"
-
-	"github.com/google/uuid"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +17,7 @@ import (
 	"github.com/semerge/semerge/pkg/hunk"
 	"github.com/semerge/semerge/pkg/llm"
 	"github.com/semerge/semerge/pkg/verifier"
+
 	"github.com/spf13/cobra"
 )
 
@@ -326,11 +325,10 @@ func buildConflictTrailers(repoDir string, model string, currentFile string, cur
 		return nil
 	}
 
-	sessionID := resolveSessionID()
-	return formatConflictTrailers(version, model, operation, ranked, truncated, sessionID)
+	return formatConflictTrailers(version, model, operation, ranked, truncated)
 }
 
-func formatConflictTrailers(ver string, model string, operation string, files []string, truncated bool, sessionID string) []string {
+func formatConflictTrailers(ver string, model string, operation string, files []string, truncated bool) []string {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		model = "unknown"
@@ -347,7 +345,6 @@ func formatConflictTrailers(ver string, model string, operation string, files []
 	return []string{
 		fmt.Sprintf("Conflict-resolved-by: semerge/%s@%s (%s)", ver, model, operation),
 		fmt.Sprintf("Conflict-files: %s", filesLine),
-		fmt.Sprintf("Conflict-context: x-session-id@%s", sessionID),
 	}
 }
 
@@ -538,20 +535,6 @@ func resolveGitDir(repoDir string) (string, error) {
 	}
 
 	return filepath.Join(repoDir, gitDir), nil
-}
-
-func resolveSessionID() string {
-	for _, key := range []string{"SEMERGE_SESSION_ID", "X_SESSION_ID", "X-SESSION-ID"} {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-
-	return generateSessionID()
-}
-
-func generateSessionID() string {
-	return uuid.NewString()
 }
 
 func fileExists(path string) bool {
@@ -1156,62 +1139,6 @@ func cleanupUpdateUserCounterLogic(content string) string {
 	block = strings.ReplaceAll(block, "\n\tuser.ID = s.userCount", "")
 
 	return content[:start] + block + content[end:]
-}
-
-func normalizeUserFileSemantics(content string) string {
-	if !strings.Contains(content, "func (u *User) Validate() error {") {
-		return content
-	}
-
-	phoneCheck := strings.Join([]string{
-		"\tif u.Phone == \"\" {",
-		"\t\treturn ErrEmptyPhone",
-		"\t}",
-	}, "\n")
-	lastNameCheck := strings.Join([]string{
-		"\tif u.LastName == \"\" {",
-		"\t\treturn ErrEmptyLastName",
-		"\t}",
-	}, "\n")
-
-	if strings.Contains(content, phoneCheck) && strings.Contains(content, lastNameCheck) {
-		phoneIdx := strings.Index(content, phoneCheck)
-		lastNameIdx := strings.Index(content, lastNameCheck)
-		if phoneIdx < lastNameIdx {
-			content = strings.Replace(content, phoneCheck+"\n\n"+lastNameCheck, lastNameCheck+"\n"+phoneCheck, 1)
-		}
-	}
-
-	fullNameSig := "func (u *User) FullName() string {"
-	contactSig := "func (u *User) GetContactInfo() string {"
-	fullNameIdx := strings.Index(content, fullNameSig)
-	contactIdx := strings.Index(content, contactSig)
-	if fullNameIdx != -1 && contactIdx != -1 && contactIdx < fullNameIdx {
-		contactBlock, contactStart, contactEnd := extractFunctionBlock(content, contactSig)
-		fullNameBlock, fullNameStart, fullNameEnd := extractFunctionBlock(content, fullNameSig)
-		if contactBlock != "" && fullNameBlock != "" && contactEnd <= fullNameStart {
-			content = content[:contactStart] + fullNameBlock + "\n\n" + contactBlock + content[fullNameEnd:]
-		}
-	}
-
-	if formatted, err := format.Source([]byte(content)); err == nil {
-		content = string(formatted)
-	}
-
-	return content
-}
-
-func extractFunctionBlock(content, sig string) (string, int, int) {
-	start := strings.Index(content, sig)
-	if start == -1 {
-		return "", -1, -1
-	}
-	end := strings.Index(content[start:], "\n}")
-	if end == -1 {
-		return "", -1, -1
-	}
-	end += start + 2
-	return content[start:end], start, end
 }
 
 func reorderServiceStructFields(content string) string {

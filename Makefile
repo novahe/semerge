@@ -1,4 +1,4 @@
-.PHONY: all build test e2e e2e-test clean install help
+.PHONY: all build test e2e e2e-test clean install golangci-lint verify help
 
 # Variables
 BINARY_NAME=semerge
@@ -6,6 +6,8 @@ BUILD_DIR=bin
 GO=go
 GOFLAGS=-v
 E2E_DIR=e2e/runner
+GOLANGCI_LINT_VERSION?=v2.1.6
+GOLANGCI_LINT=$(BUILD_DIR)/golangci-lint
 
 # Default target
 all: build
@@ -25,6 +27,23 @@ install:
 test:
 	@echo "Running unit tests..."
 	$(GO) test -v ./...
+
+## golangci-lint: Install golangci-lint into ./bin if needed
+golangci-lint:
+	@mkdir -p $(BUILD_DIR)
+	@if [ ! -x "$(GOLANGCI_LINT)" ]; then \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
+		GOBIN=$$(pwd)/$(BUILD_DIR) $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	else \
+		echo "Using existing $(GOLANGCI_LINT)"; \
+	fi
+
+## verify: Run static checks before commit
+verify: golangci-lint
+	@echo "Running static checks..."
+	$(GOLANGCI_LINT) run --config .golangci.yaml ./...
+	@echo "Checking formatters (import order/grouping)..."
+	$(GOLANGCI_LINT) fmt --config .golangci.yaml --diff
 
 ## e2e-test: Run E2E tests
 # Usage:
@@ -54,6 +73,7 @@ help:
 	@echo "  build                    Build the semerge binary"
 	@echo "  install                  Install semerge to \$$GOPATH/bin"
 	@echo "  test                     Run unit tests"
+	@echo "  verify                   Run static checks (golangci-lint)"
 	@echo "  e2e-test                 Run All E2E tests"
 	@echo "                             TEST=go/rename_struct  - Run specific test"
 	@echo "                             TEST=go                - Run all Go tests"
