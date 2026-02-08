@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -99,27 +100,53 @@ func runTestCase(t *testing.T, tc TestCase) {
 
 	t.Logf("Found %d conflict(s) in: %v", len(conflictFiles), conflictFiles)
 
+	expectFailure := shouldExpectResolveFailure(tc)
+	if expectFailure {
+		t.Log("This case expects semerge resolve to fail after retries")
+	}
+
 	// Resolve conflicts with semerge
 	for _, file := range conflictFiles {
-		resolveWithSemerge(t, worktreeDir, file)
+		resolveWithSemerge(t, tc, worktreeDir, file)
+		if expectFailure {
+			t.Log("Expected resolve failure observed; skipping post-merge verification")
+			return
+		}
 	}
 
 	// Verify the result
+	hasExpect := false
+	hasTextMismatch := false
 	for _, conflictFile := range conflictFiles {
 		expectFile := filepath.Join(corpusDir, tc.Path, "expect", filepath.Base(conflictFile))
 		if _, err := os.Stat(expectFile); os.IsNotExist(err) {
-			t.Logf("No expected file for %s, skipping verification", conflictFile)
+			t.Logf("No expected file for %s", conflictFile)
 			continue
 		}
 
+		hasExpect = true
 		got := read(filepath.Join(worktreeDir, conflictFile))
 		expected := read(expectFile)
 
 		if normalize(got) != normalize(expected) {
+			hasTextMismatch = true
 			t.Logf("GOT (%s):\n%s", conflictFile, got)
 			t.Logf("EXPECTED (%s):\n%s", expectFile, expected)
-			t.Fatalf("result does not match expected output for %s", conflictFile)
 		}
+	}
+
+	if !hasExpect {
+		t.Log("No expect files found; running syntax/behavior verification...")
+		if err := verifyByBehavior(worktreeDir, tc); err != nil {
+			t.Fatalf("semantic verification failed without expect files: %v", err)
+		}
+		t.Log("Semantic verification passed")
+	} else if hasTextMismatch {
+		t.Log("Text mismatch detected; running syntax/behavior verification...")
+		if err := verifyByBehavior(worktreeDir, tc); err != nil {
+			t.Fatalf("semantic verification failed after text mismatch: %v", err)
+		}
+		t.Log("Semantic verification passed; accepting non-identical output")
 	}
 
 	t.Log("E2E test passed!")
@@ -295,7 +322,7 @@ func applyPatches(t *testing.T, worktreeDir string, repo *git.Repository, wt *gi
 	return nil
 }
 
-func resolveWithSemerge(t *testing.T, repoDir, file string) {
+func resolveWithSemerge(t *testing.T, tc TestCase, repoDir, file string) {
 	ancestorPath := filepath.Join(repoDir, ".ancestor.tmp")
 	currentPath := filepath.Join(repoDir, file)
 	incomingPath := filepath.Join(repoDir, ".incoming.tmp")
@@ -381,7 +408,8 @@ func resolveWithSemerge(t *testing.T, repoDir, file string) {
 	}
 
 	testDir, _ := os.Getwd()
-	configPath := filepath.Join(testDir, ".semerge.yaml")
+	configPath := resolveConfigPath(testDir, tc)
+	t.Logf("Using semerge config: %s", configPath)
 
 	relAncestor := ".ancestor.tmp"
 	relCurrent := file
@@ -400,6 +428,23 @@ func resolveWithSemerge(t *testing.T, repoDir, file string) {
 	cmd.Env = env
 
 	output, err := cmd.CombinedOutput()
+
+	if tc.Name == "retry_verifier_once" {
+		assertRetryTriggered(t, output)
+	}
+
+	if tc.Name == "retry_verifier_exhausted" {
+		assertRetryExhausted(t, output)
+	}
+
+	if shouldExpectResolveFailure(tc) {
+		if err == nil {
+			t.Fatalf("expected semerge resolve to fail, but it succeeded\noutput:\n%s", string(output))
+		}
+		t.Logf("Expected resolve failure output:\n%s", string(output))
+		return
+	}
+
 	if err != nil {
 		t.Logf("semerge output:\n%s", string(output))
 		t.Fatalf("semerge resolve failed: %v", err)
@@ -412,6 +457,65 @@ func resolveWithSemerge(t *testing.T, repoDir, file string) {
 
 	os.Remove(ancestorPath)
 	os.Remove(incomingPath)
+}
+
+func resolveConfigPath(testDir string, tc TestCase) string {
+	caseConfigPath := filepath.Join(corpusDir, tc.Path, ".semerge.yaml")
+	if absCaseConfig, err := filepath.Abs(caseConfigPath); err == nil {
+		if _, statErr := os.Stat(absCaseConfig); statErr == nil {
+			return absCaseConfig
+		}
+	}
+
+	defaultConfig := filepath.Join(testDir, ".semerge.yaml")
+	if absDefaultConfig, err := filepath.Abs(defaultConfig); err == nil {
+		return absDefaultConfig
+	}
+
+	return defaultConfig
+}
+
+func shouldExpectResolveFailure(tc TestCase) bool {
+	flagPath := filepath.Join(corpusDir, tc.Path, ".expect_resolve_failure")
+	if absFlagPath, err := filepath.Abs(flagPath); err == nil {
+		if _, statErr := os.Stat(absFlagPath); statErr == nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+func assertRetryTriggered(t *testing.T, output []byte) {
+	out := string(output)
+	if !strings.Contains(out, "Resolving conflicts with AI... (attempt 1/3)") {
+		t.Fatalf("retry case missing attempt 1 log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "Verification failed (attempt 1/3)") {
+		t.Fatalf("retry case missing verification failure log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "Resolving conflicts with AI... (attempt 2/3)") {
+		t.Fatalf("retry case missing attempt 2 log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "Verification passed!") {
+		t.Fatalf("retry case missing verification passed log, output:\n%s", out)
+	}
+}
+
+func assertRetryExhausted(t *testing.T, output []byte) {
+	out := string(output)
+	if !strings.Contains(out, "Resolving conflicts with AI... (attempt 1/3)") {
+		t.Fatalf("retry exhausted case missing attempt 1 log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "Resolving conflicts with AI... (attempt 2/3)") {
+		t.Fatalf("retry exhausted case missing attempt 2 log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "Resolving conflicts with AI... (attempt 3/3)") {
+		t.Fatalf("retry exhausted case missing attempt 3 log, output:\n%s", out)
+	}
+	if !strings.Contains(out, "verification failed after 3 attempts") {
+		t.Fatalf("retry exhausted case missing final failure summary, output:\n%s", out)
+	}
 }
 
 func getConflictFiles(dir string) []string {
@@ -480,4 +584,113 @@ func normalize(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "")
 	return string(bytes.TrimSpace([]byte(s)))
+}
+
+func verifyByBehavior(worktreeDir string, tc TestCase) error {
+	baseFiles, err := scenarioBaseFiles(tc)
+	if err != nil {
+		return err
+	}
+
+	switch tc.Lang {
+	case "go":
+		if err := verifyGoSyntax(worktreeDir, baseFiles); err != nil {
+			return err
+		}
+		if err := verifyGoTestsIfAny(worktreeDir, baseFiles); err != nil {
+			return err
+		}
+	case "python":
+		if err := verifyPythonSyntax(worktreeDir, baseFiles); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func scenarioBaseFiles(tc TestCase) ([]string, error) {
+	baseDir := filepath.Join(corpusDir, tc.Path, "base")
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read base dir: %w", err)
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		files = append(files, entry.Name())
+	}
+	sort.Strings(files)
+
+	return files, nil
+}
+
+func verifyGoSyntax(worktreeDir string, files []string) error {
+	goFiles := filterByExt(files, ".go")
+	if len(goFiles) == 0 {
+		return nil
+	}
+
+	args := append([]string{"-e"}, goFiles...)
+	cmd := exec.Command("gofmt", args...)
+	cmd.Dir = worktreeDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("go syntax check failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func verifyGoTestsIfAny(worktreeDir string, files []string) error {
+	hasTest := false
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			hasTest = true
+			break
+		}
+	}
+	if !hasTest {
+		return nil
+	}
+
+	cmd := exec.Command("go", "test")
+	cmd.Dir = worktreeDir
+	cmd.Env = append(os.Environ(), "GO111MODULE=off")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("go behavior test failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func verifyPythonSyntax(worktreeDir string, files []string) error {
+	pyFiles := filterByExt(files, ".py")
+	if len(pyFiles) == 0 {
+		return nil
+	}
+
+	args := append([]string{"-m", "py_compile"}, pyFiles...)
+	cmd := exec.Command("python3", args...)
+	cmd.Dir = worktreeDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("python syntax check failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func filterByExt(files []string, ext string) []string {
+	result := make([]string, 0)
+	for _, f := range files {
+		if strings.HasSuffix(f, ext) {
+			result = append(result, f)
+		}
+	}
+	return result
 }

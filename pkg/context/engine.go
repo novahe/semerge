@@ -8,12 +8,12 @@ import (
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
+	"github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	"github.com/tree-sitter/tree-sitter-go/bindings/go"
+	"github.com/tree-sitter/tree-sitter-java/bindings/go"
 	"github.com/tree-sitter/tree-sitter-javascript/bindings/go"
 	"github.com/tree-sitter/tree-sitter-python/bindings/go"
 	"github.com/tree-sitter/tree-sitter-typescript/bindings/go"
-	"github.com/tree-sitter/tree-sitter-java/bindings/go"
-	"github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 
 	"github.com/semerge/semerge/pkg/core"
 )
@@ -23,6 +23,8 @@ type Engine struct {
 	parser   *sitter.Parser
 	maxLines int
 }
+
+const maxRelatedFiles = 5
 
 // NewEngine creates a new context engine
 func NewEngine() *Engine {
@@ -120,6 +122,60 @@ func (e *Engine) ExtractContext(filePath string, hunks []core.Hunk) (*core.Conte
 	e.buildSymbolTable(rootNode, content, ctx)
 
 	return ctx, nil
+}
+
+// EnrichContextWithRelatedFiles enriches context skeleton with lightweight cross-file symbols.
+func (e *Engine) EnrichContextWithRelatedFiles(ctx *core.Context, workDir string) {
+	if ctx == nil || len(ctx.Imports) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{})
+	extraLines := make([]string, 0)
+	count := 0
+
+	for _, imp := range ctx.Imports {
+		if count >= maxRelatedFiles {
+			break
+		}
+
+		resolvedPath := e.resolveImportPath(workDir, imp, ctx.Language)
+		if resolvedPath == "" {
+			continue
+		}
+		if _, ok := seen[resolvedPath]; ok {
+			continue
+		}
+
+		signatures := e.extractPublicSignaturesFromFile(resolvedPath)
+		if len(signatures) == 0 {
+			continue
+		}
+
+		relPath := resolvedPath
+		if rp, err := filepath.Rel(workDir, resolvedPath); err == nil {
+			relPath = rp
+		}
+
+		extraLines = append(extraLines, fmt.Sprintf("// --- External Context from %s ---", relPath))
+		for _, signature := range signatures {
+			extraLines = append(extraLines, "// Related: "+signature)
+		}
+
+		seen[resolvedPath] = struct{}{}
+		count++
+	}
+
+	if len(extraLines) == 0 {
+		return
+	}
+
+	if strings.TrimSpace(ctx.Skeleton) == "" {
+		ctx.Skeleton = strings.Join(extraLines, "\n")
+		return
+	}
+
+	ctx.Skeleton = strings.TrimRight(ctx.Skeleton, "\n") + "\n\n" + strings.Join(extraLines, "\n")
 }
 
 // extractImports extracts import statements from the AST
@@ -357,6 +413,217 @@ func (e *Engine) buildSymbolTable(node *sitter.Node, content []byte, ctx *core.C
 	for _, v := range ctx.Variables {
 		ctx.Symbols[v.Name] = "variable:" + v.Type
 	}
+}
+
+func (e *Engine) resolveImportPath(workDir, importStmt, language string) string {
+	candidates := e.extractImportCandidates(importStmt, language)
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	for _, candidate := range candidates {
+		resolved := e.findExistingPath(workDir, candidate, language)
+		if resolved != "" {
+			return resolved
+		}
+	}
+
+	return ""
+}
+
+func (e *Engine) extractImportCandidates(importStmt, language string) []string {
+	stmt := strings.TrimSpace(importStmt)
+	if stmt == "" {
+		return nil
+	}
+
+	quoted := regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(stmt, -1)
+	if len(quoted) > 0 {
+		candidates := make([]string, 0, len(quoted))
+		for _, item := range quoted {
+			if len(item) > 1 {
+				candidates = append(candidates, item[1])
+			}
+		}
+		return candidates
+	}
+
+	switch strings.ToLower(language) {
+	case "python":
+		fromRe := regexp.MustCompile(`^from\s+([\w\.]+)\s+import`)
+		if m := fromRe.FindStringSubmatch(stmt); len(m) > 1 {
+			return []string{strings.ReplaceAll(m[1], ".", string(filepath.Separator))}
+		}
+		importRe := regexp.MustCompile(`^import\s+([\w\.]+)`)
+		if m := importRe.FindStringSubmatch(stmt); len(m) > 1 {
+			return []string{strings.ReplaceAll(m[1], ".", string(filepath.Separator))}
+		}
+	}
+
+	return []string{strings.Trim(stmt, "\"'`")}
+}
+
+func (e *Engine) findExistingPath(workDir, candidate, language string) string {
+	cleaned := strings.TrimSpace(strings.Trim(candidate, "\"'`"))
+	cleaned = strings.TrimPrefix(cleaned, "./")
+	if cleaned == "" {
+		return ""
+	}
+
+	variants := make([]string, 0)
+	if filepath.IsAbs(cleaned) {
+		variants = append(variants, cleaned)
+	} else {
+		variants = append(variants, filepath.Join(workDir, cleaned))
+
+		segments := strings.Split(cleaned, "/")
+		for i := 1; i < len(segments); i++ {
+			variants = append(variants, filepath.Join(workDir, filepath.Join(segments[i:]...)))
+		}
+	}
+
+	extensions := e.preferredExtensions(language)
+	for _, variant := range variants {
+		if info, err := os.Stat(variant); err == nil {
+			if info.IsDir() {
+				for _, ext := range extensions {
+					indexPath := filepath.Join(variant, "index"+ext)
+					if fileInfo, fileErr := os.Stat(indexPath); fileErr == nil && !fileInfo.IsDir() {
+						return indexPath
+					}
+
+					basePath := filepath.Join(variant, filepath.Base(variant)+ext)
+					if fileInfo, fileErr := os.Stat(basePath); fileErr == nil && !fileInfo.IsDir() {
+						return basePath
+					}
+				}
+				continue
+			}
+			return variant
+		}
+
+		for _, ext := range extensions {
+			withExt := variant + ext
+			if info, err := os.Stat(withExt); err == nil && !info.IsDir() {
+				return withExt
+			}
+		}
+	}
+
+	return ""
+}
+
+func (e *Engine) preferredExtensions(language string) []string {
+	ordered := map[string][]string{
+		"go":         {".go"},
+		"python":     {".py"},
+		"javascript": {".js", ".mjs", ".cjs"},
+		"typescript": {".ts", ".tsx", ".mts", ".cts"},
+		"java":       {".java"},
+		"c":          {".h", ".c"},
+		"cpp":        {".hpp", ".hh", ".h", ".cpp", ".cc", ".cxx"},
+	}
+
+	if exts, ok := ordered[strings.ToLower(language)]; ok {
+		return exts
+	}
+
+	return []string{".go", ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"}
+}
+
+func (e *Engine) extractPublicSignaturesFromFile(filePath string) []string {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil
+	}
+
+	language := e.detectLanguageFromFile(filePath)
+	lines := strings.Split(string(content), "\n")
+
+	type signaturePattern struct {
+		re   *regexp.Regexp
+		name int
+	}
+
+	patterns := map[string][]signaturePattern{
+		"go": {
+			{re: regexp.MustCompile(`^func\s+([A-Z]\w*)\s*\(`), name: 1},
+			{re: regexp.MustCompile(`^func\s*\([^)]*\)\s*([A-Z]\w*)\s*\(`), name: 1},
+			{re: regexp.MustCompile(`^type\s+([A-Z]\w*)\s+(struct|interface)`), name: 1},
+		},
+		"python": {
+			{re: regexp.MustCompile(`^def\s+([A-Za-z_]\w*)\s*\(`), name: 1},
+			{re: regexp.MustCompile(`^class\s+([A-Za-z_]\w*)\s*[:(]`), name: 1},
+		},
+		"javascript": {
+			{re: regexp.MustCompile(`^(?:export\s+)?function\s+([A-Za-z_$]\w*)\s*\(`), name: 1},
+			{re: regexp.MustCompile(`^class\s+([A-Za-z_$]\w*)\s*`), name: 1},
+		},
+		"typescript": {
+			{re: regexp.MustCompile(`^(?:export\s+)?function\s+([A-Za-z_$]\w*)\s*\(`), name: 1},
+			{re: regexp.MustCompile(`^(?:export\s+)?(?:interface|type|class)\s+([A-Za-z_$]\w*)`), name: 1},
+		},
+		"java": {
+			{re: regexp.MustCompile(`^(?:public\s+)?(?:class|interface)\s+([A-Za-z_]\w*)`), name: 1},
+			{re: regexp.MustCompile(`^(?:public\s+)?(?:static\s+)?[\w<>\[\]]+\s+([A-Za-z_]\w*)\s*\(`), name: 1},
+		},
+	}
+
+	langPatterns, ok := patterns[language]
+	if !ok {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	signatures := make([]string, 0)
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		for _, p := range langPatterns {
+			m := p.re.FindStringSubmatch(line)
+			if len(m) <= p.name {
+				continue
+			}
+
+			name := m[p.name]
+			if !isPublicSymbol(name, language) {
+				continue
+			}
+
+			signature := strings.TrimSpace(line)
+			if _, exists := seen[signature]; exists {
+				continue
+			}
+
+			seen[signature] = struct{}{}
+			signatures = append(signatures, signature)
+			break
+		}
+
+		if len(signatures) >= 12 {
+			break
+		}
+	}
+
+	return signatures
+}
+
+func isPublicSymbol(name, language string) bool {
+	if name == "" {
+		return false
+	}
+
+	lang := strings.ToLower(language)
+	if lang == "go" {
+		first := name[0]
+		return first >= 'A' && first <= 'Z'
+	}
+
+	return !strings.HasPrefix(name, "_")
 }
 
 // Helper functions

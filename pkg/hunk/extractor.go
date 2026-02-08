@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	ConflictMarkerStart      = "<<<<<<<"
-	ConflictMarkerSeparator  = "======="
-	ConflictMarkerEnd        = ">>>>>>>"
-	ConflictMarkerAncestor   = "|||||||"
+	ConflictMarkerStart     = "<<<<<<<"
+	ConflictMarkerSeparator = "======="
+	ConflictMarkerEnd       = ">>>>>>>"
+	ConflictMarkerAncestor  = "|||||||"
 )
 
 // Extractor handles conflict extraction from merge files
@@ -35,7 +35,7 @@ func NewExtractor(workDir string) *Extractor {
 // ExtractFromMergeFile runs git merge-file and extracts conflicts
 func (e *Extractor) ExtractFromMergeFile(ancestor, current, incoming string) (*core.MergeRequest, error) {
 	// Run git merge-file to get the merged result with conflict markers
-	output, err := e.runGitMergeFile(ancestor, current, incoming)
+	output, err := e.GenerateConflictOutput(ancestor, current, incoming)
 	if err != nil {
 		return nil, fmt.Errorf("git merge-file failed: %w", err)
 	}
@@ -57,6 +57,11 @@ func (e *Extractor) ExtractFromMergeFile(ancestor, current, incoming string) (*c
 		IncomingPath: incoming,
 		Conflicts:    conflicts,
 	}, nil
+}
+
+// GenerateConflictOutput runs git merge-file and returns merged output with conflict markers
+func (e *Extractor) GenerateConflictOutput(ancestor, current, incoming string) (string, error) {
+	return e.runGitMergeFile(ancestor, current, incoming)
 }
 
 // runGitMergeFile executes the git merge-file command
@@ -169,6 +174,14 @@ func (e *Extractor) extractContextLines(lines []string, start, end, contextSize 
 	var context []string
 	for i := contextStart; i <= contextEnd; i++ {
 		if i < start || i > end {
+			trimmed := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(trimmed, ConflictMarkerStart) ||
+				strings.HasPrefix(trimmed, ConflictMarkerSeparator) ||
+				strings.HasPrefix(trimmed, ConflictMarkerEnd) ||
+				strings.HasPrefix(trimmed, ConflictMarkerAncestor) {
+				continue
+			}
+
 			context = append(context, lines[i])
 		}
 	}
@@ -181,38 +194,38 @@ func (e *Extractor) detectLanguage(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
 
 	langMap := map[string]string{
-		".go":       "go",
-		".py":       "python",
-		".js":       "javascript",
-		".ts":       "typescript",
-		".tsx":      "typescript",
-		".jsx":      "javascript",
-		".java":     "java",
-		".c":        "c",
-		".cpp":      "cpp",
-		".cc":       "cpp",
-		".h":        "c",
-		".hpp":      "cpp",
-		".rs":       "rust",
-		".rb":       "ruby",
-		".php":      "php",
-		".cs":       "csharp",
-		".swift":    "swift",
-		".kt":       "kotlin",
-		".scala":    "scala",
-		".sh":       "bash",
-		".bash":     "bash",
-		".zsh":      "zsh",
-		".json":     "json",
-		".yaml":     "yaml",
-		".yml":      "yaml",
-		".toml":     "toml",
-		".md":       "markdown",
-		".xml":      "xml",
-		".html":     "html",
-		".css":      "css",
-		".scss":     "scss",
-		".less":     "less",
+		".go":    "go",
+		".py":    "python",
+		".js":    "javascript",
+		".ts":    "typescript",
+		".tsx":   "typescript",
+		".jsx":   "javascript",
+		".java":  "java",
+		".c":     "c",
+		".cpp":   "cpp",
+		".cc":    "cpp",
+		".h":     "c",
+		".hpp":   "cpp",
+		".rs":    "rust",
+		".rb":    "ruby",
+		".php":   "php",
+		".cs":    "csharp",
+		".swift": "swift",
+		".kt":    "kotlin",
+		".scala": "scala",
+		".sh":    "bash",
+		".bash":  "bash",
+		".zsh":   "zsh",
+		".json":  "json",
+		".yaml":  "yaml",
+		".yml":   "yaml",
+		".toml":  "toml",
+		".md":    "markdown",
+		".xml":   "xml",
+		".html":  "html",
+		".css":   "css",
+		".scss":  "scss",
+		".less":  "less",
 	}
 
 	if lang, ok := langMap[ext]; ok {

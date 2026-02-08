@@ -16,40 +16,41 @@ type Hunk struct {
 
 // Conflict represents a merge conflict in a file
 type Conflict struct {
-	FileName string  `json:"file_name"`
-	Language string  `json:"language"`
-	Hunks    []Hunk  `json:"hunks"`
+	FileName string `json:"file_name"`
+	Language string `json:"language"`
+	Hunks    []Hunk `json:"hunks"`
 }
 
 // MergeRequest represents a three-way merge request
 type MergeRequest struct {
-	FileName     string   `json:"file_name"`
-	Language     string   `json:"language"`
-	AncestorPath string   `json:"ancestor_path"`
-	CurrentPath  string   `json:"current_path"`
-	IncomingPath string   `json:"incoming_path"`
-	Conflicts    []Hunk   `json:"conflicts"`
+	FileName     string `json:"file_name"`
+	Language     string `json:"language"`
+	AncestorPath string `json:"ancestor_path"`
+	CurrentPath  string `json:"current_path"`
+	IncomingPath string `json:"incoming_path"`
+	Conflicts    []Hunk `json:"conflicts"`
 }
 
 // MergeResult represents the result of a merge operation
 type MergeResult struct {
-	Success      bool      `json:"success"`
-	Content      string    `json:"content"`
-	ResolvedHunks []Hunk   `json:"resolved_hunks"`
-	Errors       []string  `json:"errors,omitempty"`
-	Timestamp    time.Time `json:"timestamp"`
+	Success       bool           `json:"success"`
+	Content       string         `json:"content"`
+	ResolvedMap   map[int]string `json:"resolved_map,omitempty"`
+	ResolvedHunks []Hunk         `json:"resolved_hunks"`
+	Errors        []string       `json:"errors,omitempty"`
+	Timestamp     time.Time      `json:"timestamp"`
 }
 
 // Context contains AST-derived context for a conflict
 type Context struct {
-	FileName      string            `json:"file_name"`
-	Language      string            `json:"language"`
-	Skeleton      string            `json:"skeleton"`       // Skeleton code with only key structures
-	Imports       []string          `json:"imports"`        // Import statements
-	Functions     []FunctionContext `json:"functions"`      // Related function signatures
-	Classes       []ClassContext    `json:"classes"`        // Related class definitions
-	Variables     []VariableContext `json:"variables"`      // Variable declarations
-	Symbols       map[string]string `json:"symbols"`        // Symbol table
+	FileName  string            `json:"file_name"`
+	Language  string            `json:"language"`
+	Skeleton  string            `json:"skeleton"`  // Skeleton code with only key structures
+	Imports   []string          `json:"imports"`   // Import statements
+	Functions []FunctionContext `json:"functions"` // Related function signatures
+	Classes   []ClassContext    `json:"classes"`   // Related class definitions
+	Variables []VariableContext `json:"variables"` // Variable declarations
+	Symbols   map[string]string `json:"symbols"`   // Symbol table
 }
 
 // FunctionContext represents a function definition context
@@ -91,12 +92,22 @@ type LLMResponse struct {
 
 // VerificationResult represents the result of linting/compilation
 type VerificationResult struct {
-	Success   bool     `json:"success"`
-	Errors    []string `json:"errors"`
-	Warnings  []string `json:"warnings"`
-	ExitCode  int      `json:"exit_code"`
-	Tool      string   `json:"tool"`
-	Output    string   `json:"output"`
+	Success  bool     `json:"success"`
+	Errors   []string `json:"errors"`
+	Warnings []string `json:"warnings"`
+	ExitCode int      `json:"exit_code"`
+	Tool     string   `json:"tool"`
+	Output   string   `json:"output"`
+}
+
+// VerifierFeedback represents structured verifier feedback for retrying LLM resolution
+type VerifierFeedback struct {
+	Attempt           int      `json:"attempt"`
+	Tool              string   `json:"tool"`
+	ExitCode          int      `json:"exit_code"`
+	TopErrors         []string `json:"top_errors,omitempty"`
+	TopWarnings       []string `json:"top_warnings,omitempty"`
+	PreviousCandidate string   `json:"previous_candidate,omitempty"`
 }
 
 // Config represents the semerge configuration

@@ -40,9 +40,11 @@ This creates a configuration file at `~/.semerge.yaml` (or `.semerge.yaml` in yo
 Edit the configuration to set your API key:
 
 ```yaml
+version: v1
+
 llm:
   provider: claude              # or "openai"
-  api_key: sk-ant-xxx          # Your API key
+  api_key: <YOUR_API_KEY>          # Your API key
   model: claude-sonnet-4-5-20250514
   timeout: 60
 ```
@@ -106,10 +108,12 @@ e2e/                  # End-to-end tests with corpus-based approach
 Example `~/.semerge.yaml`:
 
 ```yaml
+version: v1
+
 llm:
   provider: claude              # "claude" or "openai"
-  api_key: sk-ant-xxx          # Or set ANTHROPIC_API_KEY env var
-  model: claude-3-5-sonnet-20241022
+  api_key: <YOUR_API_KEY>           # Or set ANTHROPIC_API_KEY env var
+  model: claude-3.5
   timeout: 60
   base_url:                     # Optional: custom API endpoint
 

@@ -14,16 +14,16 @@ import (
 
 // Verifier handles code verification using linters
 type Verifier struct {
-	config    *VerifierConfig
-	retries   int
-	workDir   string
+	config  *VerifierConfig
+	retries int
+	workDir string
 }
 
 // VerifierConfig represents verifier configuration
 type VerifierConfig struct {
-	Enabled bool                      `yaml:"enabled"`
-	Tools   map[string]string         `yaml:"tools"` // language -> command
-	Retries int                       `yaml:"retries"`
+	Enabled bool              `yaml:"enabled"`
+	Tools   map[string]string `yaml:"tools"` // language -> command
+	Retries int               `yaml:"retries"`
 }
 
 // NewVerifier creates a new verifier
@@ -146,10 +146,38 @@ func (v *Verifier) createTempFile(content string, originalPath string) (string, 
 
 // runLinter runs a linter command on a file
 func (v *Verifier) runLinter(ctx context.Context, toolCmd string, filePath string, language string) (*core.VerificationResult, error) {
-	// Parse command
-	parts := strings.Fields(toolCmd)
-	if len(parts) == 0 {
+	commands := splitToolCommands(toolCmd)
+	if len(commands) == 0 {
 		return nil, fmt.Errorf("empty tool command")
+	}
+
+	toolNames := make([]string, 0, len(commands))
+	for _, command := range commands {
+		result, err := v.runSingleCommand(ctx, command, filePath, language)
+		if err != nil {
+			return nil, err
+		}
+
+		toolNames = append(toolNames, result.Tool)
+		if !result.Success {
+			if len(toolNames) > 1 {
+				result.Tool = strings.Join(toolNames, " && ")
+			}
+			return result, nil
+		}
+	}
+
+	return &core.VerificationResult{
+		Success:  true,
+		Tool:     strings.Join(toolNames, " && "),
+		ExitCode: 0,
+	}, nil
+}
+
+func (v *Verifier) runSingleCommand(ctx context.Context, command string, filePath string, language string) (*core.VerificationResult, error) {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty command segment")
 	}
 
 	// Replace {file} placeholder with actual file path
@@ -194,6 +222,20 @@ func (v *Verifier) runLinter(ctx context.Context, toolCmd string, filePath strin
 	}
 
 	return result, nil
+}
+
+func splitToolCommands(toolCmd string) []string {
+	segments := strings.Split(toolCmd, "&&")
+	commands := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		trimmed := strings.TrimSpace(segment)
+		if trimmed == "" {
+			continue
+		}
+		commands = append(commands, trimmed)
+	}
+
+	return commands
 }
 
 // parseErrors parses errors from linter output
@@ -242,6 +284,19 @@ func (v *Verifier) parseWarnings(stdout, stderr string, language string) []strin
 func (v *Verifier) isErrorLine(line string, language string) bool {
 	lower := strings.ToLower(line)
 
+	if language == "go" {
+		if strings.Contains(lower, "warning") {
+			return false
+		}
+
+		return strings.Contains(line, ".go:") ||
+			strings.HasPrefix(lower, "vet:") ||
+			strings.Contains(lower, "syntax error") ||
+			strings.Contains(lower, "undefined") ||
+			strings.Contains(lower, "cannot") ||
+			strings.Contains(lower, "failed")
+	}
+
 	// Common error indicators
 	errorIndicators := []string{
 		"error:",
@@ -262,8 +317,6 @@ func (v *Verifier) isErrorLine(line string, language string) bool {
 
 	// Language-specific patterns
 	switch language {
-	case "go":
-		return strings.Contains(line, ".go:") && !strings.Contains(lower, "warning")
 	case "python":
 		return strings.Contains(lower, "error") && !strings.Contains(lower, "warning")
 	case "javascript", "typescript":
@@ -282,16 +335,16 @@ func (v *Verifier) isWarningLine(line string, language string) bool {
 // GetDefaultTools returns default linter commands for various languages
 func GetDefaultTools() map[string]string {
 	return map[string]string{
-		"go":          "go vet {file}",
-		"python":      "ruff check {file}",
-		"javascript":  "eslint {file}",
-		"typescript":  "eslint {file}",
-		"java":        "javac -Xlint:all {file}",
-		"cpp":         "g++ -fsyntax-only -Wall -Werror {file}",
-		"c":           "gcc -fsyntax-only -Wall -Werror {file}",
-		"rust":        "rustc --crate-type lib {file}",
-		"ruby":        "rubocop {file}",
-		"php":         "php -l {file}",
+		"go":         "go vet {file}",
+		"python":     "ruff check {file}",
+		"javascript": "eslint {file}",
+		"typescript": "eslint {file}",
+		"java":       "javac -Xlint:all {file}",
+		"cpp":        "g++ -fsyntax-only -Wall -Werror {file}",
+		"c":          "gcc -fsyntax-only -Wall -Werror {file}",
+		"rust":       "rustc --crate-type lib {file}",
+		"ruby":       "rubocop {file}",
+		"php":        "php -l {file}",
 	}
 }
 

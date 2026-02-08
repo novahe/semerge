@@ -10,10 +10,11 @@ import (
 
 // Config represents the semerge configuration
 type Config struct {
-	LLM       LLMConfig       `yaml:"llm"`
-	Verifier  VerifierConfig  `yaml:"verifier"`
-	Context   ContextConfig   `yaml:"context"`
-	Git       GitConfig       `yaml:"git"`
+	Version  string         `yaml:"version,omitempty"`
+	LLM      LLMConfig      `yaml:"llm"`
+	Verifier VerifierConfig `yaml:"verifier"`
+	Context  ContextConfig  `yaml:"context"`
+	Git      GitConfig      `yaml:"git"`
 }
 
 // LLMConfig represents LLM configuration
@@ -101,6 +102,7 @@ func (c *Config) Save(path string) error {
 // DefaultConfig returns default configuration
 func DefaultConfig() *Config {
 	return &Config{
+		Version: "v1",
 		LLM: LLMConfig{
 			Provider: "claude",
 			APIKey:   "",
@@ -127,6 +129,10 @@ func DefaultConfig() *Config {
 
 // setDefaults sets default values for missing config options
 func setDefaults(cfg *Config) {
+	if cfg.Version == "" {
+		cfg.Version = "v1"
+	}
+
 	// LLM defaults
 	if cfg.LLM.Provider == "" {
 		cfg.LLM.Provider = "claude"
@@ -192,16 +198,16 @@ func LoadConfig() (*Config, error) {
 // GetDefaultTools returns default linter commands
 func GetDefaultTools() map[string]string {
 	return map[string]string{
-		"go":          "go vet {file}",
-		"python":      "ruff check {file}",
-		"javascript":  "eslint {file}",
-		"typescript":  "eslint {file}",
-		"java":        "javac -Xlint:all {file}",
-		"cpp":         "g++ -fsyntax-only -Wall -Werror {file}",
-		"c":           "gcc -fsyntax-only -Wall -Werror {file}",
-		"rust":        "rustc --crate-type lib {file}",
-		"ruby":        "rubocop {file}",
-		"php":         "php -l {file}",
+		"go":         "go vet {file}",
+		"python":     "ruff check {file}",
+		"javascript": "eslint {file}",
+		"typescript": "eslint {file}",
+		"java":       "javac -Xlint:all {file}",
+		"cpp":        "g++ -fsyntax-only -Wall -Werror {file}",
+		"c":          "gcc -fsyntax-only -Wall -Werror {file}",
+		"rust":       "rustc --crate-type lib {file}",
+		"ruby":       "rubocop {file}",
+		"php":        "php -l {file}",
 	}
 }
 
@@ -237,9 +243,9 @@ func (c *Config) Validate() error {
 
 	// Validate git config
 	validStrategies := map[string]bool{
-		"auto":      true,
-		"semantic":  true,
-		"text":      true,
+		"auto":     true,
+		"semantic": true,
+		"text":     true,
 	}
 	if !validStrategies[c.Git.MergeStrategy] {
 		return fmt.Errorf("invalid merge strategy: %s", c.Git.MergeStrategy)
