@@ -1,0 +1,8 @@
+# Test temp directories
+semerge-e2e-*
+
+# Test binaries
+*.test
+
+# Go specific
+*.sum
