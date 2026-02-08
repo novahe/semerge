@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"go/format"
+
+	"github.com/google/uuid"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,10 +24,12 @@ import (
 
 var (
 	cfgFile string
-	version = "0.1.0"
+	version = "0.2.1"
 )
 
 const maxResolveAttempts = 3
+
+var listUnmergedFiles = defaultListUnmergedFiles
 
 func main() {
 	var rootCmd = &cobra.Command{
@@ -290,7 +295,268 @@ func runResolve(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nResolved file written to: %s\n", current)
+
+	trailers := buildConflictTrailers(".", cfg.LLM.Model, current, len(mergeRequest.Conflicts))
+	if len(trailers) > 0 {
+		fmt.Println("Conflict trailer metadata:")
+		for _, trailer := range trailers {
+			fmt.Println(trailer)
+		}
+	}
+
 	return nil
+}
+
+type conflictFileStat struct {
+	path      string
+	conflicts int
+}
+
+func buildConflictTrailers(repoDir string, model string, currentFile string, currentConflicts int) []string {
+	operation := detectGitOperation(repoDir)
+	if operation == "" {
+		return nil
+	}
+
+	ranked, truncated := collectTopConflictFiles(repoDir, 8)
+	if path, ok := normalizeConflictFilePath(repoDir, currentFile); ok && currentConflicts > 0 {
+		ranked, truncated = upsertCurrentConflictFile(ranked, path, repoDir, currentConflicts, 8)
+	}
+	if len(ranked) == 0 {
+		return nil
+	}
+
+	sessionID := resolveSessionID()
+	return formatConflictTrailers(version, model, operation, ranked, truncated, sessionID)
+}
+
+func formatConflictTrailers(ver string, model string, operation string, files []string, truncated bool, sessionID string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = "unknown"
+	}
+
+	filesLine := strings.Join(files, " ")
+	if filesLine == "" {
+		filesLine = "unknown"
+	}
+	if truncated {
+		filesLine += " ..."
+	}
+
+	return []string{
+		fmt.Sprintf("Conflict-resolved-by: semerge/%s@%s (%s)", ver, model, operation),
+		fmt.Sprintf("Conflict-files: %s", filesLine),
+		fmt.Sprintf("Conflict-context: x-session-id@%s", sessionID),
+	}
+}
+
+func collectTopConflictFiles(repoDir string, limit int) ([]string, bool) {
+	files, err := listUnmergedFiles(repoDir)
+	if err != nil || len(files) == 0 {
+		return nil, false
+	}
+
+	stats := make([]conflictFileStat, 0, len(files))
+	for _, file := range files {
+		content, readErr := os.ReadFile(filepath.Join(repoDir, file))
+		if readErr != nil {
+			continue
+		}
+
+		count := strings.Count(string(content), "<<<<<<<")
+		if count <= 0 {
+			continue
+		}
+
+		stats = append(stats, conflictFileStat{path: file, conflicts: count})
+	}
+
+	if len(stats) == 0 {
+		return nil, false
+	}
+
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].conflicts != stats[j].conflicts {
+			return stats[i].conflicts > stats[j].conflicts
+		}
+		return stats[i].path < stats[j].path
+	})
+
+	truncated := false
+	if limit > 0 && len(stats) > limit {
+		stats = stats[:limit]
+		truncated = true
+	}
+
+	result := make([]string, 0, len(stats))
+	for _, stat := range stats {
+		result = append(result, stat.path)
+	}
+
+	return result, truncated
+}
+
+func upsertCurrentConflictFile(ranked []string, currentPath string, repoDir string, currentConflicts int, limit int) ([]string, bool) {
+	if currentPath == "" {
+		return ranked, false
+	}
+
+	stats := make([]conflictFileStat, 0, len(ranked)+1)
+	seen := make(map[string]bool, len(ranked)+1)
+
+	for _, path := range ranked {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+
+		conflicts := 1
+		if content, err := os.ReadFile(filepath.Join(repoDir, path)); err == nil {
+			if cnt := strings.Count(string(content), "<<<<<<<"); cnt > 0 {
+				conflicts = cnt
+			}
+		}
+
+		stats = append(stats, conflictFileStat{path: path, conflicts: conflicts})
+	}
+
+	updated := false
+	for idx := range stats {
+		if stats[idx].path == currentPath {
+			stats[idx].conflicts = currentConflicts
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		stats = append(stats, conflictFileStat{path: currentPath, conflicts: currentConflicts})
+	}
+
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].conflicts != stats[j].conflicts {
+			return stats[i].conflicts > stats[j].conflicts
+		}
+		return stats[i].path < stats[j].path
+	})
+
+	truncated := false
+	if limit > 0 && len(stats) > limit {
+		stats = stats[:limit]
+		truncated = true
+	}
+
+	out := make([]string, 0, len(stats))
+	for _, stat := range stats {
+		out = append(out, stat.path)
+	}
+
+	return out, truncated
+}
+
+func normalizeConflictFilePath(repoDir string, filePath string) (string, bool) {
+	trimmed := strings.TrimSpace(filePath)
+	if trimmed == "" {
+		return "", false
+	}
+
+	cleaned := filepath.Clean(trimmed)
+	if filepath.IsAbs(cleaned) {
+		rel, err := filepath.Rel(repoDir, cleaned)
+		if err != nil {
+			return "", false
+		}
+		cleaned = rel
+	}
+
+	cleaned = filepath.ToSlash(cleaned)
+	if strings.HasPrefix(cleaned, "../") || cleaned == ".." {
+		return "", false
+	}
+
+	return cleaned, true
+}
+
+func defaultListUnmergedFiles(repoDir string) ([]string, error) {
+	cmd := exec.Command("git", "diff", "--name-only", "--diff-filter=U")
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	raw := strings.Split(strings.TrimSpace(string(out)), "\n")
+	files := make([]string, 0, len(raw))
+	for _, item := range raw {
+		path := strings.TrimSpace(item)
+		if path == "" {
+			continue
+		}
+		files = append(files, path)
+	}
+
+	return files, nil
+}
+
+func detectGitOperation(repoDir string) string {
+	gitDir, err := resolveGitDir(repoDir)
+	if err != nil {
+		return ""
+	}
+
+	if fileExists(filepath.Join(gitDir, "CHERRY_PICK_HEAD")) {
+		return "cherry-pick"
+	}
+	if fileExists(filepath.Join(gitDir, "REVERT_HEAD")) {
+		return "revert"
+	}
+	if fileExists(filepath.Join(gitDir, "REBASE_HEAD")) || fileExists(filepath.Join(gitDir, "rebase-merge")) || fileExists(filepath.Join(gitDir, "rebase-apply")) {
+		return "rebase"
+	}
+	if fileExists(filepath.Join(gitDir, "MERGE_HEAD")) {
+		return "merge"
+	}
+
+	return ""
+}
+
+func resolveGitDir(repoDir string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	gitDir := strings.TrimSpace(string(out))
+	if gitDir == "" {
+		return "", fmt.Errorf("empty git dir")
+	}
+
+	if filepath.IsAbs(gitDir) {
+		return gitDir, nil
+	}
+
+	return filepath.Join(repoDir, gitDir), nil
+}
+
+func resolveSessionID() string {
+	for _, key := range []string{"SEMERGE_SESSION_ID", "X_SESSION_ID", "X-SESSION-ID"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+
+	return generateSessionID()
+}
+
+func generateSessionID() string {
+	return uuid.NewString()
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func buildResolvedBlocks(conflicts []core.Hunk, resolvedMap map[int]string) ([]string, error) {

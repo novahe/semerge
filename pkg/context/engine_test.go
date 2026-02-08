@@ -9,7 +9,7 @@ import (
 	"github.com/semerge/semerge/pkg/core"
 )
 
-func TestResolveImportPath_Go_Table(t *testing.T) {
+func TestResolveImportPath_Go(t *testing.T) {
 	workDir := t.TempDir()
 	packageDir := filepath.Join(workDir, "pkg", "util")
 	if err := os.MkdirAll(packageDir, 0o755); err != nil {

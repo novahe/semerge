@@ -3,6 +3,7 @@ module github.com/semerge/semerge
 go 1.25.5
 
 require (
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/liushuangls/go-anthropic/v2 v2.17.0 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect

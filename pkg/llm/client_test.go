@@ -41,7 +41,7 @@ func TestNormalizeAnthropicBaseURL(t *testing.T) {
 	}
 }
 
-func TestParseLLMResponse_Table(t *testing.T) {
+func TestParseLLMResponse(t *testing.T) {
 	testCases := []struct {
 		name    string
 		input   string
