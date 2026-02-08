@@ -93,3 +93,38 @@ func TestEnrichContextWithRelatedFiles_AppendsExternalSignatures(t *testing.T) {
 		t.Fatalf("expected private signature filtered out, got:\n%s", ctx.Skeleton)
 	}
 }
+
+func TestGetLanguage_Bash(t *testing.T) {
+	engine := NewEngine()
+
+	if _, err := engine.GetLanguage("bash"); err != nil {
+		t.Fatalf("GetLanguage(bash) returned error: %v", err)
+	}
+
+	if _, err := engine.GetLanguage("sh"); err != nil {
+		t.Fatalf("GetLanguage(sh) returned error: %v", err)
+	}
+}
+
+func TestDetectLanguageFromFile_BashExtensions(t *testing.T) {
+	engine := NewEngine()
+
+	testCases := []struct {
+		name     string
+		filePath string
+		want     string
+	}{
+		{name: "sh extension", filePath: "script.sh", want: "bash"},
+		{name: "bash extension", filePath: "script.bash", want: "bash"},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := engine.detectLanguageFromFile(tc.filePath)
+			if got != tc.want {
+				t.Fatalf("detectLanguageFromFile(%q) = %q, want %q", tc.filePath, got, tc.want)
+			}
+		})
+	}
+}

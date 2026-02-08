@@ -1,6 +1,11 @@
 package llm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/semerge/semerge/pkg/core"
+)
 
 func TestNormalizeAnthropicBaseURL(t *testing.T) {
 	tests := []struct {
@@ -106,5 +111,28 @@ func TestParseLLMResponse(t *testing.T) {
 				t.Fatalf("expected empty resolved map for failed case, got=%v", result.ResolvedMap)
 			}
 		})
+	}
+}
+
+func TestBuildPrompt_MultiHunkIncludesAllResolutionIDs(t *testing.T) {
+	req := &MergeRequest{
+		FileName: "service.sh",
+		Language: "bash",
+		Hunks: []core.Hunk{
+			{StartLine: 1, EndLine: 3, Current: "A", Incoming: "B"},
+			{StartLine: 10, EndLine: 12, Current: "C", Incoming: "D"},
+		},
+	}
+
+	prompt, err := BuildPrompt(req)
+	if err != nil {
+		t.Fatalf("BuildPrompt() error = %v", err)
+	}
+
+	if !strings.Contains(prompt, `<resolution id="0">`) {
+		t.Fatalf("prompt missing resolution id 0 placeholder: %s", prompt)
+	}
+	if !strings.Contains(prompt, `<resolution id="1">`) {
+		t.Fatalf("prompt missing resolution id 1 placeholder: %s", prompt)
 	}
 }

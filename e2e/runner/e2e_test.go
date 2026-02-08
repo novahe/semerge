@@ -604,6 +604,13 @@ func verifyByBehavior(worktreeDir string, tc TestCase) error {
 		if err := verifyPythonSyntax(worktreeDir, baseFiles); err != nil {
 			return err
 		}
+	case "bash":
+		if err := verifyBashSyntax(worktreeDir, baseFiles); err != nil {
+			return err
+		}
+		if err := verifyBashBehaviorIfAny(worktreeDir, baseFiles); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -680,6 +687,50 @@ func verifyPythonSyntax(worktreeDir string, files []string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("python syntax check failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func verifyBashSyntax(worktreeDir string, files []string) error {
+	bashFiles := make([]string, 0)
+	for _, f := range files {
+		if strings.HasSuffix(f, ".sh") || strings.HasSuffix(f, ".bash") {
+			bashFiles = append(bashFiles, f)
+		}
+	}
+	if len(bashFiles) == 0 {
+		return nil
+	}
+
+	args := append([]string{"-n"}, bashFiles...)
+	cmd := exec.Command("bash", args...)
+	cmd.Dir = worktreeDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("bash syntax check failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func verifyBashBehaviorIfAny(worktreeDir string, files []string) error {
+	var verifyScript string
+	for _, f := range files {
+		if f == "verify.sh" || f == "verify.bash" {
+			verifyScript = f
+			break
+		}
+	}
+	if verifyScript == "" {
+		return nil
+	}
+
+	cmd := exec.Command("bash", verifyScript)
+	cmd.Dir = worktreeDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("bash behavior check failed: %w\nOutput: %s", err, string(output))
 	}
 
 	return nil

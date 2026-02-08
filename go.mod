@@ -10,6 +10,7 @@ require (
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/tree-sitter/go-tree-sitter v0.24.0 // indirect
+	github.com/tree-sitter/tree-sitter-bash v0.25.1 // indirect
 	github.com/tree-sitter/tree-sitter-cpp v0.23.4 // indirect
 	github.com/tree-sitter/tree-sitter-go v0.25.0 // indirect
 	github.com/tree-sitter/tree-sitter-java v0.23.5 // indirect

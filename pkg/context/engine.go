@@ -7,15 +7,16 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/semerge/semerge/pkg/core"
+
 	sitter "github.com/tree-sitter/go-tree-sitter"
+	"github.com/tree-sitter/tree-sitter-bash/bindings/go"
 	"github.com/tree-sitter/tree-sitter-cpp/bindings/go"
 	"github.com/tree-sitter/tree-sitter-go/bindings/go"
 	"github.com/tree-sitter/tree-sitter-java/bindings/go"
 	"github.com/tree-sitter/tree-sitter-javascript/bindings/go"
 	"github.com/tree-sitter/tree-sitter-python/bindings/go"
 	"github.com/tree-sitter/tree-sitter-typescript/bindings/go"
-
-	"github.com/semerge/semerge/pkg/core"
 )
 
 // Engine handles AST parsing and context extraction
@@ -58,6 +59,8 @@ func (e *Engine) GetLanguage(lang string) (*sitter.Language, error) {
 		return sitter.NewLanguage(tree_sitter_cpp.Language()), nil
 	case "cpp", "cc", "cxx":
 		return sitter.NewLanguage(tree_sitter_cpp.Language()), nil
+	case "bash", "sh":
+		return sitter.NewLanguage(tree_sitter_bash.Language()), nil
 	default:
 		return nil, fmt.Errorf("unsupported language: %s", lang)
 	}
@@ -522,13 +525,14 @@ func (e *Engine) preferredExtensions(language string) []string {
 		"java":       {".java"},
 		"c":          {".h", ".c"},
 		"cpp":        {".hpp", ".hh", ".h", ".cpp", ".cc", ".cxx"},
+		"bash":       {".sh", ".bash"},
 	}
 
 	if exts, ok := ordered[strings.ToLower(language)]; ok {
 		return exts
 	}
 
-	return []string{".go", ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h"}
+	return []string{".go", ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".sh", ".bash"}
 }
 
 func (e *Engine) extractPublicSignaturesFromFile(filePath string) []string {
@@ -640,6 +644,8 @@ func (e *Engine) detectLanguageFromFile(filePath string) string {
 		".c":    "c",
 		".cpp":  "cpp",
 		".rs":   "rust",
+		".sh":   "bash",
+		".bash": "bash",
 	}
 	if lang, ok := langMap[ext]; ok {
 		return lang
@@ -714,7 +720,7 @@ func (e *Engine) extractNodeName(node *sitter.Node, content []byte) string {
 	// Try to find a 'name' child
 	for i := uint(0); i < node.ChildCount(); i++ {
 		child := node.Child(i)
-		if child.Kind() == "identifier" || child.Kind() == "name" {
+		if child.Kind() == "identifier" || child.Kind() == "name" || child.Kind() == "word" || child.Kind() == "variable_name" {
 			start := child.StartByte()
 			end := child.EndByte()
 			return string(content[start:end])
@@ -745,6 +751,7 @@ func (e *Engine) getFunctionQuery(language string) string {
 		"typescript": `(function_declaration name: (identifier) @func) (method_definition name: (property_identifier) @func)`,
 		"java":       `(method_declaration name: (identifier) @func)`,
 		"cpp":        `(function_definition name: (identifier) @func)`,
+		"bash":       `(function_definition name: (word) @func)`,
 	}
 	return queries[language]
 }
@@ -769,6 +776,7 @@ func (e *Engine) getVariableQuery(language string) string {
 		"typescript": `(variable_declarator name: (identifier) @var)`,
 		"java":       `(variable_declarator name: (identifier) @var)`,
 		"cpp":        `(declaration name: (identifier) @var)`,
+		"bash":       `(variable_assignment @var)`,
 	}
 	return queries[language]
 }

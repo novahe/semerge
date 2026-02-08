@@ -10,8 +10,9 @@ import (
 	"text/template"
 	"time"
 
-	anthropic "github.com/liushuangls/go-anthropic/v2"
 	"github.com/semerge/semerge/pkg/core"
+
+	anthropic "github.com/liushuangls/go-anthropic/v2"
 )
 
 var (
@@ -369,11 +370,13 @@ Your detailed analysis of the conflict, including:
 - Any dependencies or relationships affected
 </analysis>
 
-<resolution id="0">
-Return ONLY the resolved code for that conflict region.
+{{range $i, $_ := .Hunks}}
+<resolution id="{{$i}}">
+Return ONLY the resolved code for conflict {{$i}}.
 Do NOT include package/imports/other functions.
 </resolution>
 
+{{end}}
 <confidence>
 A number from 0.0 to 1.0 indicating your confidence in this resolution
 </confidence>
