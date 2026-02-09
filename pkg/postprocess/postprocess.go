@@ -47,7 +47,7 @@ func ApplyResolutionsToConflictOutput(conflictOutput string, resolutions []strin
 	inConflict := false
 	resolutionIdx := 0
 
-	for i, line := range lines {
+	for _, line := range lines {
 		if strings.HasPrefix(line, "<<<<<<<") {
 			if inConflict {
 				return "", fmt.Errorf("nested conflict markers detected")
@@ -69,7 +69,6 @@ func ApplyResolutionsToConflictOutput(conflictOutput string, resolutions []strin
 				}
 
 				resolved := strings.TrimRight(resolutions[resolutionIdx], "\n")
-				resolved = trimDuplicateTrailingBrace(resolved, lines, i+1)
 				if resolved != "" {
 					outLines = append(outLines, strings.Split(resolved, "\n")...)
 				}
@@ -111,29 +110,6 @@ func PostProcessMergedContent(language, content string) string {
 	}
 
 	return content
-}
-
-func trimDuplicateTrailingBrace(resolved string, lines []string, nextLineIdx int) string {
-	if resolved == "" || nextLineIdx >= len(lines) {
-		return resolved
-	}
-
-	nextLine := strings.TrimSpace(lines[nextLineIdx])
-	if nextLine != "}" {
-		return resolved
-	}
-
-	resolvedLines := strings.Split(resolved, "\n")
-	lastLineIdx := len(resolvedLines) - 1
-	if lastLineIdx < 0 {
-		return resolved
-	}
-
-	if strings.TrimSpace(resolvedLines[lastLineIdx]) != "}" {
-		return resolved
-	}
-
-	return strings.Join(resolvedLines[:lastLineIdx], "\n")
 }
 
 func sanitizeResolutionWithConflict(conflict core.Hunk, resolved string) string {
