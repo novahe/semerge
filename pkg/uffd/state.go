@@ -6,8 +6,10 @@ import "sync"
 type PageState uint8
 
 const (
-	StateAbsent   PageState = 0
-	StateLoaded   PageState = 1
+	StateAbsent PageState = 0
+	StateLoaded PageState = 1
+	// StateReleased: the page was present but was subsequently reclaimed by
+	// guest balloon inflation (madvise DONTNEED'd).
 	StateReleased PageState = 2
 )
 

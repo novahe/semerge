@@ -1,6 +1,7 @@
 package uffd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -13,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,6 +55,10 @@ type Config struct {
 
 	// Number of worker goroutines. 0 → runtime.NumCPU(); minimum 2.
 	NumWorkers int
+
+	// StartupRecorder is used during cold start to record demand faults.
+	// If active, batching is disabled to record actual access patterns.
+	StartupRecorder *profile.Recorder
 
 	// Optional logger; nil → discarded.
 	Logf func(string, ...any)
@@ -106,8 +112,12 @@ type Handler struct {
 	uffds   []*os.File
 	uffdsMu sync.Mutex
 
-	addrMap *AddressMap
-	state   *PageStateMap
+	addrMap          *AddressMap
+	state            *PageStateMap
+	prefillRegionsMu sync.RWMutex
+	prefillRegions   []prefillRegion
+	profileModeMu    sync.RWMutex
+	pendingFaults    atomic.Int64
 
 	epfd int
 
@@ -160,14 +170,35 @@ type handlerStats struct {
 	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
 	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
 
+	prefillRequestedBytes atomic.Uint64
+	prefillFilledBytes    atomic.Uint64
+	prefillExistingBytes  atomic.Uint64
+	prefillSkippedZero    atomic.Uint64
+	prefillFetchErrors    atomic.Uint64
+	prefillDurationNs     atomic.Uint64
+	prefillResumeWaitNs   atomic.Uint64
+	prefillTimedOut       atomic.Bool
+	prefillBudgetExhaust  atomic.Bool
+
 	inflight atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
 	pageIn   latHist      // page-in FETCH latency (data Source.ReadAt; the slow-remote/cache signal)
 }
 
+type prefillRegion struct {
+	fd          int
+	vaStart     uint64
+	size        uint64
+	memfdOffset uint64
+}
+
 type faultEvent struct {
-	address uint64
-	flags   uint64
-	uffdFD  int // which uffd this came from — determines ioctl target fd
+	address     uint64
+	memfdOffset uint64
+	flags       uint64
+	uffdFD      int // which uffd this came from — determines ioctl target fd
+	profileSeq  uint32
+	recording   bool
+	singlePage  bool
 }
 
 // NewWithBackendUffd constructs the single-uffd handler. The CH-side
@@ -222,8 +253,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		return nil, fmt.Errorf("epoll_ctl ADD uffdC fd=%d: %w", uffdCFromCH, err)
 	}
 
-	numPages := cfg.Size / PageSize
-	state := NewPageStateMap(numPages)
+	state := NewPageStateMap(cfg.Size / PageSize)
 
 	queues := make([]chan faultEvent, cfg.NumWorkers)
 	for i := range queues {
@@ -274,6 +304,140 @@ func (h *Handler) AddUffd(uffdFD int) error {
 // ProcessCH on handshake (must happen BEFORE the first uffdC fault,
 // so the handler can translate ev.address → memfd offset).
 func (h *Handler) AddressMap() *AddressMap { return h.addrMap }
+
+// RegisterPrefillRegion associates a CH VMA with the userfaultfd that owns it.
+// AddressMap intentionally does not retain fds, so proactive UFFDIO_COPY needs
+// this parallel table to translate stable memfd offsets back to (fd, chVA).
+func (h *Handler) RegisterPrefillRegion(fd int, vaStart, size uint64) error {
+	memfdOffset, ok := h.addrMap.LocateFor(ProcessCH, vaStart)
+	if !ok {
+		return fmt.Errorf("uffd: prefill region va 0x%x not registered", vaStart)
+	}
+	h.prefillRegionsMu.Lock()
+	h.prefillRegions = append(h.prefillRegions, prefillRegion{fd: fd, vaStart: vaStart, size: size, memfdOffset: memfdOffset})
+	h.prefillRegionsMu.Unlock()
+	return nil
+}
+
+// PrefillCopy installs snapshot data without writing sandbox-ctl's shared mmap.
+// One page per ioctl keeps EEXIST unambiguous: if CH restore already owns a
+// folio, prefill skips that page without overwriting it.
+func (h *Handler) PrefillCopy(ctx context.Context, memfdOffset uint64, data []byte) (filled, existed uint64, err error) {
+	if memfdOffset%PageSize != 0 || len(data)%PageSize != 0 {
+		return 0, 0, fmt.Errorf("uffd: unaligned prefill off=%d len=%d", memfdOffset, len(data))
+	}
+	for pos := 0; pos < len(data); pos += PageSize {
+		if err := ctx.Err(); err != nil {
+			return filled, existed, err
+		}
+		off := memfdOffset + uint64(pos)
+		pageIdx := off / PageSize
+
+		// A Loaded page already has usable content. Released is a lifecycle
+		// skip, not an "existing" folio, and is therefore not counted as one.
+		switch h.state.Get(pageIdx) {
+		case StateLoaded:
+			existed += PageSize
+			continue
+		case StateReleased:
+			continue
+		}
+
+		var region prefillRegion
+		for {
+			h.prefillRegionsMu.RLock()
+			found := false
+			for _, r := range h.prefillRegions {
+				if off >= r.memfdOffset && off < r.memfdOffset+r.size {
+					region, found = r, true
+					break
+				}
+			}
+			h.prefillRegionsMu.RUnlock()
+			if found {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return filled, existed, ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		}
+		dst := region.vaStart + (off - region.memfdOffset)
+		src := uint64(uintptr(unsafe.Pointer(&data[pos])))
+		var copyErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return filled, existed, err
+			}
+			copyErr = ioctlUffdCopy(region.fd, dst, src, PageSize)
+			if !errors.Is(copyErr, unix.EAGAIN) {
+				break
+			}
+			runtime.Gosched()
+		}
+		if copyErr != nil {
+			if errors.Is(copyErr, unix.EEXIST) {
+				existed += PageSize
+				continue
+			}
+			return filled, existed, copyErr
+		}
+
+		// Publish Loaded only if no lifecycle transition happened while COPY
+		// was in the kernel. Never try to "repair" StateReleased with a second
+		// PUNCH_HOLE: state inspection plus punch is not atomic. Restore keeps
+		// vCPUs paused until prefill completes, so Guest faults and balloon
+		// EVENT_REMOVE cannot enter this window.
+		if !h.state.CompareAndSwap(pageIdx, StateAbsent, StateLoaded) {
+			if h.state.Get(pageIdx) == StateLoaded {
+				existed += PageSize
+			}
+			continue
+		}
+
+		filled += PageSize
+	}
+	return filled, existed, nil
+}
+
+// BeginProfileRecording creates a hard transition from speculative batching to
+// one-page demand recording: dispatch is stopped while all old queued/inflight
+// faults drain, so no pre-window batch can hide pages from the Profile.
+func (h *Handler) BeginProfileRecording(ctx context.Context) error {
+	h.profileModeMu.Lock()
+	defer h.profileModeMu.Unlock()
+	// pendingFaults is incremented before an event becomes visible to a
+	// worker and decremented only after handling (or shutdown discard). Unlike
+	// QueueDepth+Inflight, it has no dequeue-before-inflight sampling gap.
+	for h.pendingFaults.Load() != 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if h.cfg.StartupRecorder != nil {
+		h.cfg.StartupRecorder.Start()
+	}
+	return nil
+}
+
+// RecordPrefillStats records the final execution stats of the prefill worker pool.
+func (h *Handler) RecordPrefillStats(requested, filled, existing, skipped, errors, durationNs uint64, budgetExhausted bool) {
+	h.stats.prefillRequestedBytes.Store(requested)
+	h.stats.prefillFilledBytes.Store(filled)
+	h.stats.prefillExistingBytes.Store(existing)
+	h.stats.prefillSkippedZero.Store(skipped)
+	h.stats.prefillFetchErrors.Store(errors)
+	h.stats.prefillDurationNs.Store(durationNs)
+	h.stats.prefillBudgetExhaust.Store(budgetExhausted)
+}
+
+func (h *Handler) RecordPrefillResumeWait(durationNs uint64, timedOut bool) {
+	h.stats.prefillResumeWaitNs.Store(durationNs)
+	h.stats.prefillTimedOut.Store(timedOut)
+}
 
 // Start spawns the reader and worker goroutines.
 func (h *Handler) Start() {
@@ -404,7 +568,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 	switch msg.Event {
 	case uffdEventPagefault:
 		pf := (*uffdMsgPagefault)(unsafe.Pointer(&msg.Arg[0]))
-		offset, ok := h.addrMap.Locate(pf.Address)
+		offset, ok := h.addrMap.LocateFor(ProcessCH, pf.Address)
 		if !ok {
 			h.logf("uffd: fault at unknown va 0x%x (fd=%d)", pf.Address, fromFD)
 			h.stats.errors.Add(1)
@@ -413,10 +577,22 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		}
 		idx := offset / PageSize
 		hashed := pageIdxHash(idx) % uint64(len(h.queue))
-		select {
-		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD}:
-		case <-h.stop:
+		h.profileModeMu.RLock()
+		seq, recording := uint32(0), false
+		singlePage := false
+		if h.cfg.StartupRecorder != nil {
+			seq, recording, singlePage = h.cfg.StartupRecorder.ReserveFault()
 		}
+		h.pendingFaults.Add(1)
+		select {
+		case h.queue[hashed] <- faultEvent{address: pf.Address, memfdOffset: offset, flags: pf.Flags, uffdFD: fromFD, profileSeq: seq, recording: recording, singlePage: singlePage}:
+		case <-h.stop:
+			h.pendingFaults.Add(-1)
+			if recording {
+				h.cfg.StartupRecorder.Discard()
+			}
+		}
+		h.profileModeMu.RUnlock()
 	case uffdEventRemove, uffdEventUnmap:
 		rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
 		h.handleRemove(rm.Start, rm.End, fromFD)
@@ -442,7 +618,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 // madvise as a fallback so we don't lose the reclaim signal.
 func (h *Handler) handleRemove(startVA, endVA uint64, fromFD int) {
 	_ = fromFD
-	startOff, ok := h.addrMap.Locate(startVA)
+	startOff, ok := h.addrMap.LocateFor(ProcessCH, startVA)
 	if !ok {
 		h.logf("uffd: EVENT_REMOVE start 0x%x unknown", startVA)
 		return
@@ -608,7 +784,19 @@ func (h *Handler) runWorker(idx int) {
 	for {
 		select {
 		case <-h.stop:
-			return
+			// The reader has already stopped before h.stop closes, so the queue
+			// is finite. Complete recorder reservations for events we abandon.
+			for {
+				select {
+				case ev := <-q:
+					if ev.recording {
+						h.cfg.StartupRecorder.Discard()
+					}
+					h.pendingFaults.Add(-1)
+				default:
+					return
+				}
+			}
 		case ev, ok := <-q:
 			if !ok {
 				return
@@ -662,15 +850,21 @@ func (h *Handler) recordBatch(pages uint64) {
 }
 
 func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+	defer h.pendingFaults.Add(-1)
+	committed := false
+	if ev.recording {
+		defer func() {
+			if !committed {
+				h.cfg.StartupRecorder.Discard()
+			}
+		}()
+	}
 	h.stats.inflight.Add(1)
 	defer h.stats.inflight.Add(-1)
-	memfdOffset, ok := h.addrMap.Locate(ev.address)
-	if !ok {
-		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
-		h.stats.errors.Add(1)
-		_ = ioctlUffdWake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
-		return
-	}
+	// dispatch resolved this against ProcessCH before enqueue. Carrying the
+	// offset also avoids a second lookup that could accidentally match an
+	// equal numeric VA registered for sandbox-ctl's backend mapping.
+	memfdOffset := ev.memfdOffset
 	pageVA := ev.address &^ (PageSize - 1)
 	pageOffset := memfdOffset &^ (PageSize - 1)
 	pageIdx := pageOffset / PageSize
@@ -684,7 +878,12 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 		// pageIdx. Source then picks any n ≤ this, aligned to its
 		// own internal boundaries (chunk for manifest, IsZero
 		// transition for sparse).
-		capPages := h.absentRunFrom(pageIdx)
+		var capPages uint64
+		if ev.singlePage {
+			capPages = 1
+		} else {
+			capPages = h.absentRunFrom(pageIdx)
+		}
 		capBytes := capPages * PageSize
 		// Clamp to the CH region containing pageOffset: a fill ioctl
 		// runs on one region's uffd fd and must not cross into the next
@@ -773,6 +972,10 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			}
 			h.stats.zeropages.Add(1)
 			h.stats.pagesZeroed.Add(runPages)
+			if ev.recording {
+				h.cfg.StartupRecorder.Commit(pageOffset, ev.profileSeq)
+				committed = true
+			}
 		} else {
 			src := uint64(uintptr(unsafe.Pointer(&pageBuf[0])))
 			err := ioctlUffdCopy(ev.uffdFD, pageVA, src, runBytes)
@@ -805,6 +1008,10 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			}
 			h.stats.copies.Add(1)
 			h.stats.pagesCopied.Add(runPages)
+			if ev.recording {
+				h.cfg.StartupRecorder.Commit(pageOffset, ev.profileSeq)
+				committed = true
+			}
 		}
 		// Mark the run Loaded so subsequent faults short-circuit.
 		for i := uint64(0); i < runPages; i++ {
@@ -924,9 +1131,28 @@ func (h *Handler) Stats() map[string]uint64 {
 		avgBatch = pagesSum / calls
 	}
 	return map[string]uint64{
-		"faults_absent":         h.stats.faultsAbsent.Load(),
-		"faults_released":       h.stats.faultsReleased.Load(),
-		"faults_loaded":         h.stats.faultsLoaded.Load(),
+		"faults_absent":           h.stats.faultsAbsent.Load(),
+		"faults_released":         h.stats.faultsReleased.Load(),
+		"faults_loaded":           h.stats.faultsLoaded.Load(),
+		"prefill_requested_bytes": h.stats.prefillRequestedBytes.Load(),
+		"prefill_filled_bytes":    h.stats.prefillFilledBytes.Load(),
+		"prefill_existing_bytes":  h.stats.prefillExistingBytes.Load(),
+		"prefill_skipped_zero":    h.stats.prefillSkippedZero.Load(),
+		"prefill_errors":          h.stats.prefillFetchErrors.Load(),
+		"prefill_duration_ns":     h.stats.prefillDurationNs.Load(),
+		"prefill_resume_wait_ns":  h.stats.prefillResumeWaitNs.Load(),
+		"prefill_timed_out": func() uint64 {
+			if h.stats.prefillTimedOut.Load() {
+				return 1
+			}
+			return 0
+		}(),
+		"prefill_budget_exhausted": func() uint64 {
+			if h.stats.prefillBudgetExhaust.Load() {
+				return 1
+			}
+			return 0
+		}(),
 		"zeropage_calls":        h.stats.zeropages.Load(),
 		"copy_calls":            h.stats.copies.Load(),
 		"pages_zeroed":          h.stats.pagesZeroed.Load(),

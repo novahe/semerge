@@ -118,29 +118,33 @@ crypto:
 *   **密钥边界**：`manifest.key` 必须是 64 个十六进制字符（32 字节/256 位）；`MANIFEST_KEY` 可提供或覆盖 YAML 中的 key。缺乏正确 key 时无法解开 manifest/chunk。
 *   **读写路径统一**：vhost 块读、UFFD page source、snapshot ingest 和 `upload-snapshot` 都复用同一套 manifest/cache/store 配置；cache 为空时直接走 store。
 
-### 2.3 CLI / env / YAML 的职责边界
+### 2.3 操作入口与职责边界
+
+`sandbox-ctl` 的行为与能力主要通过多级配置参数（CLI / env / YAML）与不同的子命令向外暴露。为了避免配置混乱，本节详细梳理了各种参数的职责边界以及对应子命令的典型使用场景。
+
+#### 2.3.1 CLI / env / YAML 的职责边界
 
 | 类别          | 入口                                                                       | 场景说明                                                                                                                                                                          |
 | :------------ | :------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 沙箱拓扑      | `--config`, `SANDBOX_CONFIG`                                               | 用于定义沙箱的硬件/设备模型。**场景**：冷启动沙箱时加载基础配置；或在跨机器恢复（Restore）快照时，通过追加第二个 YAML 文件（如 `a.yaml:b.yaml`）覆盖新机器特有的本地路径或网络。  |
-| 远端对象      | `--manifest-config`, `MANIFEST_CONFIG`, `MANIFEST_KEY`                     | 用于沙箱与远端存储底座交互。**场景**：基于远端快照极速冷启（按需加载/Lazy-fetch 页面）；或在制作沙箱快照后，将其内容直接上传至对象存储，方便其他节点秒级拉起复用。                 |
-| 沙箱身份      | `--sandbox-id`                                                             | 用于沙箱的生命周期寻址与管控。**场景**：单节点高密并发运行上千个沙箱时，其控制 Socket 和临时文件按 ID 严格隔离，后续执行 `snapshot`（打快照）或 `exec`（进沙箱）时凭此精准定位。    |
+| 远端对象      | `--manifest-config`, `MANIFEST_CONFIG`, `MANIFEST_KEY`                     | 用于沙箱与远端存储底座交互。**场景**：基于远端快照极速冷启（按需加载/Lazy-fetch 页面）；或在制作沙箱快照后，将其内容直接上传至对象存储，方便其他节点秒级拉起复用。                |
+| 沙箱身份      | `--sandbox-id`                                                             | 用于沙箱的生命周期寻址与管控。**场景**：单节点高密并发运行上千个沙箱时，其控制 Socket 和临时文件按 ID 严格隔离，后续执行 `snapshot`（打快照）或 `exec`（进沙箱）时凭此精准定位。  |
 | 本机路径      | `--run-root`, `--base-root`, `--ch-binary`                                 | 用于适配不同架构的环境目录规范。**场景**：将运行时的控制节点（run-root）与会膨胀的磁盘增量（base-root）分离存储，防止写满宿主机根分区；亦可用于无缝切换不同版本的底层虚拟机引擎。 |
 | 资源控制      | YAML `resources.control`, `--cgroup-path`, `--cgroup-adopt`                | 用于宿主机侧的算力物理隔离。**场景**：将主控程序保留在无限制的父组，仅把真正的沙箱虚拟机进程（Cloud Hypervisor）塞入严格限流的 Cgroup，彻底防止恶意用户跑满宿主 CPU/内存。        |
-| stdio/console | `--stdin/--stdout/--stderr`, `--*-from`, `--*-to`, `--tty`, `--console`    | 用于剥离和接管不同维度的日志流。**场景**：将沙箱内核崩溃底层的诊断日志接入运维监控，同时将沙箱内业务打出的常规日志（Stdio）通过管道导向到业务侧的日志聚合系统。                    |
+| stdio/console | `--stdin/--stdout/--stderr`, `--*-from`, `--*-to`, `--tty`, `--console`    | 用于剥离和接管不同维度的日志流。**场景**：将沙箱内核崩溃底层的诊断日志接入运维监控，同时将沙箱内业务打出的常规日志（Stdio）通过管道导向到业务侧的日志聚合系统。                   |
 | 观测/健康     | `--stats-interval`, `--stats-json`, `--ping-fatal-threshold`, `timeouts.*` | 用于系统探活与观测防呆。**场景**：暴露按需加载（Lazy-load）引发的系统缺页卡顿指标；或配置失联容忍度，让内部内核 Panic 死锁的沙箱主动自毁，防止卡死外部宿主机的控制面板。          |
-| 端口转发      | repeatable `--connect LOCAL:TARGET` 或 `LOCAL::TARGET`                     | 用于建立无网络栈开销的穿透隧道。**场景**：外界 Nginx 无需关注沙箱内网 IP，直接对接宿主机本地 UDS 文件进行请求转发；打快照时，系统自动切断并冻结该隧道，保证恢复时绝不串流。         |
+| 端口转发      | repeatable `--connect LOCAL:TARGET` 或 `LOCAL::TARGET`                     | 用于建立无网络栈开销的穿透隧道。**场景**：外界 Nginx 无需关注沙箱内网 IP，直接对接宿主机本地 UDS 文件进行请求转发；打快照时，系统自动切断并冻结该隧道，保证恢复时绝不串流。       |
 
-### 2.4 sandbox-ctl 子命令总览
+#### 2.3.2 sandbox-ctl 子命令总览
 
-| 子命令            | 当前职责                                                                                                                                  | 文档应避免的误解                                                                        |
-| :---------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- |
-| `run`             | 冷启动或 `--restore` 恢复；加载 sandbox/manifest 配置；建立 memfd/UFFD/vhost/launch/ctl.sock；承载 stdio、exec、snapshot、health、stats。 | 它不是只负责“拉起 VM”；运行期数据面和控制面也在这个常驻进程里。                         |
-| `snapshot`        | 连接运行中 sandbox 的 `ctl.sock`，请求 quiesce + CH pause/snapshot + overlay/memory sink；`--output` 与 `--upload` 二选一。               | 不是离线读取目录的命令，也不会同时输出本地文件和上传。                                  |
-| `upload-snapshot` | 不启动 VM，把本地 snapshot bundle 提升为 remote `manifest://` snapshot；校验 lower layer 引用并上传当前 bundle/overlay。                  | 输入是 snapshot path，不是任意快照目录；本地 lower layer 不能随意混用。                 |
-| `exec`            | 对运行中 sandbox 发 exec request；命令作为 user app 的 sibling 进入 app mount/pid namespace；退出码跟随 guest command。                   | UDS 名称是 `ctl.sock`；run 进程在 ack 后主要做字节 relay，MUX 端到端连接 CLI 与 guest。 |
-| `config`          | 生成、合并、校验 sandbox.yaml；支持 default/restore 模式和 strict/skip 检查。                                                             | 配置并不只有文档示例里的 resources/network/boot/launch 四块。                           |
-| `info`            | 从本地 snapshot 或 `manifest://` snapshot 中读取并打印嵌入的 `snapshot.cfg`。                                                             | 这是检查 snapshot chain、root/data disk refs、metadata 的轻量入口。                     |
+| 子命令            | 说明                                                                                                                                                                               |
+| :---------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run`             | **核心常驻进程**：不仅负责冷启动或 `--restore` 恢复（加载配置并建立 memfd/UFFD/vhost 等），还承载运行期的数据面（按需加载）和控制面（stdio、exec、snapshot、health、stats 等）。   |
+| `snapshot`        | **在线快照创建**：连接运行中 sandbox 的 `ctl.sock`，请求 quiesce + CH pause/snapshot + overlay/memory sink。必须针对运行中的沙箱执行。产物可保存在本地或直接上传至远端，两者互斥。 |
+| `upload-snapshot` | **快照上传推送**：不启动 VM，把本地 snapshot bundle 提升为 remote `manifest://` snapshot。用于校验引用并上传本地快照到远端存储。输入必须是合法的快照路径，且历史只读层链条完整。   |
+| `exec`            | **进入沙箱执行**：对运行中 sandbox 发 exec request；命令作为 user app 的 sibling 进入 namespaces，退出码跟随命令。通过 `ctl.sock` 交互，`run` 进程仅作字节中继实现端到端通信。     |
+| `config`          | **辅助配置工具**：生成、合并、校验 sandbox.yaml；支持 default/restore 模式和 strict/skip 检查。支持完整校验沙箱的最终配置清单。                                                    |
+| `info`            | **轻量级诊断入口**：从快照中读取并打印嵌入的 `snapshot.cfg`。无需启动沙箱即可快速查看快照的继承链、磁盘引用以及元数据等信息。                                                      |
 
 ## 3. Sandbox生命周期主路径
 
@@ -168,7 +172,7 @@ info = Template.build(tpl, name="my-template", cpu_count=2, memory_mb=2048)
 3. **Phase A/B/C 阶段流水线**：`run-builder` 驱动阶段 sandbox。Phase A 用 `sandbox-ctl exec flatten-ctl export` 在 guest 内拉取并展平 `fromImage`；Phase B 通过 envd 执行 RUN，通过 `flatten-ctl tar extract` 应用 COPY 并通过 `flatten-ctl export` 导出 rootfs；Phase C 通过 envd 启动 startCmd、轮询 readyCmd 后执行 `sandbox-ctl snapshot --output`。
 4. **结果回写与上传**：image-only 构建走 `manifest-ctl store image.img`；snapshot 构建走 `sandbox-ctl upload-snapshot <bundle>`，上传 bundle 及其引用的 overlay/base artifacts。`run-builder` 将 JSON 结果写到 stdout，systemd 捕获为 `<bid>.result`，`node-ctl` 读取后更新构建状态，此时 `Template.build()` 在客户端成功返回。
 
-#### 3.1.1 核心生命周期时序图
+**核心生命周期时序图与命令交互**
 
 这张图按 `node-ctl` 的真实入口和 `orchestrator/release-builder/test/e2e/e2e_run_builder.sh` 的主验证面绘制：B1 覆盖 `fromImage` 的 guest 内拉取与展平，B2 覆盖 `fromTemplate(img) + steps + startCmd/readyCmd` 生成 snapshot template，B3 覆盖从 snapshot template 继承 start/ready 后继续构建，B4 覆盖 COPY 上下文经 files endpoint 与 presigned URL 进入 build sandbox。
 
@@ -296,9 +300,9 @@ sequenceDiagram
 
 **路径二核心命令交互 (node-ctl -> sandbox-ctl)**
 
-| 关键命令                      | 核心入参 (Flags/Args)                                                                                                                                                                      | 返回值 / 产物 (Output)                                                   | 动作说明                                                                                |
-| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- |
-| `sandbox-ctl run` (Cold 模式) | `--config <sandbox.yaml[:overlay.yaml]>`<br/>`--sandbox-id <sid>`<br/>可选：`--manifest-config`, `--run-root`, `--base-root`, `--cgroup-path`, `--cgroup-adopt`, stdio/console/stats flags | 常驻进程；业务 stdio/console/stats 按 flags 输出                         | 完整启动 VM 与 guest runtime，建立统一运行期控制面和懒加载数据面。                      |
+| 关键命令                      | 核心入参 (Flags/Args)                                                                                                                                                                      | 返回值 / 产物 (Output)                           | 动作说明                                                           |
+| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- | :----------------------------------------------------------------- |
+| `sandbox-ctl run` (Cold 模式) | `--config <sandbox.yaml[:overlay.yaml]>`<br/>`--sandbox-id <sid>`<br/>可选：`--manifest-config`, `--run-root`, `--base-root`, `--cgroup-path`, `--cgroup-adopt`, stdio/console/stats flags | 常驻进程；业务 stdio/console/stats 按 flags 输出 | 完整启动 VM 与 guest runtime，建立统一运行期控制面和懒加载数据面。 |
 
 ### 3.3 Restore 极速恢复与按需加载
 
@@ -358,10 +362,10 @@ sequenceDiagram
 
 **路径三核心命令交互 (`node-ctl` → `sandbox-ctl`)**
 
-| 关键命令 | 核心入参 (Flags/Args) | 返回值 / 产物 (Output) | 动作说明 |
-| :--- | :--- | :--- | :--- |
-| `sandbox-ctl run` (Restore 模式) | `--restore <snapshot-path>` 或 `--restore manifest://<key>`<br/>`--config <host.yaml>`<br/>`--sandbox-id <sid>`<br/>manifest 恢复时需 `--manifest-config` 或 `MANIFEST_CONFIG` | 启动守护进程；业务 stdout/stderr/tty 的去向由 stdio flags 决定 | 解析 snapshot bundle 并拉起恢复态 VM；常驻承载 UFFD、vhost、exec、snapshot、stdio、health、stats。 |
-| *(隐式内部动作)* | `snapshot.cfg` + host YAML 派生 | layered memory source、root/data disk CoW、rewritten state-dir、restore notify | restore notify 负责恢复后重新建立 guest MUX；气球 resize 是差异校正，不是无条件全量放气。 |
+| 关键命令                         | 核心入参 (Flags/Args)                                                                                                                                                          | 返回值 / 产物 (Output)                                                         | 动作说明                                                                                           |
+| :------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
+| `sandbox-ctl run` (Restore 模式) | `--restore <snapshot-path>` 或 `--restore manifest://<key>`<br/>`--config <host.yaml>`<br/>`--sandbox-id <sid>`<br/>manifest 恢复时需 `--manifest-config` 或 `MANIFEST_CONFIG` | 启动守护进程；业务 stdout/stderr/tty 的去向由 stdio flags 决定                 | 解析 snapshot bundle 并拉起恢复态 VM；常驻承载 UFFD、vhost、exec、snapshot、stdio、health、stats。 |
+| *(隐式内部动作)*                 | `snapshot.cfg` + host YAML 派生                                                                                                                                                | layered memory source、root/data disk CoW、rewritten state-dir、restore notify | restore notify 负责恢复后重新建立 guest MUX；气球 resize 是差异校正，不是无条件全量放气。          |
 
 snapshot bundle、`from_refs`、`base_from_refs`、remote stacking 和 local merge 的数据结构见第 4 章；UFFD/vhost 的请求级数据路径见第 5 章。
 
@@ -571,13 +575,13 @@ graph TD
 
 #### 4.4.1 核心异同点
 
-| 维度 | 磁盘 (Disk) | 内存 (Memory) |
-| :--- | :--- | :--- |
-| **驱动组件** | `vhost-user-blk` (块设备驱动) | `Userfaultfd` (按需缺页中断) |
-| **可写顶层 (Live)** | 新建的块设备 CoW diff 文件 | VM RAM；已驻留页不进入 `fetch.NewLayered` 查询链 |
-| **增量快照层** | 捕获脏数据块，转为 `overlay.base` / `base_from_refs` | 捕获驻留页/非空洞页，转为 `selfStream` / `from_refs` |
-| **最底层的区别** | overlay 模式最终兜底到 **静态只读 EROFS base**。 | 所有 snapshot 层都是空洞时使用 **ZEROPAGE**。 |
-| **共用机制** | 均复用 `fetch.NewLayered(layers...)`，按 top → bottom 逐层解析数据、显式零区间和空洞。 | 同左。 |
+| 维度                | 磁盘 (Disk)                                                                            | 内存 (Memory)                                        |
+| :------------------ | :------------------------------------------------------------------------------------- | :--------------------------------------------------- |
+| **驱动组件**        | `vhost-user-blk` (块设备驱动)                                                          | `Userfaultfd` (按需缺页中断)                         |
+| **可写顶层 (Live)** | 新建的块设备 CoW diff 文件                                                             | VM RAM；已驻留页不进入 `fetch.NewLayered` 查询链     |
+| **增量快照层**      | 捕获脏数据块，转为 `overlay.base` / `base_from_refs`                                   | 捕获驻留页/非空洞页，转为 `selfStream` / `from_refs` |
+| **最底层的区别**    | overlay 模式最终兜底到 **静态只读 EROFS base**。                                       | 所有 snapshot 层都是空洞时使用 **ZEROPAGE**。        |
+| **共用机制**        | 均复用 `fetch.NewLayered(layers...)`，按 top → bottom 逐层解析数据、显式零区间和空洞。 | 同左。                                               |
 
 ## 5. 按需加载数据面
 

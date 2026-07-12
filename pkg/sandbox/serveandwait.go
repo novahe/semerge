@@ -3,9 +3,6 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"log"
 	"net"
 	"os"
@@ -17,10 +14,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
+	"github.com/kuasar-sandbox/sandboxer/pkg/prefill"
+	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -62,15 +64,74 @@ type CmdEnv struct {
 //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
 //     a non-nil return aborts the run (ServeAndWait kills CH).
 type PostSpawnCtx struct {
-	Ctx          context.Context
-	Cmd          *exec.Cmd
-	Pinger       *guestlink.Pinger
-	Launch       *guestlink.LaunchServer
-	EstablishMUX func(net.Conn, proto.StdioSpec) error
-	Hooks        *resctl.ControllerHooks
-	Balloon      *resctl.BalloonController
-	CHSock       string
-	Logf         func(string, ...any)
+	Ctx                     context.Context
+	Cmd                     *exec.Cmd
+	Pinger                  *guestlink.Pinger
+	Launch                  *guestlink.LaunchServer
+	EstablishMUX            func(net.Conn, proto.StdioSpec) error
+	Hooks                   *resctl.ControllerHooks
+	Balloon                 *resctl.BalloonController
+	CHSock                  string
+	Logf                    func(string, ...any)
+	PrefillDone             <-chan struct{}
+	CancelPrefill           context.CancelFunc
+	PrefillWaitTimeout      time.Duration
+	RecordPrefillResumeWait func(uint64, bool)
+	BeginProfileRecording   func() error
+}
+
+// prefillMetricsSink decouples startup metrics from UFFD handler creation.
+// CH may reach the API-ready timeout before sending its first va_report; in
+// that case metrics are retained here and applied when the handler arrives.
+type prefillMetricsSink struct {
+	mu sync.Mutex
+
+	handler       *uffd.Handler
+	stats         *prefill.PrefillStats
+	resumeWaitSet bool
+	resumeWaitNs  uint64
+	timedOut      bool
+}
+
+func (s *prefillMetricsSink) Attach(h *uffd.Handler) {
+	if h == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handler = h
+	if s.stats != nil {
+		recordPrefillStats(h, *s.stats)
+	}
+	if s.resumeWaitSet {
+		h.RecordPrefillResumeWait(s.resumeWaitNs, s.timedOut)
+	}
+}
+
+func (s *prefillMetricsSink) RecordStats(stats prefill.PrefillStats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copy := stats
+	s.stats = &copy
+	if s.handler != nil {
+		recordPrefillStats(s.handler, stats)
+	}
+}
+
+func (s *prefillMetricsSink) RecordResumeWait(ns uint64, timedOut bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeWaitSet = true
+	s.resumeWaitNs = ns
+	s.timedOut = timedOut
+	if s.handler != nil {
+		s.handler.RecordPrefillResumeWait(ns, timedOut)
+	}
+}
+
+func recordPrefillStats(h *uffd.Handler, stats prefill.PrefillStats) {
+	h.RecordPrefillStats(stats.BytesRequested, stats.BytesFilled, stats.BytesExisting,
+		stats.SkippedZero, stats.FetchErrors, uint64(stats.Duration.Nanoseconds()), stats.BudgetExhausted)
 }
 
 // VMParams is the input to ServeAndWait — everything the shared
@@ -90,6 +151,12 @@ type VMParams struct {
 
 	CapBytes   int64               // RAM capacity (memfd size); also stats UffdRAMSize
 	UffdSource uffd.SnapshotReader // ZeroSource (cold) | snapshot source (restore)
+
+	StartupProfile          *profile.MemoryProfile
+	PreparedPrefill         *prefill.Plan
+	InheritedStartupProfile []byte
+	StartupRecorder         *profile.Recorder
+	PrefillOptions          prefill.PrefillOptions
 
 	// Disks are the logical disks served to the guest, in order: Disks[0] is
 	// the root, Disks[1:] are the boot.disks[] data disks (boot.disks[] order).
@@ -234,6 +301,9 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	defer memfd.Close()
 
+	handlerReady := make(chan *uffd.Handler, 1)
+	profileHandlerReady := make(chan *uffd.Handler, 1)
+
 	// AddressMap is shared between the va_report server (registers
 	// ProcessCH on receive) and the uffd Handler (Locate on each fault).
 	addrMap := uffd.NewAddressMap(uint64(memfd.Size()))
@@ -246,6 +316,7 @@ func ServeAndWait(p VMParams) (int, error) {
 	// reach it after ctx cancellation.
 	var uffdHandler *uffd.Handler
 	var uffdHandlerMu sync.Mutex
+	prefillMetrics := &prefillMetricsSink{}
 	defer func() {
 		uffdHandlerMu.Lock()
 		h := uffdHandler
@@ -262,20 +333,36 @@ func ServeAndWait(p VMParams) (int, error) {
 		HandshakeDeadline: p.VAReportDeadline,
 		OnReady: func(uffdFD int, vaStart, size uint64) error {
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
-				MemfdFD:   memfd.FD(),
-				BackendVA: memfd.Addr(),
-				Size:      memfd.Size(),
-				Source:    p.UffdSource,
-				Logf:      logf,
+				MemfdFD:         memfd.FD(),
+				BackendVA:       memfd.Addr(),
+				Size:            memfd.Size(),
+				Source:          p.UffdSource,
+				StartupRecorder: p.StartupRecorder,
+				Logf:            logf,
 			})
 			if err != nil {
 				return err
 			}
 			h.Start()
+			if err := h.RegisterPrefillRegion(uffdFD, vaStart, size); err != nil {
+				_ = h.Close()
+				return err
+			}
 			uffdHandlerMu.Lock()
 			uffdHandler = h
 			uffdHandlerMu.Unlock()
+			prefillMetrics.Attach(h)
 			logf("uffd handler: adopted CH uffd region #0 fd=%d size=%d", uffdFD, size)
+
+			select {
+			case handlerReady <- h:
+			default:
+			}
+			select {
+			case profileHandlerReady <- h:
+			default:
+			}
+
 			return nil
 		},
 		OnRegister: func(uffdFD int, vaStart, size uint64) error {
@@ -286,6 +373,9 @@ func ServeAndWait(p VMParams) (int, error) {
 				return fmt.Errorf("OnRegister called before OnReady (no handler yet)")
 			}
 			if err := h.AddUffd(uffdFD); err != nil {
+				return err
+			}
+			if err := h.RegisterPrefillRegion(uffdFD, vaStart, size); err != nil {
 				return err
 			}
 			logf("uffd handler: attached additional region fd=%d size=%d", uffdFD, size)
@@ -362,6 +452,40 @@ func ServeAndWait(p VMParams) (int, error) {
 			}
 		},
 	}
+	var beginProfileOnce sync.Once
+	var beginProfileErr error
+	beginProfileRecording := func() error {
+		if p.StartupRecorder == nil {
+			return nil
+		}
+		beginProfileOnce.Do(func() {
+			var h *uffd.Handler
+			select {
+			case h = <-profileHandlerReady:
+			case <-backendCtx.Done():
+				beginProfileErr = backendCtx.Err()
+				return
+			}
+			if err := h.BeginProfileRecording(backendCtx); err != nil {
+				beginProfileErr = err
+				return
+			}
+			// Snapshot may freeze the recorder before this timer. Freeze is
+			// idempotent, so the timer only defines the maximum learning window.
+			go func() {
+				select {
+				case <-time.After(2 * time.Second):
+					p.StartupRecorder.Freeze(uint64(memfd.Size()))
+				case <-backendCtx.Done():
+					p.StartupRecorder.Freeze(uint64(memfd.Size()))
+				}
+			}()
+		})
+		return beginProfileErr
+	}
+	if p.StartupRecorder != nil {
+		launch.BeforeLaunch = beginProfileRecording
+	}
 	if p.WireLaunchMUX {
 		launch.OnMUXReady = func(conn net.Conn, established proto.StdioSpec) {
 			if err := establishMUX(conn, established); err != nil {
@@ -400,18 +524,20 @@ func ServeAndWait(p VMParams) (int, error) {
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
 	snapHandler := &SnapshotHandler{
-		Cfg:         p.SnapCfg,
-		ManifestCfg: p.ManifestCfg,
-		SandboxID:   p.SandboxID,
-		Memfd:       memfd,
-		Disks:       snapDisks,
-		Servers:     servers,
-		CHSock:      chSock,
-		RunDir:      runDir,
-		Pinger:      pinger,
-		Forwarder:   forwarder,
-		Reattach:    reattach,
-		Logf:        logf,
+		Cfg:                     p.SnapCfg,
+		ManifestCfg:             p.ManifestCfg,
+		SandboxID:               p.SandboxID,
+		Memfd:                   memfd,
+		Disks:                   snapDisks,
+		Servers:                 servers,
+		CHSock:                  chSock,
+		RunDir:                  runDir,
+		Pinger:                  pinger,
+		Forwarder:               forwarder,
+		Reattach:                reattach,
+		Logf:                    logf,
+		StartupRecorder:         p.StartupRecorder,
+		InheritedStartupProfile: p.InheritedStartupProfile,
 	}
 	ctlSrv := &ctl.Server{
 		Path:            ctlSockPath,
@@ -521,6 +647,37 @@ func ServeAndWait(p VMParams) (int, error) {
 	}
 	chPid := cmd.Process.Pid
 	logf("CH started pid=%d", chPid)
+	prefillDone := make(chan struct{})
+	prefillCtx, cancelPrefill := context.WithCancel(backendCtx)
+	defer cancelPrefill()
+	if p.PreparedPrefill != nil {
+		// Profile fetching and UFFDIO_COPY overlap CH restore. Restore's
+		// PostSpawn waits for this bounded operation before vm.resume, so Guest
+		// demand faults and balloon REMOVE cannot race snapshot injection.
+		backendWG.Add(1)
+		go func() {
+			defer backendWG.Done()
+			defer p.PreparedPrefill.Close()
+			defer cancelPrefill()
+			// prefillDone is the resume gate: it closes as soon as the sole
+			// injector has returned. Plan.Close may still be joining canceled
+			// fetch workers, but those workers never issue UFFDIO_COPY.
+			defer close(prefillDone)
+			var stats prefill.PrefillStats
+			select {
+			case h := <-handlerReady:
+				stats = p.PreparedPrefill.Inject(prefillCtx, h)
+				logf("startup-prefill: ranges=%d bytes=%d existing=%d errors=%d duration=%v", stats.CompletedRanges, stats.BytesFilled, stats.BytesExisting, stats.FetchErrors, stats.Duration)
+			case <-prefillCtx.Done():
+				stats = p.PreparedPrefill.CanceledStats()
+				logf("startup-prefill: canceled before handler became available: %v", prefillCtx.Err())
+			}
+			prefillMetrics.RecordStats(stats)
+		}()
+	} else {
+		cancelPrefill()
+		close(prefillDone)
+	}
 
 	// Move CH (and only CH) into the per-sandbox cgroup. sandbox-ctl
 	// stays in its parent cgroup — see pkg/sandbox/cgroup.go header.
@@ -543,15 +700,22 @@ func ServeAndWait(p VMParams) (int, error) {
 	})
 
 	if err := p.PostSpawn(PostSpawnCtx{
-		Ctx:          backendCtx,
-		Cmd:          cmd,
-		Pinger:       pinger,
-		Launch:       launch,
-		EstablishMUX: establishMUX,
-		Hooks:        p.Hooks,
-		Balloon:      p.Balloon,
-		CHSock:       chSock,
-		Logf:         logf,
+		Ctx:                backendCtx,
+		Cmd:                cmd,
+		Pinger:             pinger,
+		Launch:             launch,
+		EstablishMUX:       establishMUX,
+		Hooks:              p.Hooks,
+		Balloon:            p.Balloon,
+		CHSock:             chSock,
+		Logf:               logf,
+		PrefillDone:        prefillDone,
+		CancelPrefill:      cancelPrefill,
+		PrefillWaitTimeout: p.PrefillOptions.Timeout,
+		RecordPrefillResumeWait: func(ns uint64, timedOut bool) {
+			prefillMetrics.RecordResumeWait(ns, timedOut)
+		},
+		BeginProfileRecording: beginProfileRecording,
 	}); err != nil {
 		_ = cmd.Process.Kill()
 		cancelBackends()
