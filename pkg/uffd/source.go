@@ -1,5 +1,7 @@
 package uffd
 
+import "context"
+
 // SnapshotReader supplies the page contents the handler installs at a
 // given memfd offset on an Absent fault.
 //
@@ -36,6 +38,11 @@ type SnapshotReader interface {
 	//
 	// Safe for concurrent use.
 	ReadAt(buf []byte, memfdOffset uint64) (n int, zero bool, err error)
+
+	// CloneWithContext creates a new instance of the reader bound to the given context.
+	// This allows background workers to enforce hard timeouts via context cancellation
+	// without affecting the global UFFD reader.
+	CloneWithContext(ctx context.Context) SnapshotReader
 }
 
 // ZeroSource implements SnapshotReader for cold-start. Every page is
@@ -44,4 +51,8 @@ type ZeroSource struct{}
 
 func (ZeroSource) ReadAt(buf []byte, _ uint64) (int, bool, error) {
 	return len(buf), true, nil
+}
+
+func (ZeroSource) CloneWithContext(context.Context) SnapshotReader {
+	return ZeroSource{}
 }

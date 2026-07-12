@@ -63,6 +63,9 @@ type Sources struct {
 	// SnapshotCfg renders snapshot.cfg given the final overlay refs (one per
 	// logical disk, in Diffs order).
 	SnapshotCfg func(overlayRefs []string) ([]byte, error)
+	// StartupProfile freezes the cold-start recorder at the snapshot barrier.
+	// It is optional performance metadata; failure is logged and fail-open.
+	StartupProfile func() ([]byte, error)
 
 	Quiescer Quiescer
 	Logf     func(string, ...any)
@@ -178,11 +181,19 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
 	}
-	zipBytes, err := BuildZIP(map[string][]byte{
+	entries := map[string][]byte{
 		"config.json":  configJSON,
 		"state.json":   stateJSON,
 		"snapshot.cfg": snapshotCfg,
-	})
+	}
+	if s.StartupProfile != nil {
+		if b, profileErr := s.StartupProfile(); profileErr != nil {
+			logf("startup profile: %v (omitted)", profileErr)
+		} else if len(b) > 0 {
+			entries["startup-profile.json"] = b
+		}
+	}
+	zipBytes, err := BuildZIP(entries)
 	if err != nil {
 		return nil, fmt.Errorf("build zip: %w", err)
 	}

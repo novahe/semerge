@@ -58,6 +58,9 @@ type LaunchServer struct {
 	// just ack. This is the Settled trigger: post-boot transient is over,
 	// safe to engage memory.high / controller RPCs.
 	OnLaunchAck func()
+	// BeforeLaunch runs after hello is received but before LaunchSpec becomes
+	// visible to the guest. Returning an error aborts the handshake.
+	BeforeLaunch func() error
 
 	// OnAppStarted fires when the guest reports its user app has been
 	// fork/execed. Optional; nil → just ack.
@@ -190,6 +193,12 @@ func (s *LaunchServer) handleConn(conn *net.UnixConn) (handedOff bool) {
 			return false
 		}
 		s.Logf("launch: hello received (phase=%q), sending launch spec", msg.Phase)
+		if s.BeforeLaunch != nil {
+			if err := s.BeforeLaunch(); err != nil {
+				s.Logf("launch: before launch: %v", err)
+				return false
+			}
+		}
 		if err := proto.WriteMessage(conn, &proto.Message{
 			Type:   proto.TypeLaunch,
 			Launch: s.Spec,

@@ -165,11 +165,15 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
 	if err != nil {
 		return "", fmt.Errorf("render snapshot.cfg: %w", err)
 	}
-	zipBytes, err := snapshot.BuildZIP(map[string][]byte{
+	zipEntries := map[string][]byte{
 		"config.json":  ent["config.json"],
 		"state.json":   ent["state.json"],
 		"snapshot.cfg": newCfg,
-	})
+	}
+	if b, ok := ent["startup-profile.json"]; ok {
+		zipEntries["startup-profile.json"] = b
+	}
+	zipBytes, err := snapshot.BuildZIP(zipEntries)
 	if err != nil {
 		return "", fmt.Errorf("build zip: %w", err)
 	}

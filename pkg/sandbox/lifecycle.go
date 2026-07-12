@@ -5,9 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"io"
 	"log"
 	"os"
@@ -17,6 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+
 	"gopkg.in/yaml.v3"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -24,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -375,6 +377,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 	// faults, the merged launch spec whose conn becomes the stdio MUX
 	// (WireLaunchMUX), and a settle protocol gated on the guest's
 	// hello / launch_ack handshake.
+	startupRecorder := profile.NewRecorder()
 	return ServeAndWait(VMParams{
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
@@ -386,9 +389,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
 		StatsJSONPath:      opts.StatsJSONPath,
 		StatsInterval:      opts.StatsInterval,
 
-		CapBytes:   int64(capBytes),
-		UffdSource: uffd.ZeroSource{},
-		Disks:      disks,
+		CapBytes:        int64(capBytes),
+		UffdSource:      uffd.ZeroSource{},
+		StartupRecorder: startupRecorder,
+		Disks:           disks,
 
 		LaunchSpec:        launchSpec,
 		WireLaunchMUX:     true,
@@ -573,10 +577,28 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
 		"batch_pages_total",
 		"batch_avg_pages",
 		"batch_max_pages",
+		"prefill_requested_bytes",
+		"prefill_filled_bytes",
+		"prefill_existing_bytes",
+		"prefill_skipped_zero",
+		"prefill_errors",
+		"prefill_duration_ns",
+		"prefill_resume_wait_ns",
+		"prefill_timed_out",
+		"prefill_budget_exhausted",
 	}
 	for _, k := range keys {
 		fmt.Fprintf(w, "  %-20s %d\n", k, s[k])
 	}
+
+	reqBytes := s["prefill_requested_bytes"]
+	filledBytes := s["prefill_filled_bytes"]
+	skippedZero := s["prefill_skipped_zero"]
+	covRatio := 0.0
+	if reqBytes > 0 {
+		covRatio = float64(filledBytes+skippedZero) / float64(reqBytes) * 100
+	}
+	fmt.Fprintf(w, "  %-20s %.2f%%\n", "prefill_coverage", covRatio)
 }
 
 // guestDevPath maps a 0-based device index to its guest block device. virtio-blk
@@ -723,24 +745,26 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	Cfg         *config.SandboxConfig
-	ManifestCfg *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
-	SandboxID   string                 // required: snapshot.Take rejects empty
-	Memfd       *memory.Memfd
-	Disks       []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers     []*vhost.Server // all vhost servers (quiesced together around the dump)
-	CHSock      string
-	RunDir      string
-	Pinger      *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
-	Forwarder   *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach    func() error      // optional; re-establishes the stdio MUX after --resume
-	Logf        func(string, ...any)
+	Cfg                     *config.SandboxConfig
+	ManifestCfg             *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+	SandboxID               string                 // required: snapshot.Take rejects empty
+	Memfd                   *memory.Memfd
+	Disks                   []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+	Servers                 []*vhost.Server // all vhost servers (quiesced together around the dump)
+	CHSock                  string
+	RunDir                  string
+	Pinger                  *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
+	Forwarder               *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach                func() error      // optional; re-establishes the stdio MUX after --resume
+	Logf                    func(string, ...any)
+	StartupRecorder         *profile.Recorder
+	InheritedStartupProfile []byte
 }
 
 // Handle dispatches one ctl snapshot_request. Public for restore.Run.
 func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
 	opts := RunOptions{Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID}
-	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
+	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.StartupRecorder, h.InheritedStartupProfile, h.Logf)
 }
 
 // handleSnapshotRequest executes one snapshot_request received via
@@ -758,6 +782,8 @@ func handleSnapshotRequest(
 	pinger *guestlink.Pinger,
 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
 	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
+	startupRecorder *profile.Recorder,
+	inheritedStartupProfile []byte,
 	logf func(string, ...any),
 ) (resp ctl.Response, err error) {
 	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
@@ -897,6 +923,11 @@ func handleSnapshotRequest(
 		SnapshotCfg:   snapCfgBuilder,
 		Quiescer:      &allQuiescer{servers: servers},
 		Logf:          logf,
+	}
+	if startupRecorder != nil {
+		src.StartupProfile = func() ([]byte, error) { return startupRecorder.Marshal(uint64(mfd.Size())) }
+	} else if len(inheritedStartupProfile) > 0 {
+		src.StartupProfile = func() ([]byte, error) { return append([]byte(nil), inheritedStartupProfile...), nil }
 	}
 	if localParent {
 		if prov.ParentSnapshotPath == "" || prov.ParentOverlayPath == "" {

@@ -90,10 +90,19 @@ func (m *AddressMap) RegisterVMA(p ProcessKind, vaStart, size, memfdOffset uint6
 // Locate returns (memfdOffset, true) if faultVA falls within any
 // registered VMA (any process), else (_, false).
 func (m *AddressMap) Locate(faultVA uint64) (uint64, bool) {
+	return m.LocateFor(0, faultVA)
+}
+
+// LocateFor disambiguates equal numeric VAs belonging to different processes.
+// p==0 preserves the legacy any-process lookup for backend-only callers.
+func (m *AddressMap) LocateFor(p ProcessKind, faultVA uint64) (uint64, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for i := range m.vmas {
 		v := &m.vmas[i]
+		if p != 0 && v.process != p {
+			continue
+		}
 		if faultVA >= v.start && faultVA < v.end {
 			return v.memfdOffset + (faultVA - v.start), true
 		}

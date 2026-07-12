@@ -55,6 +55,14 @@ func NewStreamSnapshotSource(ctx context.Context, stream fetch.Stream, ramSize u
 	}, nil
 }
 
+func (s *StreamSnapshotSource) CloneWithContext(ctx context.Context) SnapshotReader {
+	return &StreamSnapshotSource{
+		stream:  s.stream,
+		ctx:     ctx,
+		ramSize: s.ramSize,
+	}
+}
+
 // ReadAt implements SnapshotReader.
 //
 // It classifies the run at memfdOffset via Stream.RunAt:

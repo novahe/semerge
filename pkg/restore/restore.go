@@ -10,9 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
 	"io"
 	"log"
 	"os"
@@ -20,8 +17,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
+	"github.com/kuasar-sandbox/sandboxer/pkg/prefill"
+	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
@@ -418,6 +421,39 @@ func Run(ctx context.Context, opts Options) (int, error) {
 	}
 	logf("snapshot source: %d memory layer(s)", len(memLayers))
 
+	// Extract and parse the startup profile, if present
+	var startupProfile *profile.MemoryProfile
+	var startupProfileData []byte
+	if profileData, ok := entries["startup-profile.json"]; ok {
+		prof, err := profile.Parse(profileData, capBytes)
+		if err != nil {
+			logf("startup-prefill: ignored invalid startup-profile.json: %v", err)
+		} else {
+			startupProfile = prof
+			startupProfileData = append([]byte(nil), profileData...)
+			logf("startup-prefill: loaded profile with %d ranges", len(prof.Targets[0].Ranges))
+		}
+	}
+	prefillOptions := prefill.PrefillOptions{
+		MaxBytes:    128 << 20,
+		BufferBytes: 64 << 20,
+		Timeout:     100 * time.Millisecond,
+	}
+	// Start remote reads at the earliest safe point: the memory source and
+	// validated profile now exist, while disk reconstruction, socket setup and
+	// CH restore are still ahead. Prepare is bounded by BufferBytes and performs
+	// no UFFD operation; injection remains gated on CH's handler.
+	preparedPrefill := prefill.Prepare(ctx, source, startupProfile, prefillOptions)
+	defer preparedPrefill.Close()
+	// A restore consumes the parent profile and, when one exists, records only
+	// newly faulted pages for the next snapshot generation. The recorder is
+	// seeded with the parent so repeated restore→snapshot cycles retain earlier
+	// priorities while appending new offsets under the same bounded cap.
+	var startupRecorder *profile.Recorder
+	if startupProfile != nil {
+		startupRecorder = profile.NewRecorderWithBase(startupProfile)
+	}
+
 	// Reconstruct each logical disk (root + data disks, in order): layer the
 	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
 	// writable CoW on top, and (overlay mode) open the erofs base as the ro
@@ -517,6 +553,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		UffdSource: source,
 		Disks:      disks,
 
+		StartupProfile:          startupProfile,
+		PreparedPrefill:         preparedPrefill,
+		InheritedStartupProfile: startupProfileData,
+		StartupRecorder:         startupRecorder,
+		PrefillOptions:          prefillOptions,
+
 		LaunchSpec:    &proto.LaunchSpec{},
 		WireLaunchMUX: false,
 		Balloon:       balloonCtl,
@@ -566,6 +608,30 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
 			}
+			// CH restore and profile fetching start together. If prefill has
+			// already finished this returns immediately; otherwise vCPUs remain
+			// paused for at most the configured wait budget after API readiness,
+			// plus the completion of any COPY already in the kernel. This keeps
+			// Guest demand faults and restored balloon activity out of the
+			// UFFDIO_COPY window, avoiding an unprovable COPY/REMOVE generation
+			// race while retaining overlap with the expensive CH restore phase.
+			if pc.PrefillDone != nil {
+				waited, timedOut, err := waitForPrefill(pc.Ctx, pc.PrefillDone, pc.CancelPrefill, pc.PrefillWaitTimeout)
+				if err != nil {
+					return err
+				}
+				if pc.RecordPrefillResumeWait != nil {
+					pc.RecordPrefillResumeWait(uint64(waited.Nanoseconds()), timedOut)
+				}
+			}
+			// Start the next-generation delta window only after proactive COPY
+			// has stopped, otherwise prefilled pages would be mistaken for Guest
+			// demand. Starting before resume captures the first restored fault.
+			if pc.BeginProfileRecording != nil {
+				if err := pc.BeginProfileRecording(); err != nil {
+					return fmt.Errorf("startup profile recording: %w", err)
+				}
+			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
 			}
@@ -613,6 +679,43 @@ func Run(ctx context.Context, opts Options) (int, error) {
 			return nil
 		},
 	})
+}
+
+// waitForPrefill is called only after CH API readiness. It returns immediately
+// when prefill is already done; timeout is the maximum additional vm.resume
+// wait budget, not a fixed delay. Work already hidden behind restore is free.
+// On timeout it cancels and joins the sole injector before returning; remote
+// fetch workers are cleaned up asynchronously because they never issue
+// UFFDIO_COPY. Thus resume is not delayed by remote teardown, while no COPY can
+// run after the Guest is resumed.
+func waitForPrefill(ctx context.Context, done <-chan struct{}, cancel context.CancelFunc, timeout time.Duration) (time.Duration, bool, error) {
+	start := time.Now()
+	if timeout <= 0 {
+		select {
+		case <-done:
+			return time.Since(start), false, nil
+		case <-ctx.Done():
+			return time.Since(start), false, ctx.Err()
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return time.Since(start), false, nil
+	case <-ctx.Done():
+		return time.Since(start), false, ctx.Err()
+	case <-timer.C:
+		if cancel != nil {
+			cancel()
+		}
+		select {
+		case <-done:
+			return time.Since(start), true, nil
+		case <-ctx.Done():
+			return time.Since(start), true, ctx.Err()
+		}
+	}
 }
 
 // reconstructDisk rebuilds one logical disk for restore: the read-only base is
