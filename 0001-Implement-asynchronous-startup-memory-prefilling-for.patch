@@ -1,4 +1,4 @@
-From 17cc189097406302944609100ca8da631b2b04f3 Mon Sep 17 00:00:00 2001
+From 065946a77c016eeff2e096ba22bca192bddef7f9 Mon Sep 17 00:00:00 2001
 From: novahe <heqianfly@gmail.com>
 Date: Mon, 13 Jul 2026 01:31:49 +0800
 Subject: [PATCH] Implement asynchronous startup memory prefilling for VM
@@ -48,15 +48,15 @@ Safety & Race Condition Defenses:
 
 Signed-off-by: novahe <heqianfly@gmail.com>
 ---
- ...ronous-startup-memory-prefilling-for.patch | 2583 +++++++++++++++++
+ ...ronous-startup-memory-prefilling-for.patch | 5367 +++++++++++++++++
  docs/sandboxer-design.md                      |   62 +-
- docs/startup-profile-memory-prefill.md        |  165 ++
+ docs/startup-profile-memory-prefill.md        |  165 +
  pkg/guestlink/launchsrv.go                    |    9 +
- pkg/prefill/prefill.go                        |  326 +++
+ pkg/prefill/prefill.go                        |  326 +
  pkg/prefill/prefill_test.go                   |  132 +
  pkg/profile/profile.go                        |  124 +
- pkg/profile/profile_test.go                   |  197 ++
- pkg/profile/recorder.go                       |  252 ++
+ pkg/profile/profile_test.go                   |  197 +
+ pkg/profile/recorder.go                       |  252 +
  pkg/restore/prefill_wait_test.go              |   34 +
  pkg/restore/restore.go                        |  109 +-
  pkg/restore/upload.go                         |    8 +-
@@ -71,7 +71,7 @@ Signed-off-by: novahe <heqianfly@gmail.com>
  pkg/uffd/source.go                            |   11 +
  pkg/uffd/source_stream.go                     |    8 +
  pkg/uffd/state.go                             |    6 +-
- 23 files changed, 4585 insertions(+), 117 deletions(-)
+ 23 files changed, 7369 insertions(+), 117 deletions(-)
  create mode 100644 0001-Implement-asynchronous-startup-memory-prefilling-for.patch
  create mode 100644 docs/startup-profile-memory-prefill.md
  create mode 100644 pkg/prefill/prefill.go
@@ -86,11 +86,11 @@ Signed-off-by: novahe <heqianfly@gmail.com>
 
 diff --git a/0001-Implement-asynchronous-startup-memory-prefilling-for.patch b/0001-Implement-asynchronous-startup-memory-prefilling-for.patch
 new file mode 100644
-index 0000000..1bca69b
+index 0000000..e843d26
 --- /dev/null
 +++ b/0001-Implement-asynchronous-startup-memory-prefilling-for.patch
-@@ -0,0 +1,2583 @@
-+From f43f9b50af1889a7bc9a283bc2df9d95474399f1 Mon Sep 17 00:00:00 2001
+@@ -0,0 +1,5367 @@
++From 17cc189097406302944609100ca8da631b2b04f3 Mon Sep 17 00:00:00 2001
 +From: novahe <heqianfly@gmail.com>
 +Date: Mon, 13 Jul 2026 01:31:49 +0800
 +Subject: [PATCH] Implement asynchronous startup memory prefilling for VM
@@ -140,29 +140,31 @@ index 0000000..1bca69b
 +
 +Signed-off-by: novahe <heqianfly@gmail.com>
 +---
-+ docs/sandboxer-design.md               |  62 ++---
-+ docs/startup-profile-memory-prefill.md | 152 ++++++++++++
-+ pkg/guestlink/launchsrv.go             |   9 +
-+ pkg/prefill/prefill.go                 | 326 +++++++++++++++++++++++++
-+ pkg/prefill/prefill_test.go            | 132 ++++++++++
-+ pkg/profile/profile.go                 | 124 ++++++++++
-+ pkg/profile/profile_test.go            |  96 ++++++++
-+ pkg/profile/recorder.go                | 204 ++++++++++++++++
-+ pkg/restore/prefill_wait_test.go       |  34 +++
-+ pkg/restore/restore.go                 |  92 ++++++-
-+ pkg/restore/upload.go                  |   8 +-
-+ pkg/sandbox/lifecycle.go               |  69 ++++--
-+ pkg/sandbox/prefill_metrics_test.go    |  36 +++
-+ pkg/sandbox/serveandwait.go            | 226 ++++++++++++++---
-+ pkg/snapshot/take.go                   |  15 +-
-+ pkg/uffd/addrmap.go                    |   9 +
-+ pkg/uffd/addrmap_test.go               |  20 ++
-+ pkg/uffd/handler.go                    | 270 ++++++++++++++++++--
-+ pkg/uffd/prefill_test.go               |  17 ++
-+ pkg/uffd/source.go                     |  11 +
-+ pkg/uffd/source_stream.go              |   8 +
-+ pkg/uffd/state.go                      |   6 +-
-+ 22 files changed, 1809 insertions(+), 117 deletions(-)
++ ...ronous-startup-memory-prefilling-for.patch | 2583 +++++++++++++++++
++ docs/sandboxer-design.md                      |   62 +-
++ docs/startup-profile-memory-prefill.md        |  165 ++
++ pkg/guestlink/launchsrv.go                    |    9 +
++ pkg/prefill/prefill.go                        |  326 +++
++ pkg/prefill/prefill_test.go                   |  132 +
++ pkg/profile/profile.go                        |  124 +
++ pkg/profile/profile_test.go                   |  197 ++
++ pkg/profile/recorder.go                       |  252 ++
++ pkg/restore/prefill_wait_test.go              |   34 +
++ pkg/restore/restore.go                        |  109 +-
++ pkg/restore/upload.go                         |    8 +-
++ pkg/sandbox/lifecycle.go                      |   69 +-
++ pkg/sandbox/prefill_metrics_test.go           |   36 +
++ pkg/sandbox/serveandwait.go                   |  240 +-
++ pkg/snapshot/take.go                          |   15 +-
++ pkg/uffd/addrmap.go                           |    9 +
++ pkg/uffd/addrmap_test.go                      |   20 +
++ pkg/uffd/handler.go                           |  270 +-
++ pkg/uffd/prefill_test.go                      |   17 +
++ pkg/uffd/source.go                            |   11 +
++ pkg/uffd/source_stream.go                     |    8 +
++ pkg/uffd/state.go                             |    6 +-
++ 23 files changed, 4585 insertions(+), 117 deletions(-)
++ create mode 100644 0001-Implement-asynchronous-startup-memory-prefilling-for.patch
 + create mode 100644 docs/startup-profile-memory-prefill.md
 + create mode 100644 pkg/prefill/prefill.go
 + create mode 100644 pkg/prefill/prefill_test.go
@@ -174,6 +176,2595 @@ index 0000000..1bca69b
 + create mode 100644 pkg/uffd/addrmap_test.go
 + create mode 100644 pkg/uffd/prefill_test.go
 +
++diff --git a/0001-Implement-asynchronous-startup-memory-prefilling-for.patch b/0001-Implement-asynchronous-startup-memory-prefilling-for.patch
++new file mode 100644
++index 0000000..1bca69b
++--- /dev/null
+++++ b/0001-Implement-asynchronous-startup-memory-prefilling-for.patch
++@@ -0,0 +1,2583 @@
+++From f43f9b50af1889a7bc9a283bc2df9d95474399f1 Mon Sep 17 00:00:00 2001
+++From: novahe <heqianfly@gmail.com>
+++Date: Mon, 13 Jul 2026 01:31:49 +0800
+++Subject: [PATCH] Implement asynchronous startup memory prefilling for VM
+++ restores
+++
+++This commit implements asynchronous startup memory prefilling using recorded
+++page access profiles (startup-profile.json) to proactively load hot pages,
+++reducing UFFD demand fault latency and optimizing VM restore performance.
+++
+++Key Enhancements & Architectures:
+++1. Asynchronous Prefill Engine:
+++   - Spawns concurrent background workers to read profiles and prefetch
+++     hot memory ranges right after Cloud Hypervisor starts.
+++   - Obeys user-defined timeout limits and memory budgets (MaxBytes).
+++2. Direct PTE Installation:
+++   - Uses UFFDIO_COPY via `ioctlUffdCopy` on Guest VAs instead of copying
+++     via sandbox-ctl's mapped `backendVA`.
+++   - Installs EPT page tables directly for the Guest, yielding zero UFFD
+++     faults and zero userspace context-switch overhead for prefilled pages.
+++3. StateMap Synchronization:
+++   - Tracks page state transitions (Absent/Loaded/Released) using a
+++     shared PageStateMap.
+++   - Prevents duplicate reads and copy EEXIST attempts by setting state
+++     to Loaded after successful prefilling.
+++
+++Safety & Race Condition Defenses:
+++1. EVENT_REMOVE / StateReleased Race Defense:
+++   - Implements pre-check and post-copy CAS logic in PrefillCopy.
+++   - If Guest ballooning/free-page-reporting frees a page concurrently (triggering
+++     EVENT_REMOVE and StateReleased) during UFFDIO_COPY, prefiller skips
+++     the page and refuses to overwrite or forcibly punch holes, relying on
+++     atomic CAS to preserve safe semantics.
+++2. Bounds Validation Overflow Fix:
+++   - Implements overflow-safe bounds validation on profile ranges to
+++     prevent malicious profiles (with large offsets/lengths wrapping to 0)
+++     from bypassing checks and causing out-of-bounds panics (DoS).
+++3. Budget Overshoot Race Fix:
+++   - Uses stable, upfront static reservation (selectRanges) before spawning
+++     workers to strictly enforce MaxBytes under heavy concurrency.
+++4. Polling Loop CPU Waste Fix:
+++   - Refactors the uffdHandler ready check loop in serveandwait.go to
+++     listen to backendCtx.Done() via select, avoiding up to 5 seconds of
+++     wasted polling when CH is terminated early.
+++5. Hot Path Recorder Optimization:
+++   - Skips the O(256) absentRunFrom page scanning when StartupRecorder
+++     is active, eliminating redundant StateMap accesses during demand recording.
+++
+++Signed-off-by: novahe <heqianfly@gmail.com>
+++---
+++ docs/sandboxer-design.md               |  62 ++---
+++ docs/startup-profile-memory-prefill.md | 152 ++++++++++++
+++ pkg/guestlink/launchsrv.go             |   9 +
+++ pkg/prefill/prefill.go                 | 326 +++++++++++++++++++++++++
+++ pkg/prefill/prefill_test.go            | 132 ++++++++++
+++ pkg/profile/profile.go                 | 124 ++++++++++
+++ pkg/profile/profile_test.go            |  96 ++++++++
+++ pkg/profile/recorder.go                | 204 ++++++++++++++++
+++ pkg/restore/prefill_wait_test.go       |  34 +++
+++ pkg/restore/restore.go                 |  92 ++++++-
+++ pkg/restore/upload.go                  |   8 +-
+++ pkg/sandbox/lifecycle.go               |  69 ++++--
+++ pkg/sandbox/prefill_metrics_test.go    |  36 +++
+++ pkg/sandbox/serveandwait.go            | 226 ++++++++++++++---
+++ pkg/snapshot/take.go                   |  15 +-
+++ pkg/uffd/addrmap.go                    |   9 +
+++ pkg/uffd/addrmap_test.go               |  20 ++
+++ pkg/uffd/handler.go                    | 270 ++++++++++++++++++--
+++ pkg/uffd/prefill_test.go               |  17 ++
+++ pkg/uffd/source.go                     |  11 +
+++ pkg/uffd/source_stream.go              |   8 +
+++ pkg/uffd/state.go                      |   6 +-
+++ 22 files changed, 1809 insertions(+), 117 deletions(-)
+++ create mode 100644 docs/startup-profile-memory-prefill.md
+++ create mode 100644 pkg/prefill/prefill.go
+++ create mode 100644 pkg/prefill/prefill_test.go
+++ create mode 100644 pkg/profile/profile.go
+++ create mode 100644 pkg/profile/profile_test.go
+++ create mode 100644 pkg/profile/recorder.go
+++ create mode 100644 pkg/restore/prefill_wait_test.go
+++ create mode 100644 pkg/sandbox/prefill_metrics_test.go
+++ create mode 100644 pkg/uffd/addrmap_test.go
+++ create mode 100644 pkg/uffd/prefill_test.go
+++
+++diff --git a/docs/sandboxer-design.md b/docs/sandboxer-design.md
+++index 3e768f6..9c8c92e 100644
+++--- a/docs/sandboxer-design.md
++++++ b/docs/sandboxer-design.md
+++@@ -118,29 +118,33 @@ crypto:
+++ *   **密钥边界**：`manifest.key` 必须是 64 个十六进制字符（32 字节/256 位）；`MANIFEST_KEY` 可提供或覆盖 YAML 中的 key。缺乏正确 key 时无法解开 manifest/chunk。
+++ *   **读写路径统一**：vhost 块读、UFFD page source、snapshot ingest 和 `upload-snapshot` 都复用同一套 manifest/cache/store 配置；cache 为空时直接走 store。
+++ 
+++-### 2.3 CLI / env / YAML 的职责边界
++++### 2.3 操作入口与职责边界
++++
++++`sandbox-ctl` 的行为与能力主要通过多级配置参数（CLI / env / YAML）与不同的子命令向外暴露。为了避免配置混乱，本节详细梳理了各种参数的职责边界以及对应子命令的典型使用场景。
++++
++++#### 2.3.1 CLI / env / YAML 的职责边界
+++ 
+++ | 类别          | 入口                                                                       | 场景说明                                                                                                                                                                          |
+++ | :------------ | :------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+++ | 沙箱拓扑      | `--config`, `SANDBOX_CONFIG`                                               | 用于定义沙箱的硬件/设备模型。**场景**：冷启动沙箱时加载基础配置；或在跨机器恢复（Restore）快照时，通过追加第二个 YAML 文件（如 `a.yaml:b.yaml`）覆盖新机器特有的本地路径或网络。  |
+++-| 远端对象      | `--manifest-config`, `MANIFEST_CONFIG`, `MANIFEST_KEY`                     | 用于沙箱与远端存储底座交互。**场景**：基于远端快照极速冷启（按需加载/Lazy-fetch 页面）；或在制作沙箱快照后，将其内容直接上传至对象存储，方便其他节点秒级拉起复用。                 |
+++-| 沙箱身份      | `--sandbox-id`                                                             | 用于沙箱的生命周期寻址与管控。**场景**：单节点高密并发运行上千个沙箱时，其控制 Socket 和临时文件按 ID 严格隔离，后续执行 `snapshot`（打快照）或 `exec`（进沙箱）时凭此精准定位。    |
++++| 远端对象      | `--manifest-config`, `MANIFEST_CONFIG`, `MANIFEST_KEY`                     | 用于沙箱与远端存储底座交互。**场景**：基于远端快照极速冷启（按需加载/Lazy-fetch 页面）；或在制作沙箱快照后，将其内容直接上传至对象存储，方便其他节点秒级拉起复用。                |
++++| 沙箱身份      | `--sandbox-id`                                                             | 用于沙箱的生命周期寻址与管控。**场景**：单节点高密并发运行上千个沙箱时，其控制 Socket 和临时文件按 ID 严格隔离，后续执行 `snapshot`（打快照）或 `exec`（进沙箱）时凭此精准定位。  |
+++ | 本机路径      | `--run-root`, `--base-root`, `--ch-binary`                                 | 用于适配不同架构的环境目录规范。**场景**：将运行时的控制节点（run-root）与会膨胀的磁盘增量（base-root）分离存储，防止写满宿主机根分区；亦可用于无缝切换不同版本的底层虚拟机引擎。 |
+++ | 资源控制      | YAML `resources.control`, `--cgroup-path`, `--cgroup-adopt`                | 用于宿主机侧的算力物理隔离。**场景**：将主控程序保留在无限制的父组，仅把真正的沙箱虚拟机进程（Cloud Hypervisor）塞入严格限流的 Cgroup，彻底防止恶意用户跑满宿主 CPU/内存。        |
+++-| stdio/console | `--stdin/--stdout/--stderr`, `--*-from`, `--*-to`, `--tty`, `--console`    | 用于剥离和接管不同维度的日志流。**场景**：将沙箱内核崩溃底层的诊断日志接入运维监控，同时将沙箱内业务打出的常规日志（Stdio）通过管道导向到业务侧的日志聚合系统。                    |
++++| stdio/console | `--stdin/--stdout/--stderr`, `--*-from`, `--*-to`, `--tty`, `--console`    | 用于剥离和接管不同维度的日志流。**场景**：将沙箱内核崩溃底层的诊断日志接入运维监控，同时将沙箱内业务打出的常规日志（Stdio）通过管道导向到业务侧的日志聚合系统。                   |
+++ | 观测/健康     | `--stats-interval`, `--stats-json`, `--ping-fatal-threshold`, `timeouts.*` | 用于系统探活与观测防呆。**场景**：暴露按需加载（Lazy-load）引发的系统缺页卡顿指标；或配置失联容忍度，让内部内核 Panic 死锁的沙箱主动自毁，防止卡死外部宿主机的控制面板。          |
+++-| 端口转发      | repeatable `--connect LOCAL:TARGET` 或 `LOCAL::TARGET`                     | 用于建立无网络栈开销的穿透隧道。**场景**：外界 Nginx 无需关注沙箱内网 IP，直接对接宿主机本地 UDS 文件进行请求转发；打快照时，系统自动切断并冻结该隧道，保证恢复时绝不串流。         |
++++| 端口转发      | repeatable `--connect LOCAL:TARGET` 或 `LOCAL::TARGET`                     | 用于建立无网络栈开销的穿透隧道。**场景**：外界 Nginx 无需关注沙箱内网 IP，直接对接宿主机本地 UDS 文件进行请求转发；打快照时，系统自动切断并冻结该隧道，保证恢复时绝不串流。       |
+++ 
+++-### 2.4 sandbox-ctl 子命令总览
++++#### 2.3.2 sandbox-ctl 子命令总览
+++ 
+++-| 子命令            | 当前职责                                                                                                                                  | 文档应避免的误解                                                                        |
+++-| :---------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- |
+++-| `run`             | 冷启动或 `--restore` 恢复；加载 sandbox/manifest 配置；建立 memfd/UFFD/vhost/launch/ctl.sock；承载 stdio、exec、snapshot、health、stats。 | 它不是只负责“拉起 VM”；运行期数据面和控制面也在这个常驻进程里。                         |
+++-| `snapshot`        | 连接运行中 sandbox 的 `ctl.sock`，请求 quiesce + CH pause/snapshot + overlay/memory sink；`--output` 与 `--upload` 二选一。               | 不是离线读取目录的命令，也不会同时输出本地文件和上传。                                  |
+++-| `upload-snapshot` | 不启动 VM，把本地 snapshot bundle 提升为 remote `manifest://` snapshot；校验 lower layer 引用并上传当前 bundle/overlay。                  | 输入是 snapshot path，不是任意快照目录；本地 lower layer 不能随意混用。                 |
+++-| `exec`            | 对运行中 sandbox 发 exec request；命令作为 user app 的 sibling 进入 app mount/pid namespace；退出码跟随 guest command。                   | UDS 名称是 `ctl.sock`；run 进程在 ack 后主要做字节 relay，MUX 端到端连接 CLI 与 guest。 |
+++-| `config`          | 生成、合并、校验 sandbox.yaml；支持 default/restore 模式和 strict/skip 检查。                                                             | 配置并不只有文档示例里的 resources/network/boot/launch 四块。                           |
+++-| `info`            | 从本地 snapshot 或 `manifest://` snapshot 中读取并打印嵌入的 `snapshot.cfg`。                                                             | 这是检查 snapshot chain、root/data disk refs、metadata 的轻量入口。                     |
++++| 子命令            | 说明                                                                                                                                                                               |
++++| :---------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++++| `run`             | **核心常驻进程**：不仅负责冷启动或 `--restore` 恢复（加载配置并建立 memfd/UFFD/vhost 等），还承载运行期的数据面（按需加载）和控制面（stdio、exec、snapshot、health、stats 等）。   |
++++| `snapshot`        | **在线快照创建**：连接运行中 sandbox 的 `ctl.sock`，请求 quiesce + CH pause/snapshot + overlay/memory sink。必须针对运行中的沙箱执行。产物可保存在本地或直接上传至远端，两者互斥。 |
++++| `upload-snapshot` | **快照上传推送**：不启动 VM，把本地 snapshot bundle 提升为 remote `manifest://` snapshot。用于校验引用并上传本地快照到远端存储。输入必须是合法的快照路径，且历史只读层链条完整。   |
++++| `exec`            | **进入沙箱执行**：对运行中 sandbox 发 exec request；命令作为 user app 的 sibling 进入 namespaces，退出码跟随命令。通过 `ctl.sock` 交互，`run` 进程仅作字节中继实现端到端通信。     |
++++| `config`          | **辅助配置工具**：生成、合并、校验 sandbox.yaml；支持 default/restore 模式和 strict/skip 检查。支持完整校验沙箱的最终配置清单。                                                    |
++++| `info`            | **轻量级诊断入口**：从快照中读取并打印嵌入的 `snapshot.cfg`。无需启动沙箱即可快速查看快照的继承链、磁盘引用以及元数据等信息。                                                      |
+++ 
+++ ## 3. Sandbox生命周期主路径
+++ 
+++@@ -168,7 +172,7 @@ info = Template.build(tpl, name="my-template", cpu_count=2, memory_mb=2048)
+++ 3. **Phase A/B/C 阶段流水线**：`run-builder` 驱动阶段 sandbox。Phase A 用 `sandbox-ctl exec flatten-ctl export` 在 guest 内拉取并展平 `fromImage`；Phase B 通过 envd 执行 RUN，通过 `flatten-ctl tar extract` 应用 COPY 并通过 `flatten-ctl export` 导出 rootfs；Phase C 通过 envd 启动 startCmd、轮询 readyCmd 后执行 `sandbox-ctl snapshot --output`。
+++ 4. **结果回写与上传**：image-only 构建走 `manifest-ctl store image.img`；snapshot 构建走 `sandbox-ctl upload-snapshot <bundle>`，上传 bundle 及其引用的 overlay/base artifacts。`run-builder` 将 JSON 结果写到 stdout，systemd 捕获为 `<bid>.result`，`node-ctl` 读取后更新构建状态，此时 `Template.build()` 在客户端成功返回。
+++ 
+++-#### 3.1.1 核心生命周期时序图
++++**核心生命周期时序图与命令交互**
+++ 
+++ 这张图按 `node-ctl` 的真实入口和 `orchestrator/release-builder/test/e2e/e2e_run_builder.sh` 的主验证面绘制：B1 覆盖 `fromImage` 的 guest 内拉取与展平，B2 覆盖 `fromTemplate(img) + steps + startCmd/readyCmd` 生成 snapshot template，B3 覆盖从 snapshot template 继承 start/ready 后继续构建，B4 覆盖 COPY 上下文经 files endpoint 与 presigned URL 进入 build sandbox。
+++ 
+++@@ -296,9 +300,9 @@ sequenceDiagram
+++ 
+++ **路径二核心命令交互 (node-ctl -> sandbox-ctl)**
+++ 
+++-| 关键命令                      | 核心入参 (Flags/Args)                                                                                                                                                                      | 返回值 / 产物 (Output)                                                   | 动作说明                                                                                |
+++-| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- |
+++-| `sandbox-ctl run` (Cold 模式) | `--config <sandbox.yaml[:overlay.yaml]>`<br/>`--sandbox-id <sid>`<br/>可选：`--manifest-config`, `--run-root`, `--base-root`, `--cgroup-path`, `--cgroup-adopt`, stdio/console/stats flags | 常驻进程；业务 stdio/console/stats 按 flags 输出                         | 完整启动 VM 与 guest runtime，建立统一运行期控制面和懒加载数据面。                      |
++++| 关键命令                      | 核心入参 (Flags/Args)                                                                                                                                                                      | 返回值 / 产物 (Output)                           | 动作说明                                                           |
++++| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- | :----------------------------------------------------------------- |
++++| `sandbox-ctl run` (Cold 模式) | `--config <sandbox.yaml[:overlay.yaml]>`<br/>`--sandbox-id <sid>`<br/>可选：`--manifest-config`, `--run-root`, `--base-root`, `--cgroup-path`, `--cgroup-adopt`, stdio/console/stats flags | 常驻进程；业务 stdio/console/stats 按 flags 输出 | 完整启动 VM 与 guest runtime，建立统一运行期控制面和懒加载数据面。 |
+++ 
+++ ### 3.3 Restore 极速恢复与按需加载
+++ 
+++@@ -358,10 +362,10 @@ sequenceDiagram
+++ 
+++ **路径三核心命令交互 (`node-ctl` → `sandbox-ctl`)**
+++ 
+++-| 关键命令 | 核心入参 (Flags/Args) | 返回值 / 产物 (Output) | 动作说明 |
+++-| :--- | :--- | :--- | :--- |
+++-| `sandbox-ctl run` (Restore 模式) | `--restore <snapshot-path>` 或 `--restore manifest://<key>`<br/>`--config <host.yaml>`<br/>`--sandbox-id <sid>`<br/>manifest 恢复时需 `--manifest-config` 或 `MANIFEST_CONFIG` | 启动守护进程；业务 stdout/stderr/tty 的去向由 stdio flags 决定 | 解析 snapshot bundle 并拉起恢复态 VM；常驻承载 UFFD、vhost、exec、snapshot、stdio、health、stats。 |
+++-| *(隐式内部动作)* | `snapshot.cfg` + host YAML 派生 | layered memory source、root/data disk CoW、rewritten state-dir、restore notify | restore notify 负责恢复后重新建立 guest MUX；气球 resize 是差异校正，不是无条件全量放气。 |
++++| 关键命令                         | 核心入参 (Flags/Args)                                                                                                                                                          | 返回值 / 产物 (Output)                                                         | 动作说明                                                                                           |
++++| :------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
++++| `sandbox-ctl run` (Restore 模式) | `--restore <snapshot-path>` 或 `--restore manifest://<key>`<br/>`--config <host.yaml>`<br/>`--sandbox-id <sid>`<br/>manifest 恢复时需 `--manifest-config` 或 `MANIFEST_CONFIG` | 启动守护进程；业务 stdout/stderr/tty 的去向由 stdio flags 决定                 | 解析 snapshot bundle 并拉起恢复态 VM；常驻承载 UFFD、vhost、exec、snapshot、stdio、health、stats。 |
++++| *(隐式内部动作)*                 | `snapshot.cfg` + host YAML 派生                                                                                                                                                | layered memory source、root/data disk CoW、rewritten state-dir、restore notify | restore notify 负责恢复后重新建立 guest MUX；气球 resize 是差异校正，不是无条件全量放气。          |
+++ 
+++ snapshot bundle、`from_refs`、`base_from_refs`、remote stacking 和 local merge 的数据结构见第 4 章；UFFD/vhost 的请求级数据路径见第 5 章。
+++ 
+++@@ -571,13 +575,13 @@ graph TD
+++ 
+++ #### 4.4.1 核心异同点
+++ 
+++-| 维度 | 磁盘 (Disk) | 内存 (Memory) |
+++-| :--- | :--- | :--- |
+++-| **驱动组件** | `vhost-user-blk` (块设备驱动) | `Userfaultfd` (按需缺页中断) |
+++-| **可写顶层 (Live)** | 新建的块设备 CoW diff 文件 | VM RAM；已驻留页不进入 `fetch.NewLayered` 查询链 |
+++-| **增量快照层** | 捕获脏数据块，转为 `overlay.base` / `base_from_refs` | 捕获驻留页/非空洞页，转为 `selfStream` / `from_refs` |
+++-| **最底层的区别** | overlay 模式最终兜底到 **静态只读 EROFS base**。 | 所有 snapshot 层都是空洞时使用 **ZEROPAGE**。 |
+++-| **共用机制** | 均复用 `fetch.NewLayered(layers...)`，按 top → bottom 逐层解析数据、显式零区间和空洞。 | 同左。 |
++++| 维度                | 磁盘 (Disk)                                                                            | 内存 (Memory)                                        |
++++| :------------------ | :------------------------------------------------------------------------------------- | :--------------------------------------------------- |
++++| **驱动组件**        | `vhost-user-blk` (块设备驱动)                                                          | `Userfaultfd` (按需缺页中断)                         |
++++| **可写顶层 (Live)** | 新建的块设备 CoW diff 文件                                                             | VM RAM；已驻留页不进入 `fetch.NewLayered` 查询链     |
++++| **增量快照层**      | 捕获脏数据块，转为 `overlay.base` / `base_from_refs`                                   | 捕获驻留页/非空洞页，转为 `selfStream` / `from_refs` |
++++| **最底层的区别**    | overlay 模式最终兜底到 **静态只读 EROFS base**。                                       | 所有 snapshot 层都是空洞时使用 **ZEROPAGE**。        |
++++| **共用机制**        | 均复用 `fetch.NewLayered(layers...)`，按 top → bottom 逐层解析数据、显式零区间和空洞。 | 同左。                                               |
+++ 
+++ ## 5. 按需加载数据面
+++ 
+++diff --git a/docs/startup-profile-memory-prefill.md b/docs/startup-profile-memory-prefill.md
+++new file mode 100644
+++index 0000000..c7131d2
+++--- /dev/null
++++++ b/docs/startup-profile-memory-prefill.md
+++@@ -0,0 +1,152 @@
++++# Startup Profile 并发内存预填充
++++
++++## 目标
++++
++++一次 cold start 自动记录应用启动阶段实际触发的内存页，并将 `startup-profile.json` 写入 snapshot。Restore 时，`sandbox-ctl` 根据 Profile 并发拉取热点页，通过 `UFFDIO_COPY` 注入 CH 内存。
++++
++++该机制替代外部 benchmark 生成热点列表；benchmark 只用于 A/B 验证，不参与生产 Profile 生成。
++++
++++## 并发模型
++++
++++```text
++++spawn cloud-hypervisor
++++  ├─ CH restore、cgroup/API 等宿主初始化
++++  └─ Profile worker pool → fetch → local buffer → UFFDIO_COPY
++++                                             ↓ 完成或超时
++++                                          vm.resume → Guest demand fault
++++```
++++
++++宿主侧路径同时运行，仅在放行 vCPU 前建立安全边界：
++++
++++- prefill 先完成：`UFFDIO_COPY` 原子安装完整页面；
++++- CH restore 已经建立 folio：prefill 得到 `EEXIST` 并跳过；`EAGAIN` 做有限重试；
++++- prefill 永远不直接写 `backendVA`，因此不会用旧 snapshot 数据覆盖 Guest 已修改页面，也不会暴露半写页面。
++++
++++只有 `vm.resume` 等待 prefill 完成或超时；CH restore、cgroup 放置、API readiness 和其他宿主侧启动动作仍与 prefill 并发。新增等待是 `max(0, prefill耗时 - 其他启动动作耗时)`；若 prefill 在 CH API ready 前完成，则不增加 resume 延迟。该边界确保 Guest demand fault 和 balloon/PUNCH_HOLE 不会进入 prefill 的页面代际窗口。
++++
++++worker 受 `backendCtx` 管理并加入 `backendWG`。CH 退出时先取消并等待所有 prefill worker，再关闭 handler、uffd fd 和 memfd。
++++
++++## Cold-start Profile 生成
++++
++++```text
++++Cold Start
++++  → UFFD handler ready
++++  → LaunchServer.HelloDone()
++++  → Recorder.Start()
++++  → 2 秒记录窗口
++++  → Snapshot 或窗口到期时 Freeze()
++++  → startup-profile.json 写入 trailing ZIP
++++```
++++
++++记录窗口内 UFFD batching 与 Profile 采集互斥：
++++
++++```text
++++Recorder 未启动/采集中 → 每次 StateAbsent fault 只解决 1 页
++++Recorder Freeze 后       → 恢复最多 256 页 batching
++++```
++++
++++如果采集时仍批量安装256页，只记录 fault page 会欠采样，记录整个 batch 又会把推测邻页误判为热点。因此记录窗口必须使用单页模式。
++++
++++Recorder 规则：
++++
++++- 只记录成功解决的 `StateAbsent` fault；
++++- 保存 memfd page offset，不保存 CH VA；
++++- PAGEFAULT 进入 host queue 时分配 order，解决成功后提交；相同页去重并保留最小 order，因此慢 fetch 不会改变 Guest 观测到的触页顺序；
++++- 默认窗口2秒，最多16384页（64 MiB）；
++++- 只合并“触页顺序连续且地址递增相邻”的页面，逆序或交错相邻页保持独立 range；
++++- UFFD 只能观察首次触页，v1 的 `hits` 不代表真实访问频率；
++++- Freeze 后 Record 为 no-op。
++++
++++## Profile 格式
++++
++++```json
++++{
++++  "version": 1,
++++  "page_size": 4096,
++++  "window_ms": 2000,
++++  "targets": [{
++++    "kind": "memory",
++++    "size": 8589934592,
++++    "ranges": [{
++++      "offset": 20971520,
++++      "length": 131072,
++++      "order": 0,
++++      "hits": 1
++++    }]
++++  }]
++++}
++++```
++++
++++解析必须校验：版本、页大小、memory size、页对齐、overflow、越界、零长度、Profile 大小和 range 数量。重叠 range 直接拒绝，相邻 range 保持原始 `order`，避免解析阶段破坏 Guest 触页顺序。
++++
++++## Restore prefill
++++
++++1. Restore 从 trailing ZIP 解析可选 `startup-profile.json`。
++++2. memory source 和 Profile 可用后立即启动有界 fetch plan，与磁盘重建、socket/server 初始化、CH spawn/restore 并发。
++++3. fetch job 按 `order+offset` 预留 buffer，多 worker 可乱序完成，但注入阶段按原顺序消费。
++++4. CH 上报首个 va_report 后，Handler 建立 memfd offset 到 `(uffd fd, chVA)` 的正向映射，并逐页调用 `UFFDIO_COPY`。
++++5. API ready 时若 handler+注入已完成，立即执行 `vm.resume`；否则只等待剩余工作，最多消费100ms额外等待预算。预算耗尽后取消并等待唯一的注入协程退出，随后立即 resume；远端 fetch worker 在后台回收，且它们不能调用 `UFFDIO_COPY`。
++++6. Zero/Hole 不注入，继续保持 lazy zero semantics。
++++7. 多 region 场景中，高区 range 等待对应 va_report 注册，绝不回退成直接写 memfd。
++++
++++使用逐页 `UFFDIO_COPY` 是有意选择：批量 ioctl 返回 `EEXIST/EAGAIN` 时不容易判断哪部分成功；逐页调用使每次竞争结果明确，优先保证不会覆盖 Guest 数据。远端 fetch 和解密仍按最多1 MiB run执行，多个 range worker继续并发。
++++
++++默认预算：
++++
++++```text
++++MaxBytes = 128 MiB
++++Timeout  = 100 ms  # 从 CH API ready 开始计算的 vm.resume 额外等待预算
++++Workers  = 8
++++BufferBytes = 64 MiB
++++```
++++
++++预算先按 `order` 选择 range，再交给 worker，避免 goroutine 调度让晚期 range 抢占早期启动热点预算。统计区分 requested、filled、existing、zero 和 error，失败或 Zero 不计为 filled。
++++
++++## Snapshot 与 upload
++++
++++Snapshot 在 pause/quiesce barrier 后 Freeze Recorder，将非空 Profile 加入：
++++
++++```text
++++config.json
++++state.json
++++snapshot.cfg
++++startup-profile.json
++++```
++++
++++Profile 是可选性能元数据；生成失败只记录 warning，不能导致 snapshot 失败。`upload-snapshot` 重建 ZIP 时必须原样保留该成员。旧快照没有 Profile 时 Restore 保持原有 UFFD lazy-load。
++++
++++## 指标
++++
++++```text
++++prefill_requested_bytes
++++prefill_filled_bytes
++++prefill_existing_bytes
++++prefill_skipped_zero
++++prefill_errors
++++prefill_duration_ns
++++prefill_resume_wait_ns
++++prefill_timed_out
++++prefill_budget_exhausted
++++faults_absent
++++copy_calls
++++pages_copied
++++page_in_fetch_p99
++++```
++++
++++`prefill_existing_bytes` 表示 CH restore 或其他 worker 已先建立可用页面，属于安全竞争结果，不是数据错误；`StateReleased` 生命周期跳过不会混入该指标。
++++
++++`prefill_resume_wait_ns` 是 CH API ready 后 `vm.resume` 实际因 prefill 增加的等待；它接近0表示 prefill 完全被 CH restore/宿主初始化遮蔽。100ms是尚未完成时的最大等待预算，不是每次启动都固定等待100ms。
++++
++++`prefill_timed_out=1` 表示 API ready 后100ms预算耗尽；此时先取消并等待注入协程退出，再执行 `vm.resume`，因此运行中的 Guest 不会与残留 COPY 竞争。远端 fetch worker 的退出不阻塞 resume，由 VM 生命周期在后台回收。
++++
++++## 验证
++++
++++- Profile parser：乱序、重叠、相邻、越界、零长度、超限。
++++- Recorder：并发去重、窗口内单页、Freeze 后恢复256页、Snapshot 提前 Freeze。
++++- UFFD：验证 prefill 在 `vm.resume` 前完成或超时，CH 已有 folio 时 COPY 返回 EEXIST 且不会覆盖。
++++- Multi-region：跨 PCI hole ranges 使用正确 uffd fd 和 chVA。
++++- 生命周期：CH 退出、timeout、context cancel 后 worker 全部退出，再关闭 handler。
++++- Snapshot/upload：Profile round-trip 字节保持一致。
++++- Linux `go test -race` 与真实 Restore smoke。
++++
++++A/B 重点观察首请求 p99、Profile 热页 fault 数、远端 fetch、CH RSS、balloon 回收和总启动时间。并发 prefill 的价值必须以端到端 `start → first request` 改善为准，而不是仅看 prefill 自身吞吐。
+++diff --git a/pkg/guestlink/launchsrv.go b/pkg/guestlink/launchsrv.go
+++index 2a5eb2b..0f0556e 100755
+++--- a/pkg/guestlink/launchsrv.go
++++++ b/pkg/guestlink/launchsrv.go
+++@@ -58,6 +58,9 @@ type LaunchServer struct {
+++ 	// just ack. This is the Settled trigger: post-boot transient is over,
+++ 	// safe to engage memory.high / controller RPCs.
+++ 	OnLaunchAck func()
++++	// BeforeLaunch runs after hello is received but before LaunchSpec becomes
++++	// visible to the guest. Returning an error aborts the handshake.
++++	BeforeLaunch func() error
+++ 
+++ 	// OnAppStarted fires when the guest reports its user app has been
+++ 	// fork/execed. Optional; nil → just ack.
+++@@ -190,6 +193,12 @@ func (s *LaunchServer) handleConn(conn *net.UnixConn) (handedOff bool) {
+++ 			return false
+++ 		}
+++ 		s.Logf("launch: hello received (phase=%q), sending launch spec", msg.Phase)
++++		if s.BeforeLaunch != nil {
++++			if err := s.BeforeLaunch(); err != nil {
++++				s.Logf("launch: before launch: %v", err)
++++				return false
++++			}
++++		}
+++ 		if err := proto.WriteMessage(conn, &proto.Message{
+++ 			Type:   proto.TypeLaunch,
+++ 			Launch: s.Spec,
+++diff --git a/pkg/prefill/prefill.go b/pkg/prefill/prefill.go
+++new file mode 100644
+++index 0000000..23380df
+++--- /dev/null
++++++ b/pkg/prefill/prefill.go
+++@@ -0,0 +1,326 @@
++++// Package prefill loads profiled snapshot pages through UFFDIO_COPY while
++++// cloud-hypervisor is restoring. Fetch workers overlap CH restore, while the
++++// caller keeps vCPUs paused until this bounded operation completes.
++++package prefill
++++
++++import (
++++	"context"
++++	"sort"
++++	"sync"
++++	"time"
++++
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
++++)
++++
++++type PrefillOptions struct {
++++	MaxBytes uint64
++++	// BufferBytes bounds data fetched before UFFD regions are ready.
++++	// Zero uses a 64 MiB default; values below MaxBatchBytes are rounded up.
++++	BufferBytes uint64
++++	Timeout     time.Duration
++++	Workers     int
++++}
++++
++++type PrefillStats struct {
++++	RequestedRanges uint64
++++	CompletedRanges uint64
++++	SkippedZero     uint64
++++	BytesRequested  uint64
++++	BytesFilled     uint64
++++	BytesExisting   uint64
++++	FetchErrors     uint64
++++	BudgetExhausted bool
++++	Duration        time.Duration
++++}
++++
++++type fetchJob struct {
++++	seq       uint64
++++	rangeSeq  uint64
++++	offset    uint64
++++	length    uint64
++++	lastRange bool
++++}
++++
++++type fetchedSpan struct {
++++	offset uint64
++++	length uint64
++++	zero   bool
++++}
++++
++++type fetchResult struct {
++++	job   fetchJob
++++	data  []byte
++++	spans []fetchedSpan
++++	err   error
++++}
++++
++++// Plan is a bounded two-stage startup prefill. Prepare starts remote reads as
++++// soon as the snapshot source and profile exist; Inject later installs the
++++// ordered results after CH reports its UFFD regions.
++++type Plan struct {
++++	ctx       context.Context
++++	cancel    context.CancelFunc
++++	results   chan fetchResult
++++	slots     chan struct{}
++++	done      chan struct{}
++++	closeOnce sync.Once
++++
++++	requestedRanges uint64
++++	requestedBytes  uint64
++++	budgetExhausted bool
++++	started         time.Time
++++}
++++
++++// Prepare begins ordered, bounded profile fetching. Jobs reserve a buffer slot
++++// before dispatch, in profile order, so later ranges cannot consume all memory
++++// and starve the earliest range. Each slot is at most MaxBatchBytes.
++++func Prepare(ctx context.Context, baseSource uffd.SnapshotReader, prof *profile.MemoryProfile, opts PrefillOptions) *Plan {
++++	if baseSource == nil || prof == nil || opts.MaxBytes == 0 {
++++		return nil
++++	}
++++	target := prof.MemoryTarget()
++++	if target == nil {
++++		return nil
++++	}
++++	selected, reserved, exhausted := selectRanges(target.Ranges, opts.MaxBytes)
++++	if len(selected) == 0 {
++++		return nil
++++	}
++++	workers := opts.Workers
++++	if workers <= 0 {
++++		workers = 8
++++	}
++++	bufferBytes := opts.BufferBytes
++++	if bufferBytes == 0 {
++++		bufferBytes = 64 << 20
++++	}
++++	if bufferBytes < uffd.MaxBatchBytes {
++++		bufferBytes = uffd.MaxBatchBytes
++++	}
++++	slotCount := int(bufferBytes / uffd.MaxBatchBytes)
++++	if slotCount < 1 {
++++		slotCount = 1
++++	}
++++	if workers > slotCount {
++++		workers = slotCount
++++	}
++++
++++	planCtx, cancel := context.WithCancel(ctx)
++++	p := &Plan{
++++		ctx:             planCtx,
++++		cancel:          cancel,
++++		results:         make(chan fetchResult, slotCount),
++++		slots:           make(chan struct{}, slotCount),
++++		done:            make(chan struct{}),
++++		requestedRanges: uint64(len(selected)),
++++		requestedBytes:  reserved,
++++		budgetExhausted: exhausted,
++++		started:         time.Now(),
++++	}
++++	jobs := make(chan fetchJob)
++++	source := baseSource.CloneWithContext(planCtx)
++++	var workersWG sync.WaitGroup
++++	for i := 0; i < workers; i++ {
++++		workersWG.Add(1)
++++		go func() {
++++			defer workersWG.Done()
++++			for job := range jobs {
++++				result := fetchResult{job: job, data: make([]byte, int(job.length))}
++++				for cursor := uint64(0); cursor < job.length; {
++++					n, zero, err := source.ReadAt(result.data[cursor:], job.offset+cursor)
++++					if err != nil || n == 0 {
++++						if err == nil {
++++							err = context.Canceled
++++						}
++++						result.err = err
++++						break
++++					}
++++					result.spans = append(result.spans, fetchedSpan{offset: cursor, length: uint64(n), zero: zero})
++++					cursor += uint64(n)
++++				}
++++				select {
++++				case p.results <- result:
++++				case <-planCtx.Done():
++++					return
++++				}
++++			}
++++		}()
++++	}
++++	go func() {
++++		defer close(jobs)
++++		var seq uint64
++++		for rangeSeq, r := range selected {
++++			for off, end := r.Offset, r.Offset+r.Length; off < end; {
++++				length := end - off
++++				if length > uffd.MaxBatchBytes {
++++					length = uffd.MaxBatchBytes
++++				}
++++				select {
++++				case p.slots <- struct{}{}:
++++				case <-planCtx.Done():
++++					return
++++				}
++++				job := fetchJob{seq: seq, rangeSeq: uint64(rangeSeq), offset: off, length: length, lastRange: off+length == end}
++++				select {
++++				case jobs <- job:
++++				case <-planCtx.Done():
++++					<-p.slots
++++					return
++++				}
++++				seq++
++++				off += length
++++			}
++++		}
++++	}()
++++	go func() {
++++		workersWG.Wait()
++++		close(p.results)
++++		close(p.done)
++++	}()
++++	return p
++++}
++++
++++// Inject consumes prepared chunks in profile order. Cancelling ctx stops both
++++// stages; no UFFDIO_COPY can continue after this method returns.
++++func (p *Plan) Inject(ctx context.Context, h *uffd.Handler) PrefillStats {
++++	if p == nil || h == nil {
++++		return PrefillStats{}
++++	}
++++	stats := PrefillStats{RequestedRanges: p.requestedRanges, BytesRequested: p.requestedBytes, BudgetExhausted: p.budgetExhausted}
++++	pending := make(map[uint64]fetchResult)
++++	failedRanges := make(map[uint64]bool)
++++	var next uint64
++++	for {
++++		if ctx.Err() != nil {
++++			p.cancel()
++++			stats.Duration = time.Since(p.started)
++++			return stats
++++		}
++++		result, ok := pending[next]
++++		if !ok {
++++			select {
++++			case result, ok = <-p.results:
++++				if !ok {
++++					stats.Duration = time.Since(p.started)
++++					return stats
++++				}
++++				if result.job.seq != next {
++++					pending[result.job.seq] = result
++++					continue
++++				}
++++			case <-ctx.Done():
++++				p.cancel()
++++				stats.Duration = time.Since(p.started)
++++				return stats
++++			}
++++		} else {
++++			delete(pending, next)
++++		}
++++
++++		if result.err != nil {
++++			stats.FetchErrors++
++++			failedRanges[result.job.rangeSeq] = true
++++		} else {
++++			for _, span := range result.spans {
++++				if span.zero {
++++					stats.SkippedZero += span.length
++++					continue
++++				}
++++				start, end := span.offset, span.offset+span.length
++++				filled, existing, err := h.PrefillCopy(ctx, result.job.offset+start, result.data[start:end])
++++				stats.BytesFilled += filled
++++				stats.BytesExisting += existing
++++				if err != nil {
++++					stats.FetchErrors++
++++					failedRanges[result.job.rangeSeq] = true
++++					break
++++				}
++++			}
++++		}
++++		if result.job.lastRange && !failedRanges[result.job.rangeSeq] {
++++			stats.CompletedRanges++
++++		}
++++		<-p.slots
++++		next++
++++	}
++++}
++++
++++// CanceledStats returns the plan metadata when cancellation happens before a
++++// UFFD handler becomes available. Fetch workers never own UFFD injection, so
++++// their eventual cleanup is intentionally kept out of the vm.resume gate.
++++func (p *Plan) CanceledStats() PrefillStats {
++++	if p == nil {
++++		return PrefillStats{}
++++	}
++++	return PrefillStats{
++++		RequestedRanges: p.requestedRanges,
++++		BytesRequested:  p.requestedBytes,
++++		BudgetExhausted: p.budgetExhausted,
++++		Duration:        time.Since(p.started),
++++	}
++++}
++++
++++// Close cancels and joins an unused or partially consumed plan.
++++func (p *Plan) Close() {
++++	if p == nil {
++++		return
++++	}
++++	p.closeOnce.Do(func() {
++++		p.cancel()
++++		<-p.done
++++		// No producer remains after done. Drop every buffered result so its
++++		// plaintext payload becomes unreachable immediately instead of being
++++		// retained by Plan until the restored VM exits.
++++		for range p.results {
++++		}
++++	})
++++}
++++
++++// PrefillStartup fetches independent canonical ranges concurrently and injects
++++// them through the CH-side userfaultfds. UFFDIO_COPY is the ownership arbiter:
++++// EEXIST means CH already materialized the page, so prefill counts it and
++++// moves on without touching existing data. EAGAIN is retried by PrefillCopy.
++++func PrefillStartup(ctx context.Context, h *uffd.Handler, baseSource uffd.SnapshotReader, prof *profile.MemoryProfile, opts PrefillOptions) PrefillStats {
++++	plan := Prepare(ctx, baseSource, prof, opts)
++++	if plan == nil {
++++		return PrefillStats{}
++++	}
++++	defer plan.Close()
++++	prefillCtx := ctx
++++	cancel := func() {}
++++	if opts.Timeout > 0 {
++++		prefillCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
++++	}
++++	defer cancel()
++++	return plan.Inject(prefillCtx, h)
++++}
++++
++++func selectRanges(input []profile.Range, maxBytes uint64) ([]profile.Range, uint64, bool) {
++++	ranges := append([]profile.Range(nil), input...)
++++	sort.SliceStable(ranges, func(i, j int) bool {
++++		if ranges[i].Order == ranges[j].Order {
++++			return ranges[i].Offset < ranges[j].Offset
++++		}
++++		return ranges[i].Order < ranges[j].Order
++++	})
++++	selected := make([]profile.Range, 0, len(ranges))
++++	exhausted := false
++++	var reserved uint64
++++	for _, r := range ranges {
++++		remaining := maxBytes - reserved
++++		if r.Length > remaining {
++++			exhausted = true
++++			// Preserve the earliest page-aligned prefix instead of dropping an
++++			// oversized hot range wholesale.
++++			remaining -= remaining % profile.PageSize
++++			if remaining == 0 {
++++				continue
++++			}
++++			r.Length = remaining
++++		}
++++		selected = append(selected, r)
++++		reserved += r.Length
++++	}
++++	return selected, reserved, exhausted
++++}
+++diff --git a/pkg/prefill/prefill_test.go b/pkg/prefill/prefill_test.go
+++new file mode 100644
+++index 0000000..4830fac
+++--- /dev/null
++++++ b/pkg/prefill/prefill_test.go
+++@@ -0,0 +1,132 @@
++++package prefill
++++
++++import (
++++	"context"
++++	"sync"
++++	"sync/atomic"
++++	"testing"
++++	"time"
++++
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
++++)
++++
++++type countingSource struct{ reads atomic.Uint64 }
++++
++++func (s *countingSource) ReadAt(buf []byte, _ uint64) (int, bool, error) {
++++	s.reads.Add(1)
++++	for i := range buf {
++++		buf[i] = 1
++++	}
++++	return len(buf), false, nil
++++}
++++
++++func (s *countingSource) CloneWithContext(context.Context) uffd.SnapshotReader { return s }
++++
++++type blockingSource struct {
++++	started chan struct{}
++++	release chan struct{}
++++	once    sync.Once
++++}
++++
++++func (s *blockingSource) ReadAt(buf []byte, _ uint64) (int, bool, error) {
++++	s.once.Do(func() { close(s.started) })
++++	// Deliberately ignore cancellation to model a transport that is slow to
++++	// abort. Its cleanup must not remain on the vm.resume critical path.
++++	<-s.release
++++	return len(buf), false, nil
++++}
++++
++++func (s *blockingSource) CloneWithContext(context.Context) uffd.SnapshotReader { return s }
++++
++++func TestSelectRangesHonorsOrderAndBudget(t *testing.T) {
++++	in := []profile.Range{{Offset: 0x3000, Length: 0x1000, Order: 3}, {Offset: 0x1000, Length: 0x2000, Order: 1}, {Offset: 0, Length: 0x1000, Order: 0}}
++++	got, bytes, exhausted := selectRanges(in, 0x3000)
++++	if !exhausted || bytes != 0x3000 || len(got) != 2 || got[0].Order != 0 || got[1].Order != 1 {
++++		t.Fatalf("got=%+v bytes=%x exhausted=%v", got, bytes, exhausted)
++++	}
++++}
++++
++++func TestSelectRangesKeepsOversizedHotPrefix(t *testing.T) {
++++	got, bytes, exhausted := selectRanges([]profile.Range{{Offset: 0, Length: 4 * profile.PageSize, Order: 0}}, 2*profile.PageSize)
++++	if !exhausted || bytes != 2*profile.PageSize || len(got) != 1 || got[0].Length != 2*profile.PageSize {
++++		t.Fatalf("got=%+v bytes=%d exhausted=%v", got, bytes, exhausted)
++++	}
++++}
++++
++++func TestPrepareFetchesBeforeInjectAndRespectsBuffer(t *testing.T) {
++++	source := &countingSource{}
++++	prof := &profile.MemoryProfile{Version: profile.CurrentVersion, PageSize: profile.PageSize, Targets: []profile.Target{{
++++		Kind: "memory", Size: 4 * uffd.MaxBatchBytes,
++++		Ranges: []profile.Range{{Offset: 0, Length: 4 * uffd.MaxBatchBytes, Order: 0}},
++++	}}}
++++	plan := Prepare(context.Background(), source, prof, PrefillOptions{
++++		MaxBytes:    4 * uffd.MaxBatchBytes,
++++		BufferBytes: 2 * uffd.MaxBatchBytes,
++++		Workers:     8,
++++	})
++++	if plan == nil {
++++		t.Fatal("Prepare returned nil")
++++	}
++++
++++	deadline := time.Now().Add(time.Second)
++++	for source.reads.Load() < 2 && time.Now().Before(deadline) {
++++		time.Sleep(time.Millisecond)
++++	}
++++	if got := source.reads.Load(); got != 2 {
++++		t.Fatalf("early reads=%d want=2", got)
++++	}
++++	// Without Inject releasing slots, later jobs must not allocate/fetch.
++++	time.Sleep(20 * time.Millisecond)
++++	if got := source.reads.Load(); got != 2 {
++++		t.Fatalf("buffer bound allowed %d reads, want 2", got)
++++	}
++++	plan.Close()
++++	if got := len(plan.results); got != 0 {
++++		t.Fatalf("Close retained %d buffered results", got)
++++	}
++++}
++++
++++func TestInjectCancellationDoesNotJoinBlockedFetch(t *testing.T) {
++++	source := &blockingSource{started: make(chan struct{}), release: make(chan struct{})}
++++	prof := &profile.MemoryProfile{Version: profile.CurrentVersion, PageSize: profile.PageSize, Targets: []profile.Target{{
++++		Kind: "memory", Size: uffd.MaxBatchBytes,
++++		Ranges: []profile.Range{{Offset: 0, Length: uffd.MaxBatchBytes, Order: 0}},
++++	}}}
++++	plan := Prepare(context.Background(), source, prof, PrefillOptions{
++++		MaxBytes:    uffd.MaxBatchBytes,
++++		BufferBytes: uffd.MaxBatchBytes,
++++		Workers:     1,
++++	})
++++	if plan == nil {
++++		t.Fatal("Prepare returned nil")
++++	}
++++
++++	select {
++++	case <-source.started:
++++	case <-time.After(time.Second):
++++		t.Fatal("fetch did not start")
++++	}
++++	ctx, cancel := context.WithCancel(context.Background())
++++	returned := make(chan PrefillStats, 1)
++++	go func() {
++++		returned <- plan.Inject(ctx, &uffd.Handler{})
++++	}()
++++	cancel()
++++	select {
++++	case stats := <-returned:
++++		if stats.BytesRequested != uffd.MaxBatchBytes {
++++			t.Fatalf("BytesRequested=%d, want %d", stats.BytesRequested, uffd.MaxBatchBytes)
++++		}
++++	case <-time.After(100 * time.Millisecond):
++++		t.Fatal("Inject waited for blocked fetch worker after cancellation")
++++	}
++++	select {
++++	case <-plan.done:
++++		t.Fatal("blocked fetch unexpectedly finished; test did not exercise asynchronous cleanup")
++++	default:
++++	}
++++
++++	close(source.release)
++++	plan.Close()
++++}
+++diff --git a/pkg/profile/profile.go b/pkg/profile/profile.go
+++new file mode 100644
+++index 0000000..8bdf238
+++--- /dev/null
++++++ b/pkg/profile/profile.go
+++@@ -0,0 +1,124 @@
++++// Package profile provides data structures and parsing logic for the startup profile.
++++// The startup profile is a JSON document generated during a cold start that records
++++// the memory pages accessed by the guest. During a subsequent restore, this profile
++++// is used to asynchronously prefill the hot memory pages to reduce UFFD latency.
++++package profile
++++
++++import (
++++	"encoding/json"
++++	"fmt"
++++	"sort"
++++)
++++
++++const (
++++	// CurrentVersion is the supported version of the startup profile format.
++++	CurrentVersion = 1
++++	// PageSize is the assumed memory page size (4 KiB).
++++	PageSize        = 4096
++++	MaxProfileBytes = 1 << 20
++++	MaxRanges       = 32768
++++)
++++
++++// Range represents a continuous block of memory accessed during cold start.
++++type Range struct {
++++	Offset uint64 `json:"offset"`
++++	Length uint64 `json:"length"`
++++	Order  uint32 `json:"order"`
++++	Hits   uint32 `json:"hits"`
++++}
++++
++++// Target represents a specific profiling target (e.g., "memory").
++++type Target struct {
++++	Kind   string  `json:"kind"`
++++	Size   uint64  `json:"size"`
++++	Ranges []Range `json:"ranges"`
++++}
++++
++++// MemoryProfile is the top-level structure of the startup-profile.json file.
++++type MemoryProfile struct {
++++	Version  int      `json:"version"`
++++	PageSize int      `json:"page_size"`
++++	WindowMs int      `json:"window_ms"`
++++	Targets  []Target `json:"targets"`
++++}
++++
++++// Parse unmarshals the JSON profile and performs basic validation.
++++func Parse(data []byte, expectedMemorySize uint64) (*MemoryProfile, error) {
++++	if len(data) > MaxProfileBytes {
++++		return nil, fmt.Errorf("profile exceeds %d bytes", MaxProfileBytes)
++++	}
++++	var prof MemoryProfile
++++	if err := json.Unmarshal(data, &prof); err != nil {
++++		return nil, fmt.Errorf("failed to unmarshal profile: %w", err)
++++	}
++++
++++	if prof.Version != CurrentVersion {
++++		return nil, fmt.Errorf("unsupported profile version: %d", prof.Version)
++++	}
++++	if prof.PageSize != PageSize {
++++		return nil, fmt.Errorf("unsupported page size: %d", prof.PageSize)
++++	}
++++
++++	var memoryTarget *Target
++++	for i := range prof.Targets {
++++		if prof.Targets[i].Kind == "memory" {
++++			if memoryTarget != nil {
++++				return nil, fmt.Errorf("multiple memory targets found in profile")
++++			}
++++			memoryTarget = &prof.Targets[i]
++++		}
++++	}
++++
++++	if memoryTarget == nil {
++++		return nil, fmt.Errorf("no memory target found in profile")
++++	}
++++
++++	if memoryTarget.Size != expectedMemorySize {
++++		return nil, fmt.Errorf("profile memory size (%d) does not match expected size (%d)", memoryTarget.Size, expectedMemorySize)
++++	}
++++
++++	if len(memoryTarget.Ranges) > MaxRanges {
++++		return nil, fmt.Errorf("profile has too many ranges: %d", len(memoryTarget.Ranges))
++++	}
++++	// Validate ranges before concurrent workers see them.
++++	for _, r := range memoryTarget.Ranges {
++++		if r.Length == 0 {
++++			return nil, fmt.Errorf("zero-length range at %d", r.Offset)
++++		}
++++		if r.Offset%PageSize != 0 {
++++			return nil, fmt.Errorf("range offset %d is not page-aligned", r.Offset)
++++		}
++++		if r.Length%PageSize != 0 {
++++			return nil, fmt.Errorf("range length %d is not page-aligned", r.Length)
++++		}
++++		if r.Offset > memoryTarget.Size || r.Length > memoryTarget.Size-r.Offset {
++++			return nil, fmt.Errorf("range exceeds memory size")
++++		}
++++	}
++++
++++	// Check overlap on an address-sorted copy, but retain the original order.
++++	// Adjacent ranges may intentionally encode reverse/interleaved Guest access;
++++	// merging them here would destroy the priority captured by Recorder.
++++	byAddress := append([]Range(nil), memoryTarget.Ranges...)
++++	sort.Slice(byAddress, func(i, j int) bool { return byAddress[i].Offset < byAddress[j].Offset })
++++	for i := 1; i < len(byAddress); i++ {
++++		previousEnd := byAddress[i-1].Offset + byAddress[i-1].Length
++++		if previousEnd > byAddress[i].Offset {
++++			return nil, fmt.Errorf("overlapping memory ranges at %d", byAddress[i].Offset)
++++		}
++++	}
++++
++++	return &prof, nil
++++}
++++
++++func (p *MemoryProfile) MemoryTarget() *Target {
++++	if p == nil {
++++		return nil
++++	}
++++	for i := range p.Targets {
++++		if p.Targets[i].Kind == "memory" {
++++			return &p.Targets[i]
++++		}
++++	}
++++	return nil
++++}
+++diff --git a/pkg/profile/profile_test.go b/pkg/profile/profile_test.go
+++new file mode 100644
+++index 0000000..200ef25
+++--- /dev/null
++++++ b/pkg/profile/profile_test.go
+++@@ -0,0 +1,96 @@
++++package profile
++++
++++import (
++++	"encoding/json"
++++	"testing"
++++)
++++
++++func TestParsePreservesOrderedAdjacentRanges(t *testing.T) {
++++	p := MemoryProfile{Version: 1, PageSize: PageSize, Targets: []Target{{Kind: "memory", Size: 8 * PageSize, Ranges: []Range{
++++		{Offset: PageSize, Length: PageSize, Order: 0, Hits: 1},
++++		{Offset: 0, Length: PageSize, Order: 1, Hits: 1},
++++	}}}}
++++	b, _ := json.Marshal(p)
++++	got, err := Parse(b, 8*PageSize)
++++	if err != nil {
++++		t.Fatal(err)
++++	}
++++	r := got.MemoryTarget().Ranges
++++	if len(r) != 2 || r[0].Offset != PageSize || r[0].Order != 0 || r[1].Offset != 0 || r[1].Order != 1 {
++++		t.Fatalf("ordered ranges = %+v", r)
++++	}
++++}
++++
++++func TestParseRejectsOverlappingRanges(t *testing.T) {
++++	p := MemoryProfile{Version: 1, PageSize: PageSize, Targets: []Target{{Kind: "memory", Size: 8 * PageSize, Ranges: []Range{
++++		{Offset: 0, Length: 2 * PageSize, Order: 0},
++++		{Offset: PageSize, Length: PageSize, Order: 1},
++++	}}}}
++++	b, _ := json.Marshal(p)
++++	if _, err := Parse(b, 8*PageSize); err == nil {
++++		t.Fatal("accepted overlapping ranges")
++++	}
++++}
++++
++++func TestParseRejectsInvalidRanges(t *testing.T) {
++++	for _, r := range []Range{{Offset: 0, Length: 0}, {Offset: 1, Length: PageSize}, {Offset: 0, Length: PageSize + 1}, {Offset: 8 * PageSize, Length: PageSize}} {
++++		p := MemoryProfile{Version: 1, PageSize: PageSize, Targets: []Target{{Kind: "memory", Size: 8 * PageSize, Ranges: []Range{r}}}}
++++		b, _ := json.Marshal(p)
++++		if _, err := Parse(b, 8*PageSize); err == nil {
++++			t.Fatalf("accepted %+v", r)
++++		}
++++	}
++++}
++++
++++func TestRecorderFreezeStopsAndDoesNotBridgeGaps(t *testing.T) {
++++	r := NewRecorder()
++++	if _, recording, singlePage := r.ReserveFault(); recording || !singlePage {
++++		t.Fatalf("before start: recording=%v singlePage=%v", recording, singlePage)
++++	}
++++	r.Start()
++++	_, recording, singlePage := r.ReserveFault()
++++	if !recording || !singlePage {
++++		t.Fatalf("active: recording=%v singlePage=%v", recording, singlePage)
++++	}
++++	r.Discard()
++++	r.RecordResolved(0)
++++	r.RecordResolved(PageSize)
++++	r.RecordResolved(3 * PageSize)
++++	p := r.Freeze(8 * PageSize)
++++	if len(p.MemoryTarget().Ranges) != 2 {
++++		t.Fatalf("ranges = %+v", p.MemoryTarget().Ranges)
++++	}
++++	r.RecordResolved(4 * PageSize)
++++	if got := r.Freeze(8 * PageSize); len(got.MemoryTarget().Ranges) != 2 {
++++		t.Fatalf("recorded after freeze: %+v", got)
++++	}
++++	if _, recording, singlePage := r.ReserveFault(); recording || singlePage {
++++		t.Fatalf("after freeze: recording=%v singlePage=%v", recording, singlePage)
++++	}
++++}
++++
++++func TestRecorderPreservesFaultArrivalOrder(t *testing.T) {
++++	r := NewRecorder()
++++	r.Start()
++++	// Reverse-adjacent accesses cannot be coalesced because a Range is replayed
++++	// in ascending address order.
++++	r.RecordResolved(PageSize)
++++	r.RecordResolved(0)
++++	p := r.Freeze(4 * PageSize)
++++	got := p.MemoryTarget().Ranges
++++	if len(got) != 2 || got[0].Offset != PageSize || got[0].Order != 0 || got[1].Offset != 0 || got[1].Order != 1 {
++++		t.Fatalf("ranges=%+v", got)
++++	}
++++}
++++
++++func TestRecorderDoesNotMergeInterleavedAdjacentPages(t *testing.T) {
++++	r := NewRecorder()
++++	r.Start()
++++	for _, page := range []uint64{0, 2, 1, 3, 4} {
++++		r.RecordResolved(page * PageSize)
++++	}
++++	got := r.Freeze(8 * PageSize).MemoryTarget().Ranges
++++	if len(got) != 4 || got[0].Offset != 0 || got[1].Offset != 2*PageSize || got[2].Offset != PageSize || got[3].Offset != 3*PageSize || got[3].Length != 2*PageSize {
++++		t.Fatalf("ranges=%+v", got)
++++	}
++++}
+++diff --git a/pkg/profile/recorder.go b/pkg/profile/recorder.go
+++new file mode 100644
+++index 0000000..4c6793b
+++--- /dev/null
++++++ b/pkg/profile/recorder.go
+++@@ -0,0 +1,204 @@
++++package profile
++++
++++import (
++++	"encoding/json"
++++	"sort"
++++	"sync"
++++)
++++
++++// maxPages avoids unbound memory usage during cold start recording
++++const defaultMaxPages = 16384 // 64 MiB
++++
++++// MaxCoalesceGap is the maximum gap between pages that can be coalesced into a single range
++++const MaxCoalesceGap = 0
++++
++++// Recorder safely tracks memory page access during the cold start window.
++++// It is designed to be called concurrently from the UFFD handler's workers.
++++type Recorder struct {
++++	mu           sync.Mutex
++++	active       bool
++++	started      bool
++++	maxPages     uint64
++++	orderCnt     uint32
++++	droppedPages uint64
++++	pages        map[uint64]uint32 // pageIdx -> order
++++	inflight     sync.WaitGroup
++++}
++++
++++type recordedPage struct {
++++	pageIdx uint64
++++	order   uint32
++++}
++++
++++// NewRecorder initializes a new Recorder with default limits.
++++func NewRecorder() *Recorder {
++++	return &Recorder{
++++		maxPages: defaultMaxPages,
++++		pages:    make(map[uint64]uint32),
++++	}
++++}
++++
++++// Start begins the recording session, clearing any previous state.
++++func (r *Recorder) Start() {
++++	r.mu.Lock()
++++	defer r.mu.Unlock()
++++	r.active = true
++++	r.started = true
++++	r.pages = make(map[uint64]uint32)
++++	r.orderCnt = 0
++++	r.droppedPages = 0
++++}
++++
++++// RecordResolved marks a page as accessed. It is called by the UFFD handler
++++// after successfully loading a page (e.g., via COPY or ZEROPAGE) when the
++++// recorder is active.
++++func (r *Recorder) Reserve() (uint32, bool) {
++++	seq, recording, _ := r.ReserveFault()
++++	return seq, recording
++++}
++++
++++// ReserveFault atomically snapshots both recorder decisions for one PAGEFAULT.
++++// singlePage is true before Start and while active, preventing speculative
++++// bootstrap batches from hiding application pages. It becomes false after
++++// Freeze so the normal 256-page batching path resumes.
++++func (r *Recorder) ReserveFault() (seq uint32, recording, singlePage bool) {
++++	r.mu.Lock()
++++	defer r.mu.Unlock()
++++	singlePage = !r.started || r.active
++++	if !r.active {
++++		return 0, false, singlePage
++++	}
++++	seq = r.orderCnt
++++	r.orderCnt++
++++	r.inflight.Add(1)
++++	return seq, true, singlePage
++++}
++++
++++func (r *Recorder) Commit(pageOffset uint64, seq uint32) {
++++	defer r.inflight.Done()
++++	r.mu.Lock()
++++	defer r.mu.Unlock()
++++
++++	pageIdx := pageOffset / PageSize
++++	if old, exists := r.pages[pageIdx]; !exists || seq < old {
++++		if !exists && uint64(len(r.pages)) >= r.maxPages {
++++			r.droppedPages++
++++			return
++++		}
++++		r.pages[pageIdx] = seq
++++	}
++++}
++++
++++func (r *Recorder) Discard() { r.inflight.Done() }
++++
++++// RecordResolved remains a test/helper path; production reserves order when
++++// the PAGEFAULT event arrives and commits it only after successful resolution.
++++func (r *Recorder) RecordResolved(pageOffset uint64) {
++++	if seq, ok := r.Reserve(); ok {
++++		r.Commit(pageOffset, seq)
++++	}
++++}
++++
++++// Freeze stops the recorder and generates the MemoryProfile based on recorded pages.
++++func (r *Recorder) Freeze(memorySize uint64) *MemoryProfile {
++++	r.mu.Lock()
++++	r.active = false
++++	r.mu.Unlock()
++++	r.inflight.Wait()
++++	r.mu.Lock()
++++	pagesMap := r.pages
++++	r.mu.Unlock()
++++
++++	if len(pagesMap) == 0 {
++++		return nil
++++	}
++++
++++	// The profile drives a priority-ordered prefill. Sort by observed Guest
++++	// access order, not address; address sorting would turn a reverse access
++++	// such as page 100 -> 99 into a range that incorrectly fetches 99 first.
++++	pages := make([]recordedPage, 0, len(pagesMap))
++++	for idx, order := range pagesMap {
++++		pages = append(pages, recordedPage{pageIdx: idx, order: order})
++++	}
++++	sort.Slice(pages, func(i, j int) bool {
++++		if pages[i].order == pages[j].order {
++++			return pages[i].pageIdx < pages[j].pageIdx
++++		}
++++		return pages[i].order < pages[j].order
++++	})
++++
++++	var ranges []Range
++++
++++	// Coalesce continuous or nearby pages
++++	startIdx := pages[0].pageIdx
++++	endIdx := startIdx + 1
++++	firstOrder := pages[0].order
++++	previousOrder := firstOrder
++++	hits := uint32(1)
++++
++++	for i := 1; i < len(pages); i++ {
++++		idx := pages[i].pageIdx
++++		order := pages[i].order
++++
++++		// A Range is replayed in ascending address order. Coalesce only a run
++++		// that was also observed in exactly that order; reverse/interleaved
++++		// accesses must stay as separate ranges to preserve priority.
++++		if idx == endIdx && order == previousOrder+1 {
++++			endIdx = idx + 1
++++			previousOrder = order
++++			hits++
++++		} else {
++++			// Commit current range
++++			ranges = append(ranges, Range{
++++				Offset: startIdx * PageSize,
++++				Length: (endIdx - startIdx) * PageSize,
++++				Order:  firstOrder,
++++				Hits:   hits,
++++			})
++++
++++			// Start new range
++++			startIdx = idx
++++			endIdx = idx + 1
++++			firstOrder = order
++++			previousOrder = order
++++			hits = 1
++++		}
++++	}
++++
++++	// Commit last range
++++	ranges = append(ranges, Range{
++++		Offset: startIdx * PageSize,
++++		Length: (endIdx - startIdx) * PageSize,
++++		Order:  firstOrder,
++++		Hits:   hits,
++++	})
++++
++++	return &MemoryProfile{
++++		Version:  CurrentVersion,
++++		PageSize: PageSize,
++++		WindowMs: 2000,
++++		Targets: []Target{
++++			{
++++				Kind:   "memory",
++++				Size:   memorySize,
++++				Ranges: ranges,
++++			},
++++		},
++++	}
++++}
++++
++++// Marshal is a helper to directly get the JSON representation
++++func (r *Recorder) Marshal(memorySize uint64) ([]byte, error) {
++++	prof := r.Freeze(memorySize)
++++	if prof == nil {
++++		return nil, nil
++++	}
++++	return json.Marshal(prof)
++++}
++++
++++// IsActive returns whether the recorder is currently capturing faults.
++++func (r *Recorder) IsActive() bool {
++++	r.mu.Lock()
++++	defer r.mu.Unlock()
++++	return r.active
++++}
+++diff --git a/pkg/restore/prefill_wait_test.go b/pkg/restore/prefill_wait_test.go
+++new file mode 100644
+++index 0000000..89e40fa
+++--- /dev/null
++++++ b/pkg/restore/prefill_wait_test.go
+++@@ -0,0 +1,34 @@
++++package restore
++++
++++import (
++++	"context"
++++	"testing"
++++	"time"
++++)
++++
++++func TestWaitForPrefillAlreadyDoneAddsNoTimeout(t *testing.T) {
++++	done := make(chan struct{})
++++	close(done)
++++	waited, timedOut, err := waitForPrefill(context.Background(), done, nil, 100*time.Millisecond)
++++	if err != nil || timedOut || waited >= 10*time.Millisecond {
++++		t.Fatalf("waited=%v timedOut=%v err=%v", waited, timedOut, err)
++++	}
++++}
++++
++++func TestWaitForPrefillTimeoutCancelsAndJoins(t *testing.T) {
++++	done := make(chan struct{})
++++	canceled := make(chan struct{})
++++	cancel := func() {
++++		close(canceled)
++++	}
++++	go func() {
++++		<-canceled
++++		// Model a COPY already inside the kernel when cancellation arrives.
++++		time.Sleep(5 * time.Millisecond)
++++		close(done)
++++	}()
++++	waited, timedOut, err := waitForPrefill(context.Background(), done, cancel, 10*time.Millisecond)
++++	if err != nil || !timedOut || waited < 10*time.Millisecond {
++++		t.Fatalf("waited=%v timedOut=%v err=%v", waited, timedOut, err)
++++	}
++++}
+++diff --git a/pkg/restore/restore.go b/pkg/restore/restore.go
+++index cf9f074..873b476 100755
+++--- a/pkg/restore/restore.go
++++++ b/pkg/restore/restore.go
+++@@ -10,9 +10,6 @@ import (
+++ 	"context"
+++ 	"errors"
+++ 	"fmt"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+++ 	"io"
+++ 	"log"
+++ 	"os"
+++@@ -20,8 +17,14 @@ import (
+++ 	"path/filepath"
+++ 	"time"
+++ 
++++	"github.com/kuasar-sandbox/sandboxer/pkg/config"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
++++
+++ 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/prefill"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
+++@@ -418,6 +421,31 @@ func Run(ctx context.Context, opts Options) (int, error) {
+++ 	}
+++ 	logf("snapshot source: %d memory layer(s)", len(memLayers))
+++ 
++++	// Extract and parse the startup profile, if present
++++	var startupProfile *profile.MemoryProfile
++++	var startupProfileData []byte
++++	if profileData, ok := entries["startup-profile.json"]; ok {
++++		prof, err := profile.Parse(profileData, capBytes)
++++		if err != nil {
++++			logf("startup-prefill: ignored invalid startup-profile.json: %v", err)
++++		} else {
++++			startupProfile = prof
++++			startupProfileData = append([]byte(nil), profileData...)
++++			logf("startup-prefill: loaded profile with %d ranges", len(prof.Targets[0].Ranges))
++++		}
++++	}
++++	prefillOptions := prefill.PrefillOptions{
++++		MaxBytes:    128 << 20,
++++		BufferBytes: 64 << 20,
++++		Timeout:     100 * time.Millisecond,
++++	}
++++	// Start remote reads at the earliest safe point: the memory source and
++++	// validated profile now exist, while disk reconstruction, socket setup and
++++	// CH restore are still ahead. Prepare is bounded by BufferBytes and performs
++++	// no UFFD operation; injection remains gated on CH's handler.
++++	preparedPrefill := prefill.Prepare(ctx, source, startupProfile, prefillOptions)
++++	defer preparedPrefill.Close()
++++
+++ 	// Reconstruct each logical disk (root + data disks, in order): layer the
+++ 	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
+++ 	// writable CoW on top, and (overlay mode) open the erofs base as the ro
+++@@ -517,6 +545,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
+++ 		UffdSource: source,
+++ 		Disks:      disks,
+++ 
++++		StartupProfile:          startupProfile,
++++		PreparedPrefill:         preparedPrefill,
++++		InheritedStartupProfile: startupProfileData,
++++		PrefillOptions:          prefillOptions,
++++
+++ 		LaunchSpec:    &proto.LaunchSpec{},
+++ 		WireLaunchMUX: false,
+++ 		Balloon:       balloonCtl,
+++@@ -566,6 +599,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
+++ 			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
+++ 				return fmt.Errorf("ch api not ready: %w", err)
+++ 			}
++++			// CH restore and profile fetching start together. If prefill has
++++			// already finished this returns immediately; otherwise vCPUs remain
++++			// paused for at most the configured wait budget after API readiness,
++++			// plus the completion of any COPY already in the kernel. This keeps
++++			// Guest demand faults and restored balloon activity out of the
++++			// UFFDIO_COPY window, avoiding an unprovable COPY/REMOVE generation
++++			// race while retaining overlap with the expensive CH restore phase.
++++			if pc.PrefillDone != nil {
++++				waited, timedOut, err := waitForPrefill(pc.Ctx, pc.PrefillDone, pc.CancelPrefill, pc.PrefillWaitTimeout)
++++				if err != nil {
++++					return err
++++				}
++++				if pc.RecordPrefillResumeWait != nil {
++++					pc.RecordPrefillResumeWait(uint64(waited.Nanoseconds()), timedOut)
++++				}
++++			}
+++ 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
+++ 				return fmt.Errorf("vm.resume: %w", err)
+++ 			}
+++@@ -615,6 +664,43 @@ func Run(ctx context.Context, opts Options) (int, error) {
+++ 	})
+++ }
+++ 
++++// waitForPrefill is called only after CH API readiness. It returns immediately
++++// when prefill is already done; timeout is the maximum additional vm.resume
++++// wait budget, not a fixed delay. Work already hidden behind restore is free.
++++// On timeout it cancels and joins the sole injector before returning; remote
++++// fetch workers are cleaned up asynchronously because they never issue
++++// UFFDIO_COPY. Thus resume is not delayed by remote teardown, while no COPY can
++++// run after the Guest is resumed.
++++func waitForPrefill(ctx context.Context, done <-chan struct{}, cancel context.CancelFunc, timeout time.Duration) (time.Duration, bool, error) {
++++	start := time.Now()
++++	if timeout <= 0 {
++++		select {
++++		case <-done:
++++			return time.Since(start), false, nil
++++		case <-ctx.Done():
++++			return time.Since(start), false, ctx.Err()
++++		}
++++	}
++++	timer := time.NewTimer(timeout)
++++	defer timer.Stop()
++++	select {
++++	case <-done:
++++		return time.Since(start), false, nil
++++	case <-ctx.Done():
++++		return time.Since(start), false, ctx.Err()
++++	case <-timer.C:
++++		if cancel != nil {
++++			cancel()
++++		}
++++		select {
++++		case <-done:
++++			return time.Since(start), true, nil
++++		case <-ctx.Done():
++++			return time.Since(start), true, ctx.Err()
++++		}
++++	}
++++}
++++
+++ // reconstructDisk rebuilds one logical disk for restore: the read-only base is
+++ // [captured top] ++ chain (§3.5) layered into a Stream; a FRESH writable CoW is
+++ // built on top (single mode: this IS the disk; overlay mode: the ext4 upper).
+++diff --git a/pkg/restore/upload.go b/pkg/restore/upload.go
+++index 66a34e7..4f736d3 100755
+++--- a/pkg/restore/upload.go
++++++ b/pkg/restore/upload.go
+++@@ -165,11 +165,15 @@ func UploadLocal(ctx context.Context, snapshotPath string, mcfg *manifest.Config
+++ 	if err != nil {
+++ 		return "", fmt.Errorf("render snapshot.cfg: %w", err)
+++ 	}
+++-	zipBytes, err := snapshot.BuildZIP(map[string][]byte{
++++	zipEntries := map[string][]byte{
+++ 		"config.json":  ent["config.json"],
+++ 		"state.json":   ent["state.json"],
+++ 		"snapshot.cfg": newCfg,
+++-	})
++++	}
++++	if b, ok := ent["startup-profile.json"]; ok {
++++		zipEntries["startup-profile.json"] = b
++++	}
++++	zipBytes, err := snapshot.BuildZIP(zipEntries)
+++ 	if err != nil {
+++ 		return "", fmt.Errorf("build zip: %w", err)
+++ 	}
+++diff --git a/pkg/sandbox/lifecycle.go b/pkg/sandbox/lifecycle.go
+++index 5eb36de..afde3d2 100755
+++--- a/pkg/sandbox/lifecycle.go
++++++ b/pkg/sandbox/lifecycle.go
+++@@ -5,9 +5,6 @@ import (
+++ 	"crypto/sha256"
+++ 	"encoding/hex"
+++ 	"fmt"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+++ 	"io"
+++ 	"log"
+++ 	"os"
+++@@ -17,6 +14,10 @@ import (
+++ 	"syscall"
+++ 	"time"
+++ 
++++	"github.com/kuasar-sandbox/sandboxer/pkg/config"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
++++
+++ 	"gopkg.in/yaml.v3"
+++ 
+++ 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+++@@ -24,6 +25,7 @@ import (
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
+++@@ -377,6 +379,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+++ 	// faults, the merged launch spec whose conn becomes the stdio MUX
+++ 	// (WireLaunchMUX), and a settle protocol gated on the guest's
+++ 	// hello / launch_ack handshake.
++++	startupRecorder := profile.NewRecorder()
+++ 	return ServeAndWait(VMParams{
+++ 		Ctx:                ctx,
+++ 		SandboxID:          opts.SandboxID,
+++@@ -388,9 +391,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+++ 		StatsJSONPath:      opts.StatsJSONPath,
+++ 		StatsInterval:      opts.StatsInterval,
+++ 
+++-		CapBytes:   int64(capBytes),
+++-		UffdSource: uffd.ZeroSource{},
+++-		Disks:      disks,
++++		CapBytes:        int64(capBytes),
++++		UffdSource:      uffd.ZeroSource{},
++++		StartupRecorder: startupRecorder,
++++		Disks:           disks,
+++ 
+++ 		LaunchSpec:        launchSpec,
+++ 		WireLaunchMUX:     true,
+++@@ -575,10 +579,28 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
+++ 		"batch_pages_total",
+++ 		"batch_avg_pages",
+++ 		"batch_max_pages",
++++		"prefill_requested_bytes",
++++		"prefill_filled_bytes",
++++		"prefill_existing_bytes",
++++		"prefill_skipped_zero",
++++		"prefill_errors",
++++		"prefill_duration_ns",
++++		"prefill_resume_wait_ns",
++++		"prefill_timed_out",
++++		"prefill_budget_exhausted",
+++ 	}
+++ 	for _, k := range keys {
+++ 		fmt.Fprintf(w, "  %-20s %d\n", k, s[k])
+++ 	}
++++
++++	reqBytes := s["prefill_requested_bytes"]
++++	filledBytes := s["prefill_filled_bytes"]
++++	skippedZero := s["prefill_skipped_zero"]
++++	covRatio := 0.0
++++	if reqBytes > 0 {
++++		covRatio = float64(filledBytes+skippedZero) / float64(reqBytes) * 100
++++	}
++++	fmt.Fprintf(w, "  %-20s %.2f%%\n", "prefill_coverage", covRatio)
+++ }
+++ 
+++ // guestDevPath maps a 0-based device index to its guest block device. virtio-blk
+++@@ -725,24 +747,26 @@ func (q *allQuiescer) Resume() {
+++ // that owns the bundle holds references; the snapshot path consumes
+++ // them when a request arrives.
+++ type SnapshotHandler struct {
+++-	Cfg         *config.SandboxConfig
+++-	ManifestCfg *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+++-	SandboxID   string                 // required: snapshot.Take rejects empty
+++-	Memfd       *memory.Memfd
+++-	Disks       []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+++-	Servers     []*vhost.Server // all vhost servers (quiesced together around the dump)
+++-	CHSock      string
+++-	RunDir      string
+++-	Pinger      *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
+++-	Forwarder   *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
+++-	Reattach    func() error      // optional; re-establishes the stdio MUX after --resume
+++-	Logf        func(string, ...any)
++++	Cfg                     *config.SandboxConfig
++++	ManifestCfg             *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
++++	SandboxID               string                 // required: snapshot.Take rejects empty
++++	Memfd                   *memory.Memfd
++++	Disks                   []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
++++	Servers                 []*vhost.Server // all vhost servers (quiesced together around the dump)
++++	CHSock                  string
++++	RunDir                  string
++++	Pinger                  *guestlink.Pinger // optional; if non-nil, paused around quiesce/Take
++++	Forwarder               *Forwarder        // optional; if non-nil, paused + active relays collapsed around quiesce
++++	Reattach                func() error      // optional; re-establishes the stdio MUX after --resume
++++	Logf                    func(string, ...any)
++++	StartupRecorder         *profile.Recorder
++++	InheritedStartupProfile []byte
+++ }
+++ 
+++ // Handle dispatches one ctl snapshot_request. Public for restore.Run.
+++ func (h *SnapshotHandler) Handle(req ctl.Request) (ctl.Response, error) {
+++ 	opts := RunOptions{Cfg: h.Cfg, ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID}
+++-	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.Logf)
++++	return handleSnapshotRequest(req, opts, h.Memfd, h.Disks, h.Servers, h.CHSock, h.RunDir, h.Pinger, h.Forwarder, h.Reattach, h.StartupRecorder, h.InheritedStartupProfile, h.Logf)
+++ }
+++ 
+++ // handleSnapshotRequest executes one snapshot_request received via
+++@@ -760,6 +784,8 @@ func handleSnapshotRequest(
+++ 	pinger *guestlink.Pinger,
+++ 	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
+++ 	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
++++	startupRecorder *profile.Recorder,
++++	inheritedStartupProfile []byte,
+++ 	logf func(string, ...any),
+++ ) (resp ctl.Response, err error) {
+++ 	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
+++@@ -900,6 +926,11 @@ func handleSnapshotRequest(
+++ 		Quiescer:      &allQuiescer{servers: servers},
+++ 		Logf:          logf,
+++ 	}
++++	if startupRecorder != nil {
++++		src.StartupProfile = func() ([]byte, error) { return startupRecorder.Marshal(uint64(mfd.Size())) }
++++	} else if len(inheritedStartupProfile) > 0 {
++++		src.StartupProfile = func() ([]byte, error) { return append([]byte(nil), inheritedStartupProfile...), nil }
++++	}
+++ 	if localParent {
+++ 		if prov.ParentSnapshotPath == "" || prov.ParentOverlayPath == "" {
+++ 			return ctl.Response{}, fmt.Errorf("snapshot: local parent %q lacks merge paths", prov.ParentSnapshotRef)
+++diff --git a/pkg/sandbox/prefill_metrics_test.go b/pkg/sandbox/prefill_metrics_test.go
+++new file mode 100644
+++index 0000000..2fd621d
+++--- /dev/null
++++++ b/pkg/sandbox/prefill_metrics_test.go
+++@@ -0,0 +1,36 @@
++++package sandbox
++++
++++import (
++++	"testing"
++++	"time"
++++
++++	"github.com/kuasar-sandbox/sandboxer/pkg/prefill"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
++++)
++++
++++func TestPrefillMetricsSinkAppliesOutcomeToLateHandler(t *testing.T) {
++++	sink := &prefillMetricsSink{}
++++	sink.RecordStats(prefill.PrefillStats{
++++		BytesRequested:  8 << 20,
++++		BytesFilled:     4 << 20,
++++		Duration:        12 * time.Millisecond,
++++		BudgetExhausted: true,
++++	})
++++	sink.RecordResumeWait(uint64((100 * time.Millisecond).Nanoseconds()), true)
++++
++++	h := &uffd.Handler{}
++++	sink.Attach(h)
++++	stats := h.Stats()
++++	if got := stats["prefill_requested_bytes"]; got != 8<<20 {
++++		t.Fatalf("prefill_requested_bytes=%d, want %d", got, 8<<20)
++++	}
++++	if got := stats["prefill_filled_bytes"]; got != 4<<20 {
++++		t.Fatalf("prefill_filled_bytes=%d, want %d", got, 4<<20)
++++	}
++++	if got := stats["prefill_timed_out"]; got != 1 {
++++		t.Fatalf("prefill_timed_out=%d, want 1", got)
++++	}
++++	if got := stats["prefill_budget_exhausted"]; got != 1 {
++++		t.Fatalf("prefill_budget_exhausted=%d, want 1", got)
++++	}
++++}
+++diff --git a/pkg/sandbox/serveandwait.go b/pkg/sandbox/serveandwait.go
+++index d9021b0..86c36f1 100755
+++--- a/pkg/sandbox/serveandwait.go
++++++ b/pkg/sandbox/serveandwait.go
+++@@ -3,9 +3,6 @@ package sandbox
+++ import (
+++ 	"context"
+++ 	"fmt"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+++-	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+++ 	"log"
+++ 	"net"
+++ 	"os"
+++@@ -17,10 +14,15 @@ import (
+++ 	"syscall"
+++ 	"time"
+++ 
++++	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/prefill"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
++++	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
+++ 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+++@@ -62,15 +64,73 @@ type CmdEnv struct {
+++ //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
+++ //     a non-nil return aborts the run (ServeAndWait kills CH).
+++ type PostSpawnCtx struct {
+++-	Ctx          context.Context
+++-	Cmd          *exec.Cmd
+++-	Pinger       *guestlink.Pinger
+++-	Launch       *guestlink.LaunchServer
+++-	EstablishMUX func(net.Conn, proto.StdioSpec) error
+++-	Hooks        *resctl.ControllerHooks
+++-	Balloon      *resctl.BalloonController
+++-	CHSock       string
+++-	Logf         func(string, ...any)
++++	Ctx                     context.Context
++++	Cmd                     *exec.Cmd
++++	Pinger                  *guestlink.Pinger
++++	Launch                  *guestlink.LaunchServer
++++	EstablishMUX            func(net.Conn, proto.StdioSpec) error
++++	Hooks                   *resctl.ControllerHooks
++++	Balloon                 *resctl.BalloonController
++++	CHSock                  string
++++	Logf                    func(string, ...any)
++++	PrefillDone             <-chan struct{}
++++	CancelPrefill           context.CancelFunc
++++	PrefillWaitTimeout      time.Duration
++++	RecordPrefillResumeWait func(uint64, bool)
++++}
++++
++++// prefillMetricsSink decouples startup metrics from UFFD handler creation.
++++// CH may reach the API-ready timeout before sending its first va_report; in
++++// that case metrics are retained here and applied when the handler arrives.
++++type prefillMetricsSink struct {
++++	mu sync.Mutex
++++
++++	handler       *uffd.Handler
++++	stats         *prefill.PrefillStats
++++	resumeWaitSet bool
++++	resumeWaitNs  uint64
++++	timedOut      bool
++++}
++++
++++func (s *prefillMetricsSink) Attach(h *uffd.Handler) {
++++	if h == nil {
++++		return
++++	}
++++	s.mu.Lock()
++++	defer s.mu.Unlock()
++++	s.handler = h
++++	if s.stats != nil {
++++		recordPrefillStats(h, *s.stats)
++++	}
++++	if s.resumeWaitSet {
++++		h.RecordPrefillResumeWait(s.resumeWaitNs, s.timedOut)
++++	}
++++}
++++
++++func (s *prefillMetricsSink) RecordStats(stats prefill.PrefillStats) {
++++	s.mu.Lock()
++++	defer s.mu.Unlock()
++++	copy := stats
++++	s.stats = &copy
++++	if s.handler != nil {
++++		recordPrefillStats(s.handler, stats)
++++	}
++++}
++++
++++func (s *prefillMetricsSink) RecordResumeWait(ns uint64, timedOut bool) {
++++	s.mu.Lock()
++++	defer s.mu.Unlock()
++++	s.resumeWaitSet = true
++++	s.resumeWaitNs = ns
++++	s.timedOut = timedOut
++++	if s.handler != nil {
++++		s.handler.RecordPrefillResumeWait(ns, timedOut)
++++	}
++++}
++++
++++func recordPrefillStats(h *uffd.Handler, stats prefill.PrefillStats) {
++++	h.RecordPrefillStats(stats.BytesRequested, stats.BytesFilled, stats.BytesExisting,
++++		stats.SkippedZero, stats.FetchErrors, uint64(stats.Duration.Nanoseconds()), stats.BudgetExhausted)
+++ }
+++ 
+++ // VMParams is the input to ServeAndWait — everything the shared
+++@@ -91,6 +151,12 @@ type VMParams struct {
+++ 	CapBytes   int64               // RAM capacity (memfd size); also stats UffdRAMSize
+++ 	UffdSource uffd.SnapshotReader // ZeroSource (cold) | snapshot source (restore)
+++ 
++++	StartupProfile          *profile.MemoryProfile
++++	PreparedPrefill         *prefill.Plan
++++	InheritedStartupProfile []byte
++++	StartupRecorder         *profile.Recorder
++++	PrefillOptions          prefill.PrefillOptions
++++
+++ 	// Disks are the logical disks served to the guest, in order: Disks[0] is
+++ 	// the root, Disks[1:] are the boot.disks[] data disks (boot.disks[] order).
+++ 	// ServeAndWait expands each into its vhost device(s) in CH --disk order
+++@@ -234,6 +300,9 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 	}
+++ 	defer memfd.Close()
+++ 
++++	handlerReady := make(chan *uffd.Handler, 1)
++++	profileHandlerReady := make(chan *uffd.Handler, 1)
++++
+++ 	// AddressMap is shared between the va_report server (registers
+++ 	// ProcessCH on receive) and the uffd Handler (Locate on each fault).
+++ 	addrMap := uffd.NewAddressMap(uint64(memfd.Size()))
+++@@ -246,6 +315,7 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 	// reach it after ctx cancellation.
+++ 	var uffdHandler *uffd.Handler
+++ 	var uffdHandlerMu sync.Mutex
++++	prefillMetrics := &prefillMetricsSink{}
+++ 	defer func() {
+++ 		uffdHandlerMu.Lock()
+++ 		h := uffdHandler
+++@@ -262,20 +332,36 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 		HandshakeDeadline: p.VAReportDeadline,
+++ 		OnReady: func(uffdFD int, vaStart, size uint64) error {
+++ 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
+++-				MemfdFD:   memfd.FD(),
+++-				BackendVA: memfd.Addr(),
+++-				Size:      memfd.Size(),
+++-				Source:    p.UffdSource,
+++-				Logf:      logf,
++++				MemfdFD:         memfd.FD(),
++++				BackendVA:       memfd.Addr(),
++++				Size:            memfd.Size(),
++++				Source:          p.UffdSource,
++++				StartupRecorder: p.StartupRecorder,
++++				Logf:            logf,
+++ 			})
+++ 			if err != nil {
+++ 				return err
+++ 			}
+++ 			h.Start()
++++			if err := h.RegisterPrefillRegion(uffdFD, vaStart, size); err != nil {
++++				_ = h.Close()
++++				return err
++++			}
+++ 			uffdHandlerMu.Lock()
+++ 			uffdHandler = h
+++ 			uffdHandlerMu.Unlock()
++++			prefillMetrics.Attach(h)
+++ 			logf("uffd handler: adopted CH uffd region #0 fd=%d size=%d", uffdFD, size)
++++
++++			select {
++++			case handlerReady <- h:
++++			default:
++++			}
++++			select {
++++			case profileHandlerReady <- h:
++++			default:
++++			}
++++
+++ 			return nil
+++ 		},
+++ 		OnRegister: func(uffdFD int, vaStart, size uint64) error {
+++@@ -288,6 +374,9 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 			if err := h.AddUffd(uffdFD); err != nil {
+++ 				return err
+++ 			}
++++			if err := h.RegisterPrefillRegion(uffdFD, vaStart, size); err != nil {
++++				return err
++++			}
+++ 			logf("uffd handler: attached additional region fd=%d size=%d", uffdFD, size)
+++ 			return nil
+++ 		},
+++@@ -362,6 +451,28 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 			}
+++ 		},
+++ 	}
++++	if p.StartupRecorder != nil {
++++		launch.BeforeLaunch = func() error {
++++			var h *uffd.Handler
++++			select {
++++			case h = <-profileHandlerReady:
++++			case <-backendCtx.Done():
++++				return backendCtx.Err()
++++			}
++++			if err := h.BeginProfileRecording(backendCtx); err != nil {
++++				return err
++++			}
++++			go func() {
++++				select {
++++				case <-time.After(2 * time.Second):
++++					p.StartupRecorder.Freeze(uint64(memfd.Size()))
++++				case <-backendCtx.Done():
++++					p.StartupRecorder.Freeze(uint64(memfd.Size()))
++++				}
++++			}()
++++			return nil
++++		}
++++	}
+++ 	if p.WireLaunchMUX {
+++ 		launch.OnMUXReady = func(conn net.Conn, established proto.StdioSpec) {
+++ 			if err := establishMUX(conn, established); err != nil {
+++@@ -400,18 +511,20 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 	// ctl.sock server for snapshot requests. SnapshotHandler is the
+++ 	// shared bundle both Run and restore.Run use.
+++ 	snapHandler := &SnapshotHandler{
+++-		Cfg:         p.SnapCfg,
+++-		ManifestCfg: p.ManifestCfg,
+++-		SandboxID:   p.SandboxID,
+++-		Memfd:       memfd,
+++-		Disks:       snapDisks,
+++-		Servers:     servers,
+++-		CHSock:      chSock,
+++-		RunDir:      runDir,
+++-		Pinger:      pinger,
+++-		Forwarder:   forwarder,
+++-		Reattach:    reattach,
+++-		Logf:        logf,
++++		Cfg:                     p.SnapCfg,
++++		ManifestCfg:             p.ManifestCfg,
++++		SandboxID:               p.SandboxID,
++++		Memfd:                   memfd,
++++		Disks:                   snapDisks,
++++		Servers:                 servers,
++++		CHSock:                  chSock,
++++		RunDir:                  runDir,
++++		Pinger:                  pinger,
++++		Forwarder:               forwarder,
++++		Reattach:                reattach,
++++		Logf:                    logf,
++++		StartupRecorder:         p.StartupRecorder,
++++		InheritedStartupProfile: p.InheritedStartupProfile,
+++ 	}
+++ 	ctlSrv := &ctl.Server{
+++ 		Path:            ctlSockPath,
+++@@ -521,6 +634,37 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 	}
+++ 	chPid := cmd.Process.Pid
+++ 	logf("CH started pid=%d", chPid)
++++	prefillDone := make(chan struct{})
++++	prefillCtx, cancelPrefill := context.WithCancel(backendCtx)
++++	defer cancelPrefill()
++++	if p.PreparedPrefill != nil {
++++		// Profile fetching and UFFDIO_COPY overlap CH restore. Restore's
++++		// PostSpawn waits for this bounded operation before vm.resume, so Guest
++++		// demand faults and balloon REMOVE cannot race snapshot injection.
++++		backendWG.Add(1)
++++		go func() {
++++			defer backendWG.Done()
++++			defer p.PreparedPrefill.Close()
++++			defer cancelPrefill()
++++			// prefillDone is the resume gate: it closes as soon as the sole
++++			// injector has returned. Plan.Close may still be joining canceled
++++			// fetch workers, but those workers never issue UFFDIO_COPY.
++++			defer close(prefillDone)
++++			var stats prefill.PrefillStats
++++			select {
++++			case h := <-handlerReady:
++++				stats = p.PreparedPrefill.Inject(prefillCtx, h)
++++				logf("startup-prefill: ranges=%d bytes=%d existing=%d errors=%d duration=%v", stats.CompletedRanges, stats.BytesFilled, stats.BytesExisting, stats.FetchErrors, stats.Duration)
++++			case <-prefillCtx.Done():
++++				stats = p.PreparedPrefill.CanceledStats()
++++				logf("startup-prefill: canceled before handler became available: %v", prefillCtx.Err())
++++			}
++++			prefillMetrics.RecordStats(stats)
++++		}()
++++	} else {
++++		cancelPrefill()
++++		close(prefillDone)
++++	}
+++ 
+++ 	// Move CH (and only CH) into the per-sandbox cgroup. sandbox-ctl
+++ 	// stays in its parent cgroup — see pkg/sandbox/cgroup.go header.
+++@@ -543,15 +687,21 @@ func ServeAndWait(p VMParams) (int, error) {
+++ 	})
+++ 
+++ 	if err := p.PostSpawn(PostSpawnCtx{
+++-		Ctx:          backendCtx,
+++-		Cmd:          cmd,
+++-		Pinger:       pinger,
+++-		Launch:       launch,
+++-		EstablishMUX: establishMUX,
+++-		Hooks:        p.Hooks,
+++-		Balloon:      p.Balloon,
+++-		CHSock:       chSock,
+++-		Logf:         logf,
++++		Ctx:                backendCtx,
++++		Cmd:                cmd,
++++		Pinger:             pinger,
++++		Launch:             launch,
++++		EstablishMUX:       establishMUX,
++++		Hooks:              p.Hooks,
++++		Balloon:            p.Balloon,
++++		CHSock:             chSock,
++++		Logf:               logf,
++++		PrefillDone:        prefillDone,
++++		CancelPrefill:      cancelPrefill,
++++		PrefillWaitTimeout: p.PrefillOptions.Timeout,
++++		RecordPrefillResumeWait: func(ns uint64, timedOut bool) {
++++			prefillMetrics.RecordResumeWait(ns, timedOut)
++++		},
+++ 	}); err != nil {
+++ 		_ = cmd.Process.Kill()
+++ 		cancelBackends()
+++diff --git a/pkg/snapshot/take.go b/pkg/snapshot/take.go
+++index 81bbd3e..76d6728 100755
+++--- a/pkg/snapshot/take.go
++++++ b/pkg/snapshot/take.go
+++@@ -63,6 +63,9 @@ type Sources struct {
+++ 	// SnapshotCfg renders snapshot.cfg given the final overlay refs (one per
+++ 	// logical disk, in Diffs order).
+++ 	SnapshotCfg func(overlayRefs []string) ([]byte, error)
++++	// StartupProfile freezes the cold-start recorder at the snapshot barrier.
++++	// It is optional performance metadata; failure is logged and fail-open.
++++	StartupProfile func() ([]byte, error)
+++ 
+++ 	Quiescer Quiescer
+++ 	Logf     func(string, ...any)
+++@@ -178,11 +181,19 @@ func Take(s Sources, sink SnapshotSink, resumeAfter bool) (*Outputs, error) {
+++ 	if err != nil {
+++ 		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
+++ 	}
+++-	zipBytes, err := BuildZIP(map[string][]byte{
++++	entries := map[string][]byte{
+++ 		"config.json":  configJSON,
+++ 		"state.json":   stateJSON,
+++ 		"snapshot.cfg": snapshotCfg,
+++-	})
++++	}
++++	if s.StartupProfile != nil {
++++		if b, profileErr := s.StartupProfile(); profileErr != nil {
++++			logf("startup profile: %v (omitted)", profileErr)
++++		} else if len(b) > 0 {
++++			entries["startup-profile.json"] = b
++++		}
++++	}
++++	zipBytes, err := BuildZIP(entries)
+++ 	if err != nil {
+++ 		return nil, fmt.Errorf("build zip: %w", err)
+++ 	}
+++diff --git a/pkg/uffd/addrmap.go b/pkg/uffd/addrmap.go
+++index 58a82e9..b8df22f 100755
+++--- a/pkg/uffd/addrmap.go
++++++ b/pkg/uffd/addrmap.go
+++@@ -90,10 +90,19 @@ func (m *AddressMap) RegisterVMA(p ProcessKind, vaStart, size, memfdOffset uint6
+++ // Locate returns (memfdOffset, true) if faultVA falls within any
+++ // registered VMA (any process), else (_, false).
+++ func (m *AddressMap) Locate(faultVA uint64) (uint64, bool) {
++++	return m.LocateFor(0, faultVA)
++++}
++++
++++// LocateFor disambiguates equal numeric VAs belonging to different processes.
++++// p==0 preserves the legacy any-process lookup for backend-only callers.
++++func (m *AddressMap) LocateFor(p ProcessKind, faultVA uint64) (uint64, bool) {
+++ 	m.mu.RLock()
+++ 	defer m.mu.RUnlock()
+++ 	for i := range m.vmas {
+++ 		v := &m.vmas[i]
++++		if p != 0 && v.process != p {
++++			continue
++++		}
+++ 		if faultVA >= v.start && faultVA < v.end {
+++ 			return v.memfdOffset + (faultVA - v.start), true
+++ 		}
+++diff --git a/pkg/uffd/addrmap_test.go b/pkg/uffd/addrmap_test.go
+++new file mode 100644
+++index 0000000..e730621
+++--- /dev/null
++++++ b/pkg/uffd/addrmap_test.go
+++@@ -0,0 +1,20 @@
++++package uffd
++++
++++import "testing"
++++
++++func TestLocateForDisambiguatesEqualVirtualAddresses(t *testing.T) {
++++	m := NewAddressMap(4 * PageSize)
++++	const va = uint64(0x100000)
++++	if err := m.RegisterVMA(ProcessBackend, va, 2*PageSize, 0); err != nil {
++++		t.Fatal(err)
++++	}
++++	if err := m.RegisterVMA(ProcessCH, va, 2*PageSize, 2*PageSize); err != nil {
++++		t.Fatal(err)
++++	}
++++	if got, ok := m.LocateFor(ProcessCH, va+PageSize); !ok || got != 3*PageSize {
++++		t.Fatalf("CH got=%x ok=%v", got, ok)
++++	}
++++	if got, ok := m.LocateFor(ProcessBackend, va+PageSize); !ok || got != PageSize {
++++		t.Fatalf("backend got=%x ok=%v", got, ok)
++++	}
++++}
+++diff --git a/pkg/uffd/handler.go b/pkg/uffd/handler.go
+++index a4fac13..88c526a 100755
+++--- a/pkg/uffd/handler.go
++++++ b/pkg/uffd/handler.go
+++@@ -1,6 +1,7 @@
+++ package uffd
+++ 
+++ import (
++++	"context"
+++ 	"errors"
+++ 	"fmt"
+++ 	"hash/fnv"
+++@@ -13,6 +14,7 @@ import (
+++ 	"time"
+++ 	"unsafe"
+++ 
++++	"github.com/kuasar-sandbox/sandboxer/pkg/profile"
+++ 	"golang.org/x/sys/unix"
+++ )
+++ 
+++@@ -54,6 +56,10 @@ type Config struct {
+++ 	// Number of worker goroutines. 0 → runtime.NumCPU(); minimum 2.
+++ 	NumWorkers int
+++ 
++++	// StartupRecorder is used during cold start to record demand faults.
++++	// If active, batching is disabled to record actual access patterns.
++++	StartupRecorder *profile.Recorder
++++
+++ 	// Optional logger; nil → discarded.
+++ 	Logf func(string, ...any)
+++ }
+++@@ -106,8 +112,12 @@ type Handler struct {
+++ 	uffds   []*os.File
+++ 	uffdsMu sync.Mutex
+++ 
+++-	addrMap *AddressMap
+++-	state   *PageStateMap
++++	addrMap          *AddressMap
++++	state            *PageStateMap
++++	prefillRegionsMu sync.RWMutex
++++	prefillRegions   []prefillRegion
++++	profileModeMu    sync.RWMutex
++++	pendingFaults    atomic.Int64
+++ 
+++ 	epfd int
+++ 
+++@@ -160,14 +170,35 @@ type handlerStats struct {
+++ 	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
+++ 	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
+++ 
++++	prefillRequestedBytes atomic.Uint64
++++	prefillFilledBytes    atomic.Uint64
++++	prefillExistingBytes  atomic.Uint64
++++	prefillSkippedZero    atomic.Uint64
++++	prefillFetchErrors    atomic.Uint64
++++	prefillDurationNs     atomic.Uint64
++++	prefillResumeWaitNs   atomic.Uint64
++++	prefillTimedOut       atomic.Bool
++++	prefillBudgetExhaust  atomic.Bool
++++
+++ 	inflight atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
+++ 	pageIn   latHist      // page-in FETCH latency (data Source.ReadAt; the slow-remote/cache signal)
+++ }
+++ 
++++type prefillRegion struct {
++++	fd          int
++++	vaStart     uint64
++++	size        uint64
++++	memfdOffset uint64
++++}
++++
+++ type faultEvent struct {
+++-	address uint64
+++-	flags   uint64
+++-	uffdFD  int // which uffd this came from — determines ioctl target fd
++++	address     uint64
++++	memfdOffset uint64
++++	flags       uint64
++++	uffdFD      int // which uffd this came from — determines ioctl target fd
++++	profileSeq  uint32
++++	recording   bool
++++	singlePage  bool
+++ }
+++ 
+++ // NewWithBackendUffd constructs the single-uffd handler. The CH-side
+++@@ -222,8 +253,7 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
+++ 		return nil, fmt.Errorf("epoll_ctl ADD uffdC fd=%d: %w", uffdCFromCH, err)
+++ 	}
+++ 
+++-	numPages := cfg.Size / PageSize
+++-	state := NewPageStateMap(numPages)
++++	state := NewPageStateMap(cfg.Size / PageSize)
+++ 
+++ 	queues := make([]chan faultEvent, cfg.NumWorkers)
+++ 	for i := range queues {
+++@@ -275,6 +305,140 @@ func (h *Handler) AddUffd(uffdFD int) error {
+++ // so the handler can translate ev.address → memfd offset).
+++ func (h *Handler) AddressMap() *AddressMap { return h.addrMap }
+++ 
++++// RegisterPrefillRegion associates a CH VMA with the userfaultfd that owns it.
++++// AddressMap intentionally does not retain fds, so proactive UFFDIO_COPY needs
++++// this parallel table to translate stable memfd offsets back to (fd, chVA).
++++func (h *Handler) RegisterPrefillRegion(fd int, vaStart, size uint64) error {
++++	memfdOffset, ok := h.addrMap.LocateFor(ProcessCH, vaStart)
++++	if !ok {
++++		return fmt.Errorf("uffd: prefill region va 0x%x not registered", vaStart)
++++	}
++++	h.prefillRegionsMu.Lock()
++++	h.prefillRegions = append(h.prefillRegions, prefillRegion{fd: fd, vaStart: vaStart, size: size, memfdOffset: memfdOffset})
++++	h.prefillRegionsMu.Unlock()
++++	return nil
++++}
++++
++++// PrefillCopy installs snapshot data without writing sandbox-ctl's shared mmap.
++++// One page per ioctl keeps EEXIST unambiguous: if CH restore already owns a
++++// folio, prefill skips that page without overwriting it.
++++func (h *Handler) PrefillCopy(ctx context.Context, memfdOffset uint64, data []byte) (filled, existed uint64, err error) {
++++	if memfdOffset%PageSize != 0 || len(data)%PageSize != 0 {
++++		return 0, 0, fmt.Errorf("uffd: unaligned prefill off=%d len=%d", memfdOffset, len(data))
++++	}
++++	for pos := 0; pos < len(data); pos += PageSize {
++++		if err := ctx.Err(); err != nil {
++++			return filled, existed, err
++++		}
++++		off := memfdOffset + uint64(pos)
++++		pageIdx := off / PageSize
++++
++++		// A Loaded page already has usable content. Released is a lifecycle
++++		// skip, not an "existing" folio, and is therefore not counted as one.
++++		switch h.state.Get(pageIdx) {
++++		case StateLoaded:
++++			existed += PageSize
++++			continue
++++		case StateReleased:
++++			continue
++++		}
++++
++++		var region prefillRegion
++++		for {
++++			h.prefillRegionsMu.RLock()
++++			found := false
++++			for _, r := range h.prefillRegions {
++++				if off >= r.memfdOffset && off < r.memfdOffset+r.size {
++++					region, found = r, true
++++					break
++++				}
++++			}
++++			h.prefillRegionsMu.RUnlock()
++++			if found {
++++				break
++++			}
++++			select {
++++			case <-ctx.Done():
++++				return filled, existed, ctx.Err()
++++			case <-time.After(time.Millisecond):
++++			}
++++		}
++++		dst := region.vaStart + (off - region.memfdOffset)
++++		src := uint64(uintptr(unsafe.Pointer(&data[pos])))
++++		var copyErr error
++++		for attempt := 0; attempt < 3; attempt++ {
++++			if err := ctx.Err(); err != nil {
++++				return filled, existed, err
++++			}
++++			copyErr = ioctlUffdCopy(region.fd, dst, src, PageSize)
++++			if !errors.Is(copyErr, unix.EAGAIN) {
++++				break
++++			}
++++			runtime.Gosched()
++++		}
++++		if copyErr != nil {
++++			if errors.Is(copyErr, unix.EEXIST) {
++++				existed += PageSize
++++				continue
++++			}
++++			return filled, existed, copyErr
++++		}
++++
++++		// Publish Loaded only if no lifecycle transition happened while COPY
++++		// was in the kernel. Never try to "repair" StateReleased with a second
++++		// PUNCH_HOLE: state inspection plus punch is not atomic. Restore keeps
++++		// vCPUs paused until prefill completes, so Guest faults and balloon
++++		// EVENT_REMOVE cannot enter this window.
++++		if !h.state.CompareAndSwap(pageIdx, StateAbsent, StateLoaded) {
++++			if h.state.Get(pageIdx) == StateLoaded {
++++				existed += PageSize
++++			}
++++			continue
++++		}
++++
++++		filled += PageSize
++++	}
++++	return filled, existed, nil
++++}
++++
++++// BeginProfileRecording creates a hard transition from speculative batching to
++++// one-page demand recording: dispatch is stopped while all old queued/inflight
++++// faults drain, so no pre-window batch can hide pages from the Profile.
++++func (h *Handler) BeginProfileRecording(ctx context.Context) error {
++++	h.profileModeMu.Lock()
++++	defer h.profileModeMu.Unlock()
++++	// pendingFaults is incremented before an event becomes visible to a
++++	// worker and decremented only after handling (or shutdown discard). Unlike
++++	// QueueDepth+Inflight, it has no dequeue-before-inflight sampling gap.
++++	for h.pendingFaults.Load() != 0 {
++++		select {
++++		case <-ctx.Done():
++++			return ctx.Err()
++++		case <-time.After(time.Millisecond):
++++		}
++++	}
++++	if h.cfg.StartupRecorder != nil {
++++		h.cfg.StartupRecorder.Start()
++++	}
++++	return nil
++++}
++++
++++// RecordPrefillStats records the final execution stats of the prefill worker pool.
++++func (h *Handler) RecordPrefillStats(requested, filled, existing, skipped, errors, durationNs uint64, budgetExhausted bool) {
++++	h.stats.prefillRequestedBytes.Store(requested)
++++	h.stats.prefillFilledBytes.Store(filled)
++++	h.stats.prefillExistingBytes.Store(existing)
++++	h.stats.prefillSkippedZero.Store(skipped)
++++	h.stats.prefillFetchErrors.Store(errors)
++++	h.stats.prefillDurationNs.Store(durationNs)
++++	h.stats.prefillBudgetExhaust.Store(budgetExhausted)
++++}
++++
++++func (h *Handler) RecordPrefillResumeWait(durationNs uint64, timedOut bool) {
++++	h.stats.prefillResumeWaitNs.Store(durationNs)
++++	h.stats.prefillTimedOut.Store(timedOut)
++++}
++++
+++ // Start spawns the reader and worker goroutines.
+++ func (h *Handler) Start() {
+++ 	h.wg.Add(1)
+++@@ -404,7 +568,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
+++ 	switch msg.Event {
+++ 	case uffdEventPagefault:
+++ 		pf := (*uffdMsgPagefault)(unsafe.Pointer(&msg.Arg[0]))
+++-		offset, ok := h.addrMap.Locate(pf.Address)
++++		offset, ok := h.addrMap.LocateFor(ProcessCH, pf.Address)
+++ 		if !ok {
+++ 			h.logf("uffd: fault at unknown va 0x%x (fd=%d)", pf.Address, fromFD)
+++ 			h.stats.errors.Add(1)
+++@@ -413,10 +577,22 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
+++ 		}
+++ 		idx := offset / PageSize
+++ 		hashed := pageIdxHash(idx) % uint64(len(h.queue))
++++		h.profileModeMu.RLock()
++++		seq, recording := uint32(0), false
++++		singlePage := false
++++		if h.cfg.StartupRecorder != nil {
++++			seq, recording, singlePage = h.cfg.StartupRecorder.ReserveFault()
++++		}
++++		h.pendingFaults.Add(1)
+++ 		select {
+++-		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD}:
++++		case h.queue[hashed] <- faultEvent{address: pf.Address, memfdOffset: offset, flags: pf.Flags, uffdFD: fromFD, profileSeq: seq, recording: recording, singlePage: singlePage}:
+++ 		case <-h.stop:
++++			h.pendingFaults.Add(-1)
++++			if recording {
++++				h.cfg.StartupRecorder.Discard()
++++			}
+++ 		}
++++		h.profileModeMu.RUnlock()
+++ 	case uffdEventRemove, uffdEventUnmap:
+++ 		rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
+++ 		h.handleRemove(rm.Start, rm.End, fromFD)
+++@@ -442,7 +618,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
+++ // madvise as a fallback so we don't lose the reclaim signal.
+++ func (h *Handler) handleRemove(startVA, endVA uint64, fromFD int) {
+++ 	_ = fromFD
+++-	startOff, ok := h.addrMap.Locate(startVA)
++++	startOff, ok := h.addrMap.LocateFor(ProcessCH, startVA)
+++ 	if !ok {
+++ 		h.logf("uffd: EVENT_REMOVE start 0x%x unknown", startVA)
+++ 		return
+++@@ -608,7 +784,19 @@ func (h *Handler) runWorker(idx int) {
+++ 	for {
+++ 		select {
+++ 		case <-h.stop:
+++-			return
++++			// The reader has already stopped before h.stop closes, so the queue
++++			// is finite. Complete recorder reservations for events we abandon.
++++			for {
++++				select {
++++				case ev := <-q:
++++					if ev.recording {
++++						h.cfg.StartupRecorder.Discard()
++++					}
++++					h.pendingFaults.Add(-1)
++++				default:
++++					return
++++				}
++++			}
+++ 		case ev, ok := <-q:
+++ 			if !ok {
+++ 				return
+++@@ -662,15 +850,21 @@ func (h *Handler) recordBatch(pages uint64) {
+++ }
+++ 
+++ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
++++	defer h.pendingFaults.Add(-1)
++++	committed := false
++++	if ev.recording {
++++		defer func() {
++++			if !committed {
++++				h.cfg.StartupRecorder.Discard()
++++			}
++++		}()
++++	}
+++ 	h.stats.inflight.Add(1)
+++ 	defer h.stats.inflight.Add(-1)
+++-	memfdOffset, ok := h.addrMap.Locate(ev.address)
+++-	if !ok {
+++-		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
+++-		h.stats.errors.Add(1)
+++-		_ = ioctlUffdWake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
+++-		return
+++-	}
++++	// dispatch resolved this against ProcessCH before enqueue. Carrying the
++++	// offset also avoids a second lookup that could accidentally match an
++++	// equal numeric VA registered for sandbox-ctl's backend mapping.
++++	memfdOffset := ev.memfdOffset
+++ 	pageVA := ev.address &^ (PageSize - 1)
+++ 	pageOffset := memfdOffset &^ (PageSize - 1)
+++ 	pageIdx := pageOffset / PageSize
+++@@ -684,7 +878,12 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+++ 		// pageIdx. Source then picks any n ≤ this, aligned to its
+++ 		// own internal boundaries (chunk for manifest, IsZero
+++ 		// transition for sparse).
+++-		capPages := h.absentRunFrom(pageIdx)
++++		var capPages uint64
++++		if ev.singlePage {
++++			capPages = 1
++++		} else {
++++			capPages = h.absentRunFrom(pageIdx)
++++		}
+++ 		capBytes := capPages * PageSize
+++ 		// Clamp to the CH region containing pageOffset: a fill ioctl
+++ 		// runs on one region's uffd fd and must not cross into the next
+++@@ -773,6 +972,10 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+++ 			}
+++ 			h.stats.zeropages.Add(1)
+++ 			h.stats.pagesZeroed.Add(runPages)
++++			if ev.recording {
++++				h.cfg.StartupRecorder.Commit(pageOffset, ev.profileSeq)
++++				committed = true
++++			}
+++ 		} else {
+++ 			src := uint64(uintptr(unsafe.Pointer(&pageBuf[0])))
+++ 			err := ioctlUffdCopy(ev.uffdFD, pageVA, src, runBytes)
+++@@ -805,6 +1008,10 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+++ 			}
+++ 			h.stats.copies.Add(1)
+++ 			h.stats.pagesCopied.Add(runPages)
++++			if ev.recording {
++++				h.cfg.StartupRecorder.Commit(pageOffset, ev.profileSeq)
++++				committed = true
++++			}
+++ 		}
+++ 		// Mark the run Loaded so subsequent faults short-circuit.
+++ 		for i := uint64(0); i < runPages; i++ {
+++@@ -924,9 +1131,28 @@ func (h *Handler) Stats() map[string]uint64 {
+++ 		avgBatch = pagesSum / calls
+++ 	}
+++ 	return map[string]uint64{
+++-		"faults_absent":         h.stats.faultsAbsent.Load(),
+++-		"faults_released":       h.stats.faultsReleased.Load(),
+++-		"faults_loaded":         h.stats.faultsLoaded.Load(),
++++		"faults_absent":           h.stats.faultsAbsent.Load(),
++++		"faults_released":         h.stats.faultsReleased.Load(),
++++		"faults_loaded":           h.stats.faultsLoaded.Load(),
++++		"prefill_requested_bytes": h.stats.prefillRequestedBytes.Load(),
++++		"prefill_filled_bytes":    h.stats.prefillFilledBytes.Load(),
++++		"prefill_existing_bytes":  h.stats.prefillExistingBytes.Load(),
++++		"prefill_skipped_zero":    h.stats.prefillSkippedZero.Load(),
++++		"prefill_errors":          h.stats.prefillFetchErrors.Load(),
++++		"prefill_duration_ns":     h.stats.prefillDurationNs.Load(),
++++		"prefill_resume_wait_ns":  h.stats.prefillResumeWaitNs.Load(),
++++		"prefill_timed_out": func() uint64 {
++++			if h.stats.prefillTimedOut.Load() {
++++				return 1
++++			}
++++			return 0
++++		}(),
++++		"prefill_budget_exhausted": func() uint64 {
++++			if h.stats.prefillBudgetExhaust.Load() {
++++				return 1
++++			}
++++			return 0
++++		}(),
+++ 		"zeropage_calls":        h.stats.zeropages.Load(),
+++ 		"copy_calls":            h.stats.copies.Load(),
+++ 		"pages_zeroed":          h.stats.pagesZeroed.Load(),
+++diff --git a/pkg/uffd/prefill_test.go b/pkg/uffd/prefill_test.go
+++new file mode 100644
+++index 0000000..9dc7142
+++--- /dev/null
++++++ b/pkg/uffd/prefill_test.go
+++@@ -0,0 +1,17 @@
++++package uffd
++++
++++import (
++++	"context"
++++	"errors"
++++	"testing"
++++)
++++
++++func TestPrefillCopyHonorsCanceledContextBeforeCopy(t *testing.T) {
++++	h := &Handler{state: NewPageStateMap(1)}
++++	ctx, cancel := context.WithCancel(context.Background())
++++	cancel()
++++	filled, existing, err := h.PrefillCopy(ctx, 0, make([]byte, PageSize))
++++	if !errors.Is(err, context.Canceled) || filled != 0 || existing != 0 {
++++		t.Fatalf("filled=%d existing=%d err=%v", filled, existing, err)
++++	}
++++}
+++diff --git a/pkg/uffd/source.go b/pkg/uffd/source.go
+++index 563aace..8f3b5b6 100755
+++--- a/pkg/uffd/source.go
++++++ b/pkg/uffd/source.go
+++@@ -1,5 +1,7 @@
+++ package uffd
+++ 
++++import "context"
++++
+++ // SnapshotReader supplies the page contents the handler installs at a
+++ // given memfd offset on an Absent fault.
+++ //
+++@@ -36,6 +38,11 @@ type SnapshotReader interface {
+++ 	//
+++ 	// Safe for concurrent use.
+++ 	ReadAt(buf []byte, memfdOffset uint64) (n int, zero bool, err error)
++++
++++	// CloneWithContext creates a new instance of the reader bound to the given context.
++++	// This allows background workers to enforce hard timeouts via context cancellation
++++	// without affecting the global UFFD reader.
++++	CloneWithContext(ctx context.Context) SnapshotReader
+++ }
+++ 
+++ // ZeroSource implements SnapshotReader for cold-start. Every page is
+++@@ -45,3 +52,7 @@ type ZeroSource struct{}
+++ func (ZeroSource) ReadAt(buf []byte, _ uint64) (int, bool, error) {
+++ 	return len(buf), true, nil
+++ }
++++
++++func (ZeroSource) CloneWithContext(context.Context) SnapshotReader {
++++	return ZeroSource{}
++++}
+++diff --git a/pkg/uffd/source_stream.go b/pkg/uffd/source_stream.go
+++index 45f2222..2218b6b 100755
+++--- a/pkg/uffd/source_stream.go
++++++ b/pkg/uffd/source_stream.go
+++@@ -55,6 +55,14 @@ func NewStreamSnapshotSource(ctx context.Context, stream fetch.Stream, ramSize u
+++ 	}, nil
+++ }
+++ 
++++func (s *StreamSnapshotSource) CloneWithContext(ctx context.Context) SnapshotReader {
++++	return &StreamSnapshotSource{
++++		stream:  s.stream,
++++		ctx:     ctx,
++++		ramSize: s.ramSize,
++++	}
++++}
++++
+++ // ReadAt implements SnapshotReader.
+++ //
+++ // It classifies the run at memfdOffset via Stream.RunAt:
+++diff --git a/pkg/uffd/state.go b/pkg/uffd/state.go
+++index c0de3af..8b01110 100755
+++--- a/pkg/uffd/state.go
++++++ b/pkg/uffd/state.go
+++@@ -6,8 +6,10 @@ import "sync"
+++ type PageState uint8
+++ 
+++ const (
+++-	StateAbsent   PageState = 0
+++-	StateLoaded   PageState = 1
++++	StateAbsent PageState = 0
++++	StateLoaded PageState = 1
++++	// StateReleased: the page was present but was subsequently reclaimed by
++++	// guest balloon inflation (madvise DONTNEED'd).
+++ 	StateReleased PageState = 2
+++ )
+++ 
+++-- 
+++2.50.1 (Apple Git-155)
+++
 +diff --git a/docs/sandboxer-design.md b/docs/sandboxer-design.md
 +index 3e768f6..9c8c92e 100644
 +--- a/docs/sandboxer-design.md
@@ -286,10 +2877,10 @@ index 0000000..1bca69b
 + 
 +diff --git a/docs/startup-profile-memory-prefill.md b/docs/startup-profile-memory-prefill.md
 +new file mode 100644
-+index 0000000..c7131d2
++index 0000000..2caec70
 +--- /dev/null
 ++++ b/docs/startup-profile-memory-prefill.md
-+@@ -0,0 +1,152 @@
++@@ -0,0 +1,165 @@
 ++# Startup Profile 并发内存预填充
 ++
 ++## 目标
@@ -406,6 +2997,19 @@ index 0000000..1bca69b
 ++```
 ++
 ++Profile 是可选性能元数据；生成失败只记录 warning，不能导致 snapshot 失败。`upload-snapshot` 重建 ZIP 时必须原样保留该成员。旧快照没有 Profile 时 Restore 保持原有 UFFD lazy-load。
+++
+++## 多代增量更新
+++
+++当带 Profile 的快照 Restore 后再次生成子快照时，Restore 会在 prefill 停止后、`vm.resume` 前开启新一轮2秒记录窗口。下一代 Profile 按以下规则生成：
+++
+++- 父 Profile 中的页面和优先级保留；
+++- 本代新触发的 UFFD demand fault 去重后追加；
+++- 已存在于父 Profile 的页面不会重复加入；
+++- 合并后的总页数仍受16384页（64 MiB）限制，Profile 不会随代际无限增长；
+++- 多次 `snapshot → restore → snapshot` 重复相同过程，因此支持连续增量更新；
+++- 没有父 Profile 的旧快照仍只消费普通 lazy-load，不在首次 Restore 临时学习，保持 cold-start 学习边界。
+++
+++Profile 仍然只保存逻辑内存 offset。子快照页面内容发生变化时，后续 prefill 会从子快照自己的 memory source 读取新内容，不会复用父快照的页面字节。
 ++
 ++## 指标
 ++
@@ -1071,14 +3675,15 @@ index 0000000..1bca69b
 ++}
 +diff --git a/pkg/profile/profile_test.go b/pkg/profile/profile_test.go
 +new file mode 100644
-+index 0000000..200ef25
++index 0000000..987a5df
 +--- /dev/null
 ++++ b/pkg/profile/profile_test.go
-+@@ -0,0 +1,96 @@
++@@ -0,0 +1,197 @@
 ++package profile
 ++
 ++import (
 ++	"encoding/json"
+++	"sort"
 ++	"testing"
 ++)
 ++
@@ -1171,12 +3776,112 @@ index 0000000..1bca69b
 ++		t.Fatalf("ranges=%+v", got)
 ++	}
 ++}
+++
+++func TestIncrementalRecorderRetainsParentAndAppendsNewPages(t *testing.T) {
+++	base := &MemoryProfile{Version: CurrentVersion, PageSize: PageSize, WindowMs: 2000, Targets: []Target{{
+++		Kind: "memory", Size: 8 * PageSize,
+++		Ranges: []Range{{Offset: 0, Length: 2 * PageSize, Order: 0, Hits: 2}},
+++	}}}
+++	r := NewRecorderWithBase(base)
+++	r.Start()
+++	r.RecordResolved(PageSize)     // duplicate parent page
+++	r.RecordResolved(3 * PageSize) // new generation page
+++	got := profilePageOffsets(r.Freeze(8 * PageSize))
+++	want := []uint64{0, PageSize, 3 * PageSize}
+++	if len(got) != len(want) {
+++		t.Fatalf("pages=%v want=%v", got, want)
+++	}
+++	for i := range want {
+++		if got[i] != want[i] {
+++			t.Fatalf("pages=%v want=%v", got, want)
+++		}
+++	}
+++}
+++
+++func TestIncrementalRecorderSupportsMultipleSnapshotGenerations(t *testing.T) {
+++	base := &MemoryProfile{Version: CurrentVersion, PageSize: PageSize, WindowMs: 2000, Targets: []Target{{
+++		Kind: "memory", Size: 8 * PageSize,
+++		Ranges: []Range{{Offset: 4 * PageSize, Length: PageSize, Order: 0, Hits: 1}},
+++	}}}
+++	gen1 := NewRecorderWithBase(base)
+++	gen1.Start()
+++	gen1.RecordResolved(2 * PageSize)
+++	p1 := gen1.Freeze(8 * PageSize)
+++
+++	gen2 := NewRecorderWithBase(p1)
+++	gen2.Start()
+++	gen2.RecordResolved(6 * PageSize)
+++	got := profilePageOffsets(gen2.Freeze(8 * PageSize))
+++	want := []uint64{4 * PageSize, 2 * PageSize, 6 * PageSize}
+++	if len(got) != len(want) {
+++		t.Fatalf("pages=%v want=%v", got, want)
+++	}
+++	for i := range want {
+++		if got[i] != want[i] {
+++			t.Fatalf("pages=%v want=%v", got, want)
+++		}
+++	}
+++}
+++
+++func TestIncrementalRecorderMarshalRetainsBaseWithoutNewFaults(t *testing.T) {
+++	base := &MemoryProfile{Version: CurrentVersion, PageSize: PageSize, WindowMs: 2000, Targets: []Target{{
+++		Kind: "memory", Size: 8 * PageSize,
+++		Ranges: []Range{{Offset: PageSize, Length: 2 * PageSize, Order: 0, Hits: 2}},
+++	}}}
+++	r := NewRecorderWithBase(base)
+++	r.Start()
+++	b, err := r.Marshal(8 * PageSize)
+++	if err != nil {
+++		t.Fatal(err)
+++	}
+++	got, err := Parse(b, 8*PageSize)
+++	if err != nil {
+++		t.Fatal(err)
+++	}
+++	pages := profilePageOffsets(got)
+++	if len(pages) != 2 || pages[0] != PageSize || pages[1] != 2*PageSize {
+++		t.Fatalf("pages=%v", pages)
+++	}
+++}
+++
+++func TestIncrementalRecorderKeepsTotalPageLimit(t *testing.T) {
+++	base := &MemoryProfile{Version: CurrentVersion, PageSize: PageSize, WindowMs: 2000, Targets: []Target{{
+++		Kind: "memory", Size: 8 * PageSize,
+++		Ranges: []Range{{Offset: 0, Length: 2 * PageSize, Order: 0, Hits: 2}},
+++	}}}
+++	r := NewRecorderWithBase(base)
+++	r.maxPages = 3
+++	r.Start()
+++	r.RecordResolved(2 * PageSize)
+++	r.RecordResolved(3 * PageSize)
+++	got := profilePageOffsets(r.Freeze(8 * PageSize))
+++	if len(got) != 3 || got[2] != 2*PageSize {
+++		t.Fatalf("bounded pages=%v", got)
+++	}
+++}
+++
+++func profilePageOffsets(p *MemoryProfile) []uint64 {
+++	ranges := append([]Range(nil), p.MemoryTarget().Ranges...)
+++	sort.SliceStable(ranges, func(i, j int) bool {
+++		if ranges[i].Order == ranges[j].Order {
+++			return ranges[i].Offset < ranges[j].Offset
+++		}
+++		return ranges[i].Order < ranges[j].Order
+++	})
+++	var pages []uint64
+++	for _, r := range ranges {
+++		for off, end := r.Offset, r.Offset+r.Length; off < end; off += PageSize {
+++			pages = append(pages, off)
+++		}
+++	}
+++	return pages
+++}
 +diff --git a/pkg/profile/recorder.go b/pkg/profile/recorder.go
 +new file mode 100644
-+index 0000000..4c6793b
++index 0000000..6e7e181
 +--- /dev/null
 ++++ b/pkg/profile/recorder.go
-+@@ -0,0 +1,204 @@
++@@ -0,0 +1,252 @@
 ++package profile
 ++
 ++import (
@@ -1201,6 +3906,8 @@ index 0000000..1bca69b
 ++	orderCnt     uint32
 ++	droppedPages uint64
 ++	pages        map[uint64]uint32 // pageIdx -> order
+++	seedPages    map[uint64]uint32 // inherited profile pages retained across Start
+++	seedOrderCnt uint32
 ++	inflight     sync.WaitGroup
 ++}
 ++
@@ -1212,9 +3919,56 @@ index 0000000..1bca69b
 ++// NewRecorder initializes a new Recorder with default limits.
 ++func NewRecorder() *Recorder {
 ++	return &Recorder{
-++		maxPages: defaultMaxPages,
-++		pages:    make(map[uint64]uint32),
+++		maxPages:  defaultMaxPages,
+++		pages:     make(map[uint64]uint32),
+++		seedPages: make(map[uint64]uint32),
 ++	}
+++}
+++
+++// NewRecorderWithBase creates an incremental recorder seeded by a parent
+++// snapshot profile. Parent pages keep their priority; pages faulted during the
+++// new generation are deduplicated and appended until the same 64 MiB cap is
+++// reached. The base is not revalidated here; callers must pass a profile
+++// returned by Parse.
+++func NewRecorderWithBase(base *MemoryProfile) *Recorder {
+++	r := NewRecorder()
+++	target := base.MemoryTarget()
+++	if target == nil {
+++		return r
+++	}
+++	ranges := append([]Range(nil), target.Ranges...)
+++	sort.SliceStable(ranges, func(i, j int) bool {
+++		if ranges[i].Order == ranges[j].Order {
+++			return ranges[i].Offset < ranges[j].Offset
+++		}
+++		return ranges[i].Order < ranges[j].Order
+++	})
+++	for _, rg := range ranges {
+++		for off, end := rg.Offset, rg.Offset+rg.Length; off < end; off += PageSize {
+++			if uint64(len(r.seedPages)) >= r.maxPages {
+++				break
+++			}
+++			pageIdx := off / PageSize
+++			if _, exists := r.seedPages[pageIdx]; exists {
+++				continue
+++			}
+++			r.seedPages[pageIdx] = r.seedOrderCnt
+++			r.seedOrderCnt++
+++		}
+++		if uint64(len(r.seedPages)) >= r.maxPages {
+++			break
+++		}
+++	}
+++	r.resetPagesLocked()
+++	return r
+++}
+++
+++func (r *Recorder) resetPagesLocked() {
+++	r.pages = make(map[uint64]uint32, len(r.seedPages))
+++	for pageIdx, order := range r.seedPages {
+++		r.pages[pageIdx] = order
+++	}
+++	r.orderCnt = r.seedOrderCnt
 ++}
 ++
 ++// Start begins the recording session, clearing any previous state.
@@ -1223,8 +3977,7 @@ index 0000000..1bca69b
 ++	defer r.mu.Unlock()
 ++	r.active = true
 ++	r.started = true
-++	r.pages = make(map[uint64]uint32)
-++	r.orderCnt = 0
+++	r.resetPagesLocked()
 ++	r.droppedPages = 0
 ++}
 ++
@@ -1422,7 +4175,7 @@ index 0000000..1bca69b
 ++	}
 ++}
 +diff --git a/pkg/restore/restore.go b/pkg/restore/restore.go
-+index cf9f074..873b476 100755
++index cf9f074..43c7f66 100755
 +--- a/pkg/restore/restore.go
 ++++ b/pkg/restore/restore.go
 +@@ -10,9 +10,6 @@ import (
@@ -1450,7 +4203,7 @@ index 0000000..1bca69b
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
-+@@ -418,6 +421,31 @@ func Run(ctx context.Context, opts Options) (int, error) {
++@@ -418,6 +421,39 @@ func Run(ctx context.Context, opts Options) (int, error) {
 + 	}
 + 	logf("snapshot source: %d memory layer(s)", len(memLayers))
 + 
@@ -1478,23 +4231,32 @@ index 0000000..1bca69b
 ++	// no UFFD operation; injection remains gated on CH's handler.
 ++	preparedPrefill := prefill.Prepare(ctx, source, startupProfile, prefillOptions)
 ++	defer preparedPrefill.Close()
+++	// A restore consumes the parent profile and, when one exists, records only
+++	// newly faulted pages for the next snapshot generation. The recorder is
+++	// seeded with the parent so repeated restore→snapshot cycles retain earlier
+++	// priorities while appending new offsets under the same bounded cap.
+++	var startupRecorder *profile.Recorder
+++	if startupProfile != nil {
+++		startupRecorder = profile.NewRecorderWithBase(startupProfile)
+++	}
 ++
 + 	// Reconstruct each logical disk (root + data disks, in order): layer the
 + 	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
 + 	// writable CoW on top, and (overlay mode) open the erofs base as the ro
-+@@ -517,6 +545,11 @@ func Run(ctx context.Context, opts Options) (int, error) {
++@@ -517,6 +553,12 @@ func Run(ctx context.Context, opts Options) (int, error) {
 + 		UffdSource: source,
 + 		Disks:      disks,
 + 
 ++		StartupProfile:          startupProfile,
 ++		PreparedPrefill:         preparedPrefill,
 ++		InheritedStartupProfile: startupProfileData,
+++		StartupRecorder:         startupRecorder,
 ++		PrefillOptions:          prefillOptions,
 ++
 + 		LaunchSpec:    &proto.LaunchSpec{},
 + 		WireLaunchMUX: false,
 + 		Balloon:       balloonCtl,
-+@@ -566,6 +599,22 @@ func Run(ctx context.Context, opts Options) (int, error) {
++@@ -566,6 +608,30 @@ func Run(ctx context.Context, opts Options) (int, error) {
 + 			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 + 				return fmt.Errorf("ch api not ready: %w", err)
 + 			}
@@ -1514,10 +4276,18 @@ index 0000000..1bca69b
 ++					pc.RecordPrefillResumeWait(uint64(waited.Nanoseconds()), timedOut)
 ++				}
 ++			}
+++			// Start the next-generation delta window only after proactive COPY
+++			// has stopped, otherwise prefilled pages would be mistaken for Guest
+++			// demand. Starting before resume captures the first restored fault.
+++			if pc.BeginProfileRecording != nil {
+++				if err := pc.BeginProfileRecording(); err != nil {
+++					return fmt.Errorf("startup profile recording: %w", err)
+++				}
+++			}
 + 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
 + 				return fmt.Errorf("vm.resume: %w", err)
 + 			}
-+@@ -615,6 +664,43 @@ func Run(ctx context.Context, opts Options) (int, error) {
++@@ -615,6 +681,43 @@ func Run(ctx context.Context, opts Options) (int, error) {
 + 	})
 + }
 + 
@@ -1771,7 +4541,7 @@ index 0000000..1bca69b
 ++	}
 ++}
 +diff --git a/pkg/sandbox/serveandwait.go b/pkg/sandbox/serveandwait.go
-+index d9021b0..86c36f1 100755
++index d9021b0..6a9f272 100755
 +--- a/pkg/sandbox/serveandwait.go
 ++++ b/pkg/sandbox/serveandwait.go
 +@@ -3,9 +3,6 @@ package sandbox
@@ -1800,7 +4570,7 @@ index 0000000..1bca69b
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 + 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
-+@@ -62,15 +64,73 @@ type CmdEnv struct {
++@@ -62,15 +64,74 @@ type CmdEnv struct {
 + //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
 + //     a non-nil return aborts the run (ServeAndWait kills CH).
 + type PostSpawnCtx struct {
@@ -1826,6 +4596,7 @@ index 0000000..1bca69b
 ++	CancelPrefill           context.CancelFunc
 ++	PrefillWaitTimeout      time.Duration
 ++	RecordPrefillResumeWait func(uint64, bool)
+++	BeginProfileRecording   func() error
 ++}
 ++
 ++// prefillMetricsSink decouples startup metrics from UFFD handler creation.
@@ -1883,7 +4654,7 @@ index 0000000..1bca69b
 + }
 + 
 + // VMParams is the input to ServeAndWait — everything the shared
-+@@ -91,6 +151,12 @@ type VMParams struct {
++@@ -91,6 +152,12 @@ type VMParams struct {
 + 	CapBytes   int64               // RAM capacity (memfd size); also stats UffdRAMSize
 + 	UffdSource uffd.SnapshotReader // ZeroSource (cold) | snapshot source (restore)
 + 
@@ -1896,7 +4667,7 @@ index 0000000..1bca69b
 + 	// Disks are the logical disks served to the guest, in order: Disks[0] is
 + 	// the root, Disks[1:] are the boot.disks[] data disks (boot.disks[] order).
 + 	// ServeAndWait expands each into its vhost device(s) in CH --disk order
-+@@ -234,6 +300,9 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -234,6 +301,9 @@ func ServeAndWait(p VMParams) (int, error) {
 + 	}
 + 	defer memfd.Close()
 + 
@@ -1906,7 +4677,7 @@ index 0000000..1bca69b
 + 	// AddressMap is shared between the va_report server (registers
 + 	// ProcessCH on receive) and the uffd Handler (Locate on each fault).
 + 	addrMap := uffd.NewAddressMap(uint64(memfd.Size()))
-+@@ -246,6 +315,7 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -246,6 +316,7 @@ func ServeAndWait(p VMParams) (int, error) {
 + 	// reach it after ctx cancellation.
 + 	var uffdHandler *uffd.Handler
 + 	var uffdHandlerMu sync.Mutex
@@ -1914,7 +4685,7 @@ index 0000000..1bca69b
 + 	defer func() {
 + 		uffdHandlerMu.Lock()
 + 		h := uffdHandler
-+@@ -262,20 +332,36 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -262,20 +333,36 @@ func ServeAndWait(p VMParams) (int, error) {
 + 		HandshakeDeadline: p.VAReportDeadline,
 + 		OnReady: func(uffdFD int, vaStart, size uint64) error {
 + 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
@@ -1956,7 +4727,7 @@ index 0000000..1bca69b
 + 			return nil
 + 		},
 + 		OnRegister: func(uffdFD int, vaStart, size uint64) error {
-+@@ -288,6 +374,9 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -288,6 +375,9 @@ func ServeAndWait(p VMParams) (int, error) {
 + 			if err := h.AddUffd(uffdFD); err != nil {
 + 				return err
 + 			}
@@ -1966,21 +4737,30 @@ index 0000000..1bca69b
 + 			logf("uffd handler: attached additional region fd=%d size=%d", uffdFD, size)
 + 			return nil
 + 		},
-+@@ -362,6 +451,28 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -362,6 +452,40 @@ func ServeAndWait(p VMParams) (int, error) {
 + 			}
 + 		},
 + 	}
-++	if p.StartupRecorder != nil {
-++		launch.BeforeLaunch = func() error {
+++	var beginProfileOnce sync.Once
+++	var beginProfileErr error
+++	beginProfileRecording := func() error {
+++		if p.StartupRecorder == nil {
+++			return nil
+++		}
+++		beginProfileOnce.Do(func() {
 ++			var h *uffd.Handler
 ++			select {
 ++			case h = <-profileHandlerReady:
 ++			case <-backendCtx.Done():
-++				return backendCtx.Err()
+++				beginProfileErr = backendCtx.Err()
+++				return
 ++			}
 ++			if err := h.BeginProfileRecording(backendCtx); err != nil {
-++				return err
+++				beginProfileErr = err
+++				return
 ++			}
+++			// Snapshot may freeze the recorder before this timer. Freeze is
+++			// idempotent, so the timer only defines the maximum learning window.
 ++			go func() {
 ++				select {
 ++				case <-time.After(2 * time.Second):
@@ -1989,13 +4769,16 @@ index 0000000..1bca69b
 ++					p.StartupRecorder.Freeze(uint64(memfd.Size()))
 ++				}
 ++			}()
-++			return nil
-++		}
+++		})
+++		return beginProfileErr
+++	}
+++	if p.StartupRecorder != nil {
+++		launch.BeforeLaunch = beginProfileRecording
 ++	}
 + 	if p.WireLaunchMUX {
 + 		launch.OnMUXReady = func(conn net.Conn, established proto.StdioSpec) {
 + 			if err := establishMUX(conn, established); err != nil {
-+@@ -400,18 +511,20 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -400,18 +524,20 @@ func ServeAndWait(p VMParams) (int, error) {
 + 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 + 	// shared bundle both Run and restore.Run use.
 + 	snapHandler := &SnapshotHandler{
@@ -2028,7 +4811,7 @@ index 0000000..1bca69b
 + 	}
 + 	ctlSrv := &ctl.Server{
 + 		Path:            ctlSockPath,
-+@@ -521,6 +634,37 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -521,6 +647,37 @@ func ServeAndWait(p VMParams) (int, error) {
 + 	}
 + 	chPid := cmd.Process.Pid
 + 	logf("CH started pid=%d", chPid)
@@ -2066,7 +4849,7 @@ index 0000000..1bca69b
 + 
 + 	// Move CH (and only CH) into the per-sandbox cgroup. sandbox-ctl
 + 	// stays in its parent cgroup — see pkg/sandbox/cgroup.go header.
-+@@ -543,15 +687,21 @@ func ServeAndWait(p VMParams) (int, error) {
++@@ -543,15 +700,22 @@ func ServeAndWait(p VMParams) (int, error) {
 + 	})
 + 
 + 	if err := p.PostSpawn(PostSpawnCtx{
@@ -2094,6 +4877,7 @@ index 0000000..1bca69b
 ++		RecordPrefillResumeWait: func(ns uint64, timedOut bool) {
 ++			prefillMetrics.RecordResumeWait(ns, timedOut)
 ++		},
+++		BeginProfileRecording: beginProfileRecording,
 + 	}); err != nil {
 + 		_ = cmd.Process.Kill()
 + 		cancelBackends()
@@ -4262,7 +7046,7 @@ index 66a34e7..4f736d3 100755
  		return "", fmt.Errorf("build zip: %w", err)
  	}
 diff --git a/pkg/sandbox/lifecycle.go b/pkg/sandbox/lifecycle.go
-index 5eb36de..afde3d2 100755
+index f662ace..ab227df 100755
 --- a/pkg/sandbox/lifecycle.go
 +++ b/pkg/sandbox/lifecycle.go
 @@ -5,9 +5,6 @@ import (
@@ -4294,7 +7078,7 @@ index 5eb36de..afde3d2 100755
  	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
  	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
  	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
-@@ -377,6 +379,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+@@ -375,6 +377,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
  	// faults, the merged launch spec whose conn becomes the stdio MUX
  	// (WireLaunchMUX), and a settle protocol gated on the guest's
  	// hello / launch_ack handshake.
@@ -4302,7 +7086,7 @@ index 5eb36de..afde3d2 100755
  	return ServeAndWait(VMParams{
  		Ctx:                ctx,
  		SandboxID:          opts.SandboxID,
-@@ -388,9 +391,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+@@ -386,9 +389,10 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
  		StatsJSONPath:      opts.StatsJSONPath,
  		StatsInterval:      opts.StatsInterval,
  
@@ -4316,7 +7100,7 @@ index 5eb36de..afde3d2 100755
  
  		LaunchSpec:        launchSpec,
  		WireLaunchMUX:     true,
-@@ -575,10 +579,28 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
+@@ -573,10 +577,28 @@ func writeUffdStats(w io.Writer, s map[string]uint64) {
  		"batch_pages_total",
  		"batch_avg_pages",
  		"batch_max_pages",
@@ -4345,7 +7129,7 @@ index 5eb36de..afde3d2 100755
  }
  
  // guestDevPath maps a 0-based device index to its guest block device. virtio-blk
-@@ -725,24 +747,26 @@ func (q *allQuiescer) Resume() {
+@@ -723,24 +745,26 @@ func (q *allQuiescer) Resume() {
  // that owns the bundle holds references; the snapshot path consumes
  // them when a request arrives.
  type SnapshotHandler struct {
@@ -4385,7 +7169,7 @@ index 5eb36de..afde3d2 100755
  }
  
  // handleSnapshotRequest executes one snapshot_request received via
-@@ -760,6 +784,8 @@ func handleSnapshotRequest(
+@@ -758,6 +782,8 @@ func handleSnapshotRequest(
  	pinger *guestlink.Pinger,
  	forwarder *Forwarder, // gates new forwards + collapses active relays around quiesce; may be nil
  	reattachMUX func() error, // re-establishes the stdio MUX after --resume; may be nil
@@ -4394,7 +7178,7 @@ index 5eb36de..afde3d2 100755
  	logf func(string, ...any),
  ) (resp ctl.Response, err error) {
  	// Quiesce sequence (docs/sandbox.md §6.2 T2a, sandbox-init.md §3.4):
-@@ -900,6 +926,11 @@ func handleSnapshotRequest(
+@@ -898,6 +924,11 @@ func handleSnapshotRequest(
  		Quiescer:      &allQuiescer{servers: servers},
  		Logf:          logf,
  	}
