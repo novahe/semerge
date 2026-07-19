@@ -56,6 +56,24 @@ type Config struct {
 
 	// Optional logger; nil → discarded.
 	Logf func(string, ...any)
+
+	// DemandObserver, when non-nil, observes StateAbsent snapshot data
+	// reads. Zero, Released, and already-Loaded faults are deliberately
+	// excluded so the measurements isolate cache-warming contention.
+	DemandObserver DemandObserver
+}
+
+// DemandToken is opaque state returned by a DemandObserver. The handler only
+// carries it from BeginDemand to EndDemand; implementations own its shape.
+type DemandToken any
+
+// DemandObserver measures the effect of speculative snapshot warming on the
+// demand-fault critical path. EndDemand is called for every BeginDemand. A
+// bytes value of zero means the source resolved a zero/hole and the observer
+// must discard the sample after releasing any token bookkeeping.
+type DemandObserver interface {
+	BeginDemand(offset uint64, queueDelay time.Duration) DemandToken
+	EndDemand(token DemandToken, fetchLatency, serviceLatency time.Duration, bytes uint64, err error)
 }
 
 // Handler manages a single userfaultfd:
@@ -165,9 +183,10 @@ type handlerStats struct {
 }
 
 type faultEvent struct {
-	address uint64
-	flags   uint64
-	uffdFD  int // which uffd this came from — determines ioctl target fd
+	address    uint64
+	flags      uint64
+	uffdFD     int // which uffd this came from — determines ioctl target fd
+	enqueuedAt time.Time
 }
 
 // NewWithBackendUffd constructs the single-uffd handler. The CH-side
@@ -414,7 +433,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		idx := offset / PageSize
 		hashed := pageIdxHash(idx) % uint64(len(h.queue))
 		select {
-		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD}:
+		case h.queue[hashed] <- faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD, enqueuedAt: time.Now()}:
 		case <-h.stop:
 		}
 	case uffdEventRemove, uffdEventUnmap:
@@ -679,6 +698,29 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	switch state {
 	case StateAbsent:
 		h.stats.faultsAbsent.Add(1)
+		serviceStart := time.Now()
+		queueDelay := time.Duration(0)
+		if !ev.enqueuedAt.IsZero() {
+			queueDelay = serviceStart.Sub(ev.enqueuedAt)
+		}
+		var demandToken DemandToken
+		if h.cfg.DemandObserver != nil {
+			demandToken = h.cfg.DemandObserver.BeginDemand(pageOffset, queueDelay)
+		}
+		var demandFetchLatency time.Duration
+		var demandBytes uint64
+		var demandErr error
+		if h.cfg.DemandObserver != nil {
+			defer func() {
+				h.cfg.DemandObserver.EndDemand(
+					demandToken,
+					demandFetchLatency,
+					time.Since(serviceStart),
+					demandBytes,
+					demandErr,
+				)
+			}()
+		}
 
 		// State-side cap: how many consecutive Absent pages from
 		// pageIdx. Source then picks any n ≤ this, aligned to its
@@ -698,11 +740,16 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 
 		tFetch := time.Now()
 		n, isZero, err := h.cfg.Source.ReadAt(pageBuf[:capBytes], pageOffset)
+		demandFetchLatency = time.Since(tFetch)
+		demandErr = err
+		if !isZero && n > 0 {
+			demandBytes = uint64(n)
+		}
 		// Record only DATA fetches (the RPC/IO path): zero-region serves are
 		// near-instant and would mask the slow-remote/cache tail. p99 here is
 		// the cold-fetch latency that reveals a degraded store.
 		if err == nil && !isZero {
-			h.stats.pageIn.record(uint64(time.Since(tFetch).Nanoseconds()))
+			h.stats.pageIn.record(uint64(demandFetchLatency.Nanoseconds()))
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			h.logf("uffd: source.ReadAt off=0x%x cap=%d: %v", pageOffset, capBytes, err)

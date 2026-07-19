@@ -32,16 +32,18 @@ var latencyBucketsNs = [...]uint64{
 
 const numLatencyBuckets = len(latencyBucketsNs)
 
-// latHist is a lock-free latency histogram (count + sum + max + buckets),
-// safe for concurrent record from every fault worker.
-type latHist struct {
+// LatencyHistogram is a lock-free latency histogram (count + sum + max +
+// buckets), safe for concurrent recording. It is exported so restore-side
+// background work can use the exact same buckets as the UFFD hot path.
+type LatencyHistogram struct {
 	count   atomic.Uint64
 	sumNs   atomic.Uint64
 	maxNs   atomic.Uint64
 	buckets [numLatencyBuckets + 1]atomic.Uint64 // [n] = overflow (>1s)
 }
 
-func (h *latHist) record(latNs uint64) {
+// Record adds one latency sample in nanoseconds.
+func (h *LatencyHistogram) Record(latNs uint64) {
 	h.count.Add(1)
 	h.sumNs.Add(latNs)
 	for {
@@ -72,13 +74,21 @@ type LatSnapshot struct {
 	Buckets [numLatencyBuckets + 1]uint64
 }
 
-func (h *latHist) snapshot() LatSnapshot {
+// Snapshot returns an immutable cumulative view.
+func (h *LatencyHistogram) Snapshot() LatSnapshot {
 	s := LatSnapshot{Count: h.count.Load(), SumNs: h.sumNs.Load(), MaxNs: h.maxNs.Load()}
 	for i := range h.buckets {
 		s.Buckets[i] = h.buckets[i].Load()
 	}
 	return s
 }
+
+// Keep the handler's internal spelling compact while sharing the
+// implementation with restore-side warming metrics.
+type latHist = LatencyHistogram
+
+func (h *LatencyHistogram) record(latNs uint64)   { h.Record(latNs) }
+func (h *LatencyHistogram) snapshot() LatSnapshot { return h.Snapshot() }
 
 // Sub returns the per-window delta between this (newer) snapshot and prev: the
 // counts/sum/buckets subtract. The window MaxNs is exact when a new peak was

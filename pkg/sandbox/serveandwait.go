@@ -90,6 +90,14 @@ type VMParams struct {
 
 	CapBytes   int64               // RAM capacity (memfd size); also stats UffdRAMSize
 	UffdSource uffd.SnapshotReader // ZeroSource (cold) | snapshot source (restore)
+	// DemandObserver is set only by remote S2 restore warming. It observes
+	// StateAbsent data faults without changing UFFD scheduling.
+	DemandObserver uffd.DemandObserver
+	// WarmingStats snapshots async warming/conflict metrics at stats-json time.
+	WarmingStats func() WarmingStatsSnapshot
+	// StopWarming cancels and drains async warming before final stats are
+	// rendered. Restore also defers it as an early-return safety net.
+	StopWarming func()
 
 	// Disks are the logical disks served to the guest, in order: Disks[0] is
 	// the root, Disks[1:] are the boot.disks[] data disks (boot.disks[] order).
@@ -262,11 +270,12 @@ func ServeAndWait(p VMParams) (int, error) {
 		HandshakeDeadline: p.VAReportDeadline,
 		OnReady: func(uffdFD int, vaStart, size uint64) error {
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
-				MemfdFD:   memfd.FD(),
-				BackendVA: memfd.Addr(),
-				Size:      memfd.Size(),
-				Source:    p.UffdSource,
-				Logf:      logf,
+				MemfdFD:        memfd.FD(),
+				BackendVA:      memfd.Addr(),
+				Size:           memfd.Size(),
+				Source:         p.UffdSource,
+				Logf:           logf,
+				DemandObserver: p.DemandObserver,
 			})
 			if err != nil {
 				return err
@@ -565,6 +574,9 @@ func ServeAndWait(p VMParams) (int, error) {
 	waitErr := waitForCHWithSignalEscalation(doneCh, sigCh, cmd.Process, chPid, chSock, p.SnapCfg.CHApiDeadline(), chShutdownGrace, logf)
 	cancelBackends()
 	backendWG.Wait()
+	if p.StopWarming != nil {
+		p.StopWarming()
+	}
 	exit := 0
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -601,6 +613,10 @@ func ServeAndWait(p VMParams) (int, error) {
 		if pinger.Stats != nil {
 			snap := pinger.Stats.Snapshot()
 			bundle.Ping = &snap
+		}
+		if p.WarmingStats != nil {
+			snap := p.WarmingStats()
+			bundle.Warming = &snap
 		}
 		if err := writeStatsJSON(p.StatsJSONPath, bundle); err != nil {
 			logf("stats json write %s: %v", p.StatsJSONPath, err)

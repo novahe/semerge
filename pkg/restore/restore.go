@@ -398,6 +398,33 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		return -1, err
 	}
 
+	// Start S2 self-layer warming at the earliest point its inputs are ready:
+	// selfStream and the Guest RAM range. It intentionally overlaps opening
+	// parent layers, UFFD-source construction, disk reconstruction, CH startup,
+	// and Guest execution; /vm.resume never waits for it. selfStream's Close
+	// defer was registered when it was opened, so this later defer drains the
+	// warmer before that stream can be closed.
+	var warmer *s2Warmer
+	if opts.SnapshotManifestKey != "" && len(parsedSnap.FromRefs) > 0 {
+		if warmable, ok := selfStream.(fetch.WarmableChunkStream); ok && warmable.WarmSupported() {
+			workers := 4
+			if opts.ManifestCfg != nil {
+				workers, err = opts.ManifestCfg.Cache.EffectiveWarmingWorkers()
+				if err != nil {
+					return -1, fmt.Errorf("snapshot warming config: %w", err)
+				}
+			}
+			warmer = startS2Warmer(ctx, warmable, 0, capBytes, s2WarmConfig{
+				Workers: workers,
+				Queue:   2 * workers,
+			}, logf)
+			defer warmer.Close()
+			logf("snapshot warming: started S2 self layer workers=%d queue=%d", workers, 2*workers)
+		} else {
+			logf("snapshot warming: skipped (self manifest/cache does not support warm-only RPC)")
+		}
+	}
+
 	// Build the layered memory source: [self bundle] ++ from_refs (§3.5). A
 	// non-resident page (hole) in an upper layer falls through to a lower
 	// layer; a page hole in every layer (merged hole) → ZEROPAGE. Single layer
@@ -531,6 +558,25 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		Forwards:    opts.Forwards,
 		Cgroup:      cg,
 
+		DemandObserver: func() uffd.DemandObserver {
+			if warmer == nil {
+				return nil
+			}
+			return warmer
+		}(),
+		WarmingStats: func() func() sandbox.WarmingStatsSnapshot {
+			if warmer == nil {
+				return nil
+			}
+			return warmer.Snapshot
+		}(),
+		StopWarming: func() func() {
+			if warmer == nil {
+				return nil
+			}
+			return warmer.Close
+		}(),
+
 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
 			// CH 51 `--restore source_url=file://<dir>` replaces
 			// --kernel/--vsock; --console/--serial are restored from the
@@ -565,6 +611,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
 		PostSpawn: func(pc sandbox.PostSpawnCtx) error {
 			if err := chapi.WaitReady(ctx, pc.CHSock, opts.HostCfg.APIReadyDeadline()); err != nil {
 				return fmt.Errorf("ch api not ready: %w", err)
+			}
+			if warmer != nil {
+				warmer.MarkResume()
 			}
 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
 				return fmt.Errorf("vm.resume: %w", err)
