@@ -76,6 +76,15 @@ func NewCacheHandler(tier cache.Tier, shard cache.ShardTier) *CacheHandler {
 	return &CacheHandler{tier: tier, shard: shard}
 }
 
+// Capabilities reports protocol features that the configured backend can
+// actually serve. This prevents non-tiered modes from advertising warm-only.
+func (h *CacheHandler) Capabilities() byte {
+	if _, ok := h.tier.(cache.Warmer); ok {
+		return wire.CapabilityWarmOnly
+	}
+	return 0
+}
+
 // ServerStats returns a snapshot of the wire-handler counters. Safe to
 // call concurrently with request handling.
 func (h *CacheHandler) ServerStats() cache.ServerStats {
@@ -107,7 +116,7 @@ func (h *CacheHandler) HandleFrame(ctx context.Context, req *wire.Request) *wire
 	case wire.OpcodeShardPut:
 		return h.shardPut(ctx, req)
 	case wire.OpcodePing:
-		return &wire.Response{Status: wire.StatusHit}
+		return &wire.Response{Status: wire.StatusHit, Flags: h.Capabilities()}
 	default:
 		return &wire.Response{Status: wire.StatusError, ErrMsg: "unknown opcode"}
 	}
@@ -123,12 +132,31 @@ func (h *CacheHandler) objectGet(ctx context.Context, req *wire.Request) *wire.R
 		return &wire.Response{Status: wire.StatusError, ErrMsg: "object ops not supported in this mode"}
 	}
 	h.inflight.Add(1)
+	defer h.inflight.Add(-1)
+	if req.Flags&wire.FlagWarmOnly != 0 {
+		warmer, ok := h.tier.(cache.Warmer)
+		if !ok {
+			h.errN.Add(1)
+			return &wire.Response{Status: wire.StatusError, ErrMsg: cache.ErrWarmUnsupported.Error()}
+		}
+		result, err := warmer.Warm(ctx, wireNSToPartition(req.Namespace), req.Hash)
+		if err != nil {
+			h.errN.Add(1)
+			return &wire.Response{Status: wire.StatusError, ErrMsg: err.Error()}
+		}
+		if result != cache.CacheHit {
+			h.srvMisses.Add(1)
+			return &wire.Response{Status: wire.StatusMiss}
+		}
+		h.srvHits.Add(1)
+		return &wire.Response{Status: wire.StatusHit}
+	}
 	start := time.Now()
 	defer func() {
-		h.inflight.Add(-1)
 		h.getN.Add(1)
 		h.getHist.Record(time.Since(start))
 	}()
+
 	result, blob, err := h.tier.Get(ctx, wireNSToPartition(req.Namespace), req.Hash)
 	if err != nil {
 		h.errN.Add(1)

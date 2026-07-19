@@ -41,6 +41,11 @@ import (
 const (
 	defaultStoreTimeout = ""
 	defaultCacheTimeout = ""
+	// DefaultWarmingWorkers is the default number of asynchronous S2 warming
+	// workers and independent warm-only cache connections.
+	DefaultWarmingWorkers = 4
+	// MaxWarmingWorkers caps speculative concurrency configured by operators.
+	MaxWarmingWorkers = 32
 )
 
 // Config aggregates the five sub-schemas that together describe a
@@ -89,14 +94,30 @@ type StoreConfig struct {
 }
 
 // CacheConfig is the wire-level connection schema for the cache-ctl
-// daemon. When Endpoint is empty, the read path falls back to a
-// store-as-cache adapter (cache.NewStoreOrigin) and the manifest
-// facade dials only the store. The fallback exists so the same
-// Config can drive both daemon-backed and daemon-less deployments.
+// daemon. WarmingWorkers defaults to DefaultWarmingWorkers and controls the
+// cache client's independent warm-only connection pool. When Endpoint is
+// empty, the read path falls back to a store-as-cache adapter
+// (cache.NewStoreOrigin) and the manifest facade dials only the store. The
+// fallback exists so the same Config can drive both daemon-backed and
+// daemon-less deployments.
 type CacheConfig struct {
-	Endpoint string `yaml:"endpoint"`
-	Pool     int    `yaml:"pool"`
-	Timeout  string `yaml:"timeout"`
+	Endpoint       string `yaml:"endpoint"`
+	Pool           int    `yaml:"pool"`
+	Timeout        string `yaml:"timeout"`
+	WarmingWorkers int    `yaml:"warming_workers"`
+}
+
+// EffectiveWarmingWorkers validates and resolves the warm-only connection and
+// worker count. Zero selects the default; explicit values must be in [1, 32].
+func (c CacheConfig) EffectiveWarmingWorkers() (int, error) {
+	workers := c.WarmingWorkers
+	if workers == 0 {
+		workers = DefaultWarmingWorkers
+	}
+	if workers < 1 || workers > MaxWarmingWorkers {
+		return 0, fmt.Errorf("warming_workers must be between 1 and %d", MaxWarmingWorkers)
+	}
+	return workers, nil
 }
 
 // parseTimeout parses a Go duration string and applies fallback when
@@ -172,13 +193,18 @@ func (c *Config) NewFetcher(keyFn fetch.CustomerKeyFunc) (FetcherCloser, error) 
 	}
 
 	if c.Cache.Endpoint != "" {
+		warmingWorkers, err := c.Cache.EffectiveWarmingWorkers()
+		if err != nil {
+			return nil, fmt.Errorf("manifest: cache.%w", err)
+		}
 		cacheTO, err := parseTimeout(c.Cache.Timeout, defaultCacheTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("manifest: cache.timeout: %w", err)
 		}
 		cc, err := cacheclient.NewGetter(c.Cache.Endpoint, cacheclient.Options{
-			Pool:    c.Cache.Pool,
-			Timeout: cacheTO,
+			Pool:     c.Cache.Pool,
+			WarmPool: warmingWorkers,
+			Timeout:  cacheTO,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("manifest: dial cache: %w", err)

@@ -274,18 +274,29 @@ func (pc *PoolConn) Drain(pool cache.BlobPool) {
 }
 
 func (pc *PoolConn) Ping(timeout time.Duration) error {
+	_, err := pc.PingCapabilities(timeout)
+	return err
+}
+
+// PingCapabilities performs the normal health ping and returns protocol
+// capabilities carried in the response's formerly-reserved flags byte.
+func (pc *PoolConn) PingCapabilities(timeout time.Duration) (byte, error) {
 	_ = pc.conn.SetDeadline(time.Now().Add(timeout))
+	defer pc.conn.SetDeadline(time.Time{})
 	if err := pc.conn.WriteRequest(&wire.Request{Opcode: wire.OpcodePing}); err != nil {
-		return err
+		return 0, err
 	}
 	resp, err := pc.conn.ReadResponse(nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if resp.Value != nil {
 		resp.Value.Release()
 	}
-	return nil
+	if resp.Status != wire.StatusHit {
+		return 0, fmt.Errorf("cache: ping status %d", resp.Status)
+	}
+	return resp.Flags, nil
 }
 
 func (pc *PoolConn) closeConn() error {

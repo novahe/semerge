@@ -67,6 +67,32 @@ type ChunkStream interface {
 	ReadChunkAt(ctx context.Context, buf []byte, chunkIdx, offset, end uint64) (int, error)
 }
 
+// WarmChunkRef identifies one stored ciphertext chunk in a single manifest.
+// Offset and End are the full logical extent of the chunk, even when the
+// caller's WalkDataChunks range intersects only part of it.
+type WarmChunkRef struct {
+	Offset          uint64
+	End             uint64
+	CiphertextBytes uint64
+	Key             store.ContentKey
+}
+
+// WarmableChunkStream is an optional enhancement implemented only by a
+// single-manifest stream backed by a cache client that supports warm-only
+// requests. A layered stream deliberately does not expose this contract:
+// chunk indices and content membership belong to individual layers.
+//
+// WalkDataChunks emits every non-zero Data entry intersecting [start, end), in
+// logical-offset order. Equal content keys in different entries are emitted
+// separately; callers that warm by content key are responsible for deduping.
+type WarmableChunkStream interface {
+	Stream
+	WalkDataChunks(start, end uint64, fn func(WarmChunkRef) error) error
+	DataChunkAt(offset uint64) (WarmChunkRef, bool)
+	WarmSupported() bool
+	WarmChunk(ctx context.Context, ref WarmChunkRef) error
+}
+
 // manifestStream is the single-manifest implementation (Stream + ChunkStream).
 type manifestStream struct {
 	m         *codec.Manifest
@@ -85,6 +111,92 @@ func NewStream(m *codec.Manifest, keys [][32]byte, c cache.Getter, enc crypto.Ch
 
 func (s *manifestStream) Size() uint64 { return s.m.ImageSize }
 func (s *manifestStream) Close() error { return nil }
+
+// WalkDataChunks enumerates the self manifest's stored Data chunks that
+// intersect [start, end). It never resolves parent layers, fetches data, or
+// emits explicit zero chunks and holes.
+func (s *manifestStream) WalkDataChunks(start, end uint64, fn func(WarmChunkRef) error) error {
+	if fn == nil {
+		return fmt.Errorf("walk data chunks: nil callback")
+	}
+	if start >= end || start >= s.m.ImageSize {
+		return nil
+	}
+	if end > s.m.ImageSize {
+		end = s.m.ImageSize
+	}
+
+	for _, entry := range s.m.Entries {
+		entryEnd := entry.Offset + uint64(entry.Size)
+		if entryEnd <= start {
+			continue
+		}
+		if entry.Offset >= end {
+			break
+		}
+		if entry.IsZero {
+			continue
+		}
+		if err := fn(WarmChunkRef{
+			Offset:          entry.Offset,
+			End:             entryEnd,
+			CiphertextBytes: uint64(entry.Size) + 1, // AES-CTR flag byte + payload.
+			Key:             store.ContentKey(entry.CiphertextHash),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DataChunkAt returns the single-manifest Data chunk containing offset. Holes,
+// explicit zero chunks, and out-of-range offsets have no warmable chunk.
+func (s *manifestStream) DataChunkAt(offset uint64) (WarmChunkRef, bool) {
+	if offset >= s.m.ImageSize {
+		return WarmChunkRef{}, false
+	}
+	i := codec.ChunkIndexForOffset(s.m.Entries, offset)
+	if i < 0 {
+		return WarmChunkRef{}, false
+	}
+	entry := s.m.Entries[i]
+	if entry.IsZero || offset < entry.Offset || offset >= entry.Offset+uint64(entry.Size) {
+		return WarmChunkRef{}, false
+	}
+	return WarmChunkRef{
+		Offset:          entry.Offset,
+		End:             entry.Offset + uint64(entry.Size),
+		CiphertextBytes: uint64(entry.Size) + 1, // AES-CTR flag byte + payload.
+		Key:             store.ContentKey(entry.CiphertextHash),
+	}, true
+}
+
+// WarmSupported reports whether the backing cache implements the optional
+// warm-only operation. Store-origin fallback getters intentionally return
+// false because fetching without filling a cache would provide no benefit.
+func (s *manifestStream) WarmSupported() bool {
+	_, warmerOK := s.cache.(cache.Warmer)
+	capability, capabilityOK := s.cache.(cache.WarmCapability)
+	return warmerOK && capabilityOK && capability.WarmSupported()
+}
+
+// WarmChunk asks the cache to make ref's ciphertext ready without returning
+// its payload to the manifest reader. Hash verification and decryption remain
+// on the demand ReadAt path.
+func (s *manifestStream) WarmChunk(ctx context.Context, ref WarmChunkRef) error {
+	if !s.WarmSupported() {
+		return fmt.Errorf("warm chunk: %w", cache.ErrWarmUnsupported)
+	}
+	w := s.cache.(cache.Warmer)
+	result, err := w.Warm(ctx, store.PartitionChunk, ref.Key)
+	if err != nil {
+		return fmt.Errorf("warm chunk %x: %w", ref.Key, err)
+	}
+	if result != cache.CacheHit {
+		return fmt.Errorf("warm chunk %x: not found", ref.Key)
+	}
+	return nil
+}
 
 // RunChunkAt classifies one region starting at offset. By the tiling invariant
 // (entries + holes cover [0, ImageSize) with no overlap or gap) a data/zero

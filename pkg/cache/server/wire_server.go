@@ -144,7 +144,7 @@ func (s *WireServer) serveConn(c net.Conn) {
 		}
 
 		if req.Opcode == wire.OpcodePing {
-			wc.WriteResponse(&wire.Response{Status: wire.StatusHit})
+			wc.WriteResponse(&wire.Response{Status: wire.StatusHit, Flags: s.handler.Capabilities()})
 			req.Release()
 			continue
 		}
@@ -188,7 +188,7 @@ func (s *WireServer) serveConn(c net.Conn) {
 					cancelHandler()
 					cancelled = true
 				} else if nextReq.Opcode == wire.OpcodePing {
-					wc.WriteResponse(&wire.Response{Status: wire.StatusHit})
+					wc.WriteResponse(&wire.Response{Status: wire.StatusHit, Flags: s.handler.Capabilities()})
 					nextReq.Release()
 				} else {
 					pendingReqs = append(pendingReqs, nextReq)

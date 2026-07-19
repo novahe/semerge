@@ -81,6 +81,21 @@ func TestRequestRoundTrip_Ping(t *testing.T) {
 	}
 }
 
+func TestResponseFlagsRoundTrip(t *testing.T) {
+	want := &Response{Status: StatusHit, Flags: CapabilityWarmOnly}
+	var buf bytes.Buffer
+	if err := WriteResponse(&buf, want); err != nil {
+		t.Fatalf("WriteResponse: %v", err)
+	}
+	got, err := ReadResponse(&buf, nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if got.Flags != CapabilityWarmOnly {
+		t.Fatalf("flags=%#x, want %#x", got.Flags, CapabilityWarmOnly)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Response round-trip
 // ---------------------------------------------------------------------------

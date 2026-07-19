@@ -869,6 +869,10 @@ func (b *tieredBackend) Get(ctx context.Context, p store.Partition, key store.Co
 	return cache.CacheHit, blob, nil
 }
 
+func (b *tieredBackend) Warm(ctx context.Context, p store.Partition, key store.ContentKey) (cache.CacheResult, error) {
+	return b.tc.Warm(ctx, p, key)
+}
+
 func (b *tieredBackend) Fill(ctx context.Context, p store.Partition, key store.ContentKey, data []byte) error {
 	return errTieredFill
 }

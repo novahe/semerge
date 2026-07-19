@@ -2,12 +2,245 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 )
+
+type gatedOrigin struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (o *gatedOrigin) Get(ctx context.Context, _ store.Partition, _ store.ContentKey) (CacheResult, Blob, error) {
+	o.calls.Add(1)
+	select {
+	case o.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-o.release:
+		return CacheHit, NewMemBlob([]byte("ciphertext")), nil
+	case <-ctx.Done():
+		return CacheMiss, nil, ctx.Err()
+	}
+}
+
+type gatedFillTier struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type staleMissTier struct {
+	calls        atomic.Int32
+	ready        atomic.Bool
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	filled       chan struct{}
+}
+
+func (t *staleMissTier) Get(context.Context, store.Partition, store.ContentKey) (CacheResult, Blob, error) {
+	call := t.calls.Add(1)
+	readyAtStart := t.ready.Load()
+	if call == 1 {
+		close(t.firstStarted)
+		<-t.releaseFirst
+	}
+	if readyAtStart {
+		return CacheHit, NewMemBlob([]byte("ciphertext")), nil
+	}
+	return CacheMiss, nil, nil
+}
+
+func (t *staleMissTier) Fill(context.Context, store.Partition, store.ContentKey, []byte) error {
+	t.ready.Store(true)
+	select {
+	case <-t.filled:
+	default:
+		close(t.filled)
+	}
+	return nil
+}
+
+func (t *gatedFillTier) Get(context.Context, store.Partition, store.ContentKey) (CacheResult, Blob, error) {
+	return CacheMiss, nil, nil
+}
+
+func (t *gatedFillTier) Fill(ctx context.Context, _ store.Partition, _ store.ContentKey, _ []byte) error {
+	select {
+	case t.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-t.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestTieredCacheGetAndWarmShareLookupButWaitForDifferentReadiness(t *testing.T) {
+	origin := &gatedOrigin{started: make(chan struct{}, 1), release: make(chan struct{})}
+	tier := &gatedFillTier{started: make(chan struct{}, 1), release: make(chan struct{})}
+	tc := NewTieredCache(origin, tier)
+	defer tc.Close()
+	key := store.ContentKey{1}
+
+	warmDone := make(chan error, 1)
+	go func() {
+		result, err := tc.Warm(context.Background(), store.PartitionChunk, key)
+		if err == nil && result != CacheHit {
+			err = errors.New("warm did not hit")
+		}
+		warmDone <- err
+	}()
+	select {
+	case <-origin.started:
+	case <-time.After(time.Second):
+		t.Fatal("origin lookup did not start")
+	}
+
+	getDone := make(chan error, 1)
+	go func() {
+		found, blob, err := tc.Get(context.Background(), store.PartitionChunk, key)
+		if err == nil && !found {
+			err = errors.New("get did not hit")
+		}
+		if blob != nil {
+			blob.Release()
+		}
+		getDone <- err
+	}()
+	close(origin.release)
+
+	select {
+	case err := <-getDone:
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Get waited for cache fill instead of dataReady")
+	}
+	select {
+	case <-tier.started:
+	case <-time.After(time.Second):
+		t.Fatal("upper tier fill did not start")
+	}
+	select {
+	case err := <-warmDone:
+		t.Fatalf("Warm returned before fillReady: %v", err)
+	default:
+	}
+	close(tier.release)
+	select {
+	case err := <-warmDone:
+		if err != nil {
+			t.Fatalf("Warm: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Warm did not return after fill")
+	}
+	if got := origin.calls.Load(); got != 1 {
+		t.Fatalf("origin calls=%d, want one shared lookup", got)
+	}
+}
+
+func TestTieredCacheCanceledSoleWaiterCancelsLeader(t *testing.T) {
+	origin := &gatedOrigin{started: make(chan struct{}, 1), release: make(chan struct{})}
+	tc := NewTieredCache(origin, newMockTier())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := tc.Get(ctx, store.PartitionChunk, store.ContentKey{2})
+		done <- err
+	}()
+	<-origin.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Get error=%v, want context canceled", err)
+	}
+	tc.Close()
+}
+
+func TestTieredCacheLeaderRechecksTiersAfterStaleMiss(t *testing.T) {
+	origin := &gatedOrigin{started: make(chan struct{}, 2), release: make(chan struct{})}
+	tier := &staleMissTier{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		filled:       make(chan struct{}),
+	}
+	tc := NewTieredCache(origin, tier)
+	defer tc.Close()
+	key := store.ContentKey{3}
+
+	// B captures a tier miss, then pauses before it can join singleflight.
+	bDone := make(chan error, 1)
+	go func() {
+		found, blob, err := tc.Get(context.Background(), store.PartitionChunk, key)
+		if err == nil && !found {
+			err = errors.New("B did not hit")
+		}
+		if blob != nil {
+			blob.Release()
+		}
+		bDone <- err
+	}()
+	<-tier.firstStarted
+
+	// A proceeds through origin and fills the tier while B still holds its
+	// stale miss result.
+	aDone := make(chan error, 1)
+	go func() {
+		found, blob, err := tc.Get(context.Background(), store.PartitionChunk, key)
+		if err == nil && !found {
+			err = errors.New("A did not hit")
+		}
+		if blob != nil {
+			blob.Release()
+		}
+		aDone <- err
+	}()
+	<-origin.started
+	close(origin.release)
+	if err := <-aDone; err != nil {
+		t.Fatalf("A Get: %v", err)
+	}
+	select {
+	case <-tier.filled:
+	case <-time.After(time.Second):
+		t.Fatal("A did not fill ready tier")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		tc.inflightMu.Lock()
+		remaining := len(tc.inflight)
+		tc.inflightMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A singleflight entry was not retired")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	close(tier.releaseFirst)
+	if err := <-bDone; err != nil {
+		t.Fatalf("B Get: %v", err)
+	}
+	if got := origin.calls.Load(); got != 1 {
+		t.Fatalf("origin calls=%d, want 1 after stale-miss recheck", got)
+	}
+	// B's uncounted leader probe must not add another hit/miss sample.
+	c := tc.Counters()
+	if got := c.TierMisses[0] + c.TierHits[0]; got != 2 {
+		t.Fatalf("counted tier probes=%d, want exactly A+B initial scans", got)
+	}
+}
 
 // countingBlob is a cache.Blob mock that tracks Clone and Release
 // calls through a shared refcount, so tests can assert that fill-

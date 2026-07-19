@@ -9,7 +9,7 @@
 //	  [4 TotalLen LE][1 Opcode][1 NS][1 Flags][32 Hash][N Value]
 //
 //	Response (8 B header + optional payload):
-//	  [4 TotalLen LE][1 Status][1 Reserved][2 ErrLen LE][ErrLen ErrMsg][N Value]
+//	  [4 TotalLen LE][1 Status][1 Flags][2 ErrLen LE][ErrLen ErrMsg][N Value]
 //
 // For shard opcodes (OpcodeShardGet / OpcodeShardPut) the Value bytes
 // follow the on-disk shard format: [1 idx][1 total][N shard_data]
@@ -31,6 +31,16 @@ const (
 	OpcodeShardPut      byte = 0x04
 	OpcodePing          byte = 0x05
 	OpcodeCancelRequest byte = 0x06
+)
+
+// Request flags. Unknown flags are ignored for forward compatibility.
+const (
+	FlagWarmOnly byte = 1 << 0
+)
+
+// Capability bits returned in Response.Flags for OpcodePing.
+const (
+	CapabilityWarmOnly byte = 1 << 0
 )
 
 // Status codes in a response frame.
@@ -91,6 +101,7 @@ func (r *Request) Release() {
 // the right pool via the blob's own interface.
 type Response struct {
 	Status byte
+	Flags  byte       // capabilities for Ping; zero for ordinary responses
 	ErrMsg string     // non-empty only when Status == StatusError
 	Value  cache.Blob // nil for MISS/ERROR; carries the payload on HIT
 }

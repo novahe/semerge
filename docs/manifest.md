@@ -250,7 +250,8 @@ store:
   timeout: 5s                     # 单次 store RPC 超时
 cache:
   endpoint: 127.0.0.1:7070        # 空 = 跳过 cache 层、直接走 store;同支持 Unix socket 路径
-  pool: 4
+  pool: 4                         # demand Get 独立连接池
+  warming_workers: 4              # S2 异步 warm worker/独立连接池, 范围 1..32
   timeout: 2s
 chunker:
   mode: cdc                       # cdc | fixed
@@ -280,6 +281,9 @@ crypto:
 - `cache.endpoint` — 空则 manifest-ctl `load` 路径直走 store gRPC;非空则
   通过 wire 协议穿 cache-ctl。同样接受 `host:port` 或 Unix socket 路径
   (`unix://path` 或裸 `/path`),与 cache-ctl 的 `listen` 同址。
+- `cache.warming_workers` — S2 self-layer 后台 warming 的 worker 数，同时作为
+  warm-only 独立连接池大小。默认 4，可配置范围 `1..32`；不改变
+  `cache.pool` 所配置的 demand Get 连接池。
 - `chunker.mode` — `cdc`(FastCDC,变长)或 `fixed`(固定大小)。详见 §4.1。
 - `crypto.chunk` / `crypto.manifest` — chunk 与 Manifest 的加密算法,均仅支持
   `aes`(§4.3 / §4.4);其它值在构造时即被拒绝。

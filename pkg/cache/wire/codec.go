@@ -128,7 +128,7 @@ func ReadResponse(r io.Reader, pool cache.BlobPool) (*Response, error) {
 
 	resp := &Response{
 		Status: hdr[4],
-		// hdr[5] reserved
+		Flags:  hdr[5],
 	}
 	errLen := int(binary.LittleEndian.Uint16(hdr[6:8]))
 
@@ -188,7 +188,7 @@ func readResponseFast(br *bufio.Reader, raw io.Reader, pool cache.BlobPool) (*Re
 		return nil, ErrFrameTooLarge
 	}
 
-	resp := &Response{Status: hdr[4]}
+	resp := &Response{Status: hdr[4], Flags: hdr[5]}
 	errLen := int(binary.LittleEndian.Uint16(hdr[6:8]))
 	remaining := int(totalLen) - ResponseHeaderSize
 
@@ -275,7 +275,7 @@ func WriteResponse(w io.Writer, resp *Response) error {
 	totalLen := uint32(ResponseHeaderSize + len(errBytes) + valueLen)
 	binary.LittleEndian.PutUint32(hdr[:4], totalLen)
 	hdr[4] = resp.Status
-	// hdr[5] reserved = 0
+	hdr[5] = resp.Flags
 	binary.LittleEndian.PutUint16(hdr[6:8], uint16(len(errBytes)))
 
 	// Use writev to avoid copying the (potentially large) value. For

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/cache"
@@ -31,6 +32,54 @@ func (m mapGetter) Get(_ context.Context, p store.Partition, k store.ContentKey)
 		}
 	}
 	return cache.CacheMiss, nil, nil
+}
+
+type warmTier struct {
+	result cache.CacheResult
+	err    error
+	calls  atomic.Int32
+}
+
+func (t *warmTier) Get(context.Context, store.Partition, store.ContentKey) (cache.CacheResult, cache.Blob, error) {
+	return cache.CacheMiss, nil, nil
+}
+func (t *warmTier) Fill(context.Context, store.Partition, store.ContentKey, []byte) error { return nil }
+func (t *warmTier) Warm(context.Context, store.Partition, store.ContentKey) (cache.CacheResult, error) {
+	t.calls.Add(1)
+	return t.result, t.err
+}
+
+func TestWireHandlerWarmOnlyReturnsNoPayloadAndAdvertisesCapability(t *testing.T) {
+	tier := &warmTier{result: cache.CacheHit}
+	h := NewCacheHandler(tier, nil)
+	if got := h.Capabilities(); got&wire.CapabilityWarmOnly == 0 {
+		t.Fatalf("capabilities=%#x, want warm-only", got)
+	}
+	resp := h.HandleFrame(context.Background(), &wire.Request{
+		Opcode: wire.OpcodeObjectGet, Namespace: wire.NSChunk,
+		Flags: wire.FlagWarmOnly, Hash: mkKey("warm"),
+	})
+	if resp.Status != wire.StatusHit || resp.Value != nil {
+		t.Fatalf("warm response status=%d value=%v", resp.Status, resp.Value)
+	}
+	if tier.calls.Load() != 1 {
+		t.Fatalf("warm calls=%d, want 1", tier.calls.Load())
+	}
+	stats := h.WireStats()
+	if stats.GetN != 0 || stats.GetHist.Count != 0 {
+		t.Fatalf("warm-only polluted demand Get stats: count=%d hist=%d", stats.GetN, stats.GetHist.Count)
+	}
+
+	plain := NewCacheHandler(roTier{mapGetter{}}, nil)
+	if got := plain.Capabilities(); got != 0 {
+		t.Fatalf("plain backend advertised capabilities %#x", got)
+	}
+	unsupported := plain.HandleFrame(context.Background(), &wire.Request{
+		Opcode: wire.OpcodeObjectGet, Flags: wire.FlagWarmOnly,
+	})
+	if unsupported.Status != wire.StatusError {
+		t.Fatalf("unsupported warm status=%d, want error", unsupported.Status)
+	}
 }
 
 func mkKey(s string) store.ContentKey { return store.ContentKey(sha256.Sum256([]byte(s))) }
