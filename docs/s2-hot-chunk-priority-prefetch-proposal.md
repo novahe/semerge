@@ -115,10 +115,9 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    SM["S2 memory self manifest"] --> EM["枚举 Data keys"]
-    SD["S2 disk self manifests"] --> ED["枚举 Data keys"]
-    EM --> K["按 partition + ciphertext key 去重"]
-    ED --> K
+    SM["S2 memory self manifest"] --> E["枚举 Data keys"]
+    SD["S2 disk self manifests"] --> E
+    E --> K["按 partition + ciphertext key 去重"]
     K --> P1Q["P1 低优先级队列"]
 
     U["UFFD memory fault"] --> P0["P0 高优先级任务"]
