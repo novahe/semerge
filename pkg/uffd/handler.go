@@ -51,8 +51,11 @@ type Config struct {
 	// start; StreamSnapshotSource for restore.
 	Source SnapshotReader
 
-	// Number of worker goroutines. 0 → runtime.NumCPU(); minimum 2.
+	// Number of worker goroutines. 0 → NumVCPUs (or runtime.NumCPU()); minimum 2.
 	NumWorkers int
+
+	// Number of vCPUs configured for Cloud-Hypervisor (CLH).
+	NumVCPUs int
 
 	// Optional logger; nil → discarded.
 	Logf func(string, ...any)
@@ -199,6 +202,11 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 	if addrMap == nil {
 		return nil, fmt.Errorf("uffd: AddressMap is nil")
+	}
+	if cfg.NumWorkers <= 0 {
+		// The vCPU count forms an upper bound on fault concurrency, serving as a natural baseline for default workers.
+		// Benchmark data demonstrates that setting NumWorkers equal to the vCPU count yields optimal performance.
+		cfg.NumWorkers = cfg.NumVCPUs
 	}
 	if cfg.NumWorkers <= 0 {
 		cfg.NumWorkers = runtime.NumCPU()

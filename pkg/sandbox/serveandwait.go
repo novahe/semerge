@@ -261,11 +261,16 @@ func ServeAndWait(p VMParams) (int, error) {
 		Logf:              logf,
 		HandshakeDeadline: p.VAReportDeadline,
 		OnReady: func(uffdFD int, vaStart, size uint64) error {
+			numVCPUs := 0
+			if p.SnapCfg != nil {
+				numVCPUs = p.SnapCfg.Resources.Capacity.CPU
+			}
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
 				MemfdFD:   memfd.FD(),
 				BackendVA: memfd.Addr(),
 				Size:      memfd.Size(),
 				Source:    p.UffdSource,
+				NumVCPUs:  numVCPUs,
 				Logf:      logf,
 			})
 			if err != nil {
