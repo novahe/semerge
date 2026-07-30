@@ -143,6 +143,15 @@ type digestedSource struct {
 
 func (s *digestedSource) Digest() string { return s.digest }
 
+func (s *digestedSource) StoredRangeAt(offset, limit uint64) (fileOffset, length uint64, ok bool, err error) {
+	if locator, ok := s.Source.(interface {
+		StoredRangeAt(offset, limit uint64) (fileOffset, length uint64, ok bool, err error)
+	}); ok {
+		return locator.StoredRangeAt(offset, limit)
+	}
+	return 0, 0, false, nil
+}
+
 // discoverDigest recognizes the strict two-entry artifact shape. A normal tar
 // without a marker is not an error; a reserved marker that is present but
 // malformed is. All scans skip stored payload bytes with Seek.
@@ -769,6 +778,33 @@ func (s *readerAtSource) Size() uint64 { return uint64(s.logical) }
 
 func (s *readerAtSource) RunAt(offset, limit uint64) (sparse.RunKind, uint64, error) {
 	return s.meta.runAt(offset, limit)
+}
+
+// StoredRangeAt translates a logical Data range into its contiguous byte range
+// in the tarstream envelope. The returned file offset is suitable for a
+// read-only mmap of the original ReaderAt when it is the backing *os.File.
+//
+// ok is false for holes. The returned length never crosses a packed extent,
+// even when limit extends beyond it.
+func (s *readerAtSource) StoredRangeAt(offset, limit uint64) (fileOffset, length uint64, ok bool, err error) {
+	if limit == 0 {
+		return 0, 0, false, nil
+	}
+	if offset >= uint64(s.logical) {
+		return 0, 0, false, io.EOF
+	}
+	idx := s.extentAt(offset)
+	if idx == len(s.extents) || offset < uint64(s.extents[idx].Offset) {
+		return 0, 0, false, nil
+	}
+
+	e := s.extents[idx]
+	within := int64(offset) - e.Offset
+	length = uint64(e.Size - within)
+	if length > limit {
+		length = limit
+	}
+	return uint64(s.dataStart + s.packedPrefix[idx] + within), length, true, nil
 }
 
 func (s *readerAtSource) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {

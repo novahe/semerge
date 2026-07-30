@@ -3,10 +3,16 @@ package fetch
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"golang.org/x/sys/unix"
 )
+
+type storedRangeSource interface {
+	StoredRangeAt(offset, limit uint64) (fileOffset, length uint64, ok bool, err error)
+}
 
 // tarFileStream is a local tarstream artifact as a Stream: the
 // platform's at-rest container for images, snapshot bundles and
@@ -16,8 +22,11 @@ import (
 // contract. Nothing is unpacked.
 type tarFileStream struct {
 	sparse.Source
-	f      *os.File
-	digest string
+	f       *os.File
+	digest  string
+	mapOnce sync.Once
+	mapped  []byte
+	mapErr  error
 }
 
 // OpenTarStream opens the artifact at path (a tarstream envelope whose first
@@ -49,4 +58,63 @@ func OpenTarStream(path string) (Stream, error) {
 }
 
 func (s *tarFileStream) Digest() string { return s.digest }
-func (s *tarFileStream) Close() error   { return s.f.Close() }
+
+// BorrowAt returns a read-only mmap view of a packed Data extent. Mapping is
+// lazy so ordinary Stream users retain the existing pread-only behaviour.
+func (s *tarFileStream) BorrowAt(offset, limit uint64) ([]byte, bool, error) {
+	locator, ok := s.Source.(storedRangeSource)
+	if !ok {
+		return nil, false, nil
+	}
+	fileOffset, length, ok, err := locator.StoredRangeAt(offset, limit)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+
+	s.mapOnce.Do(func() {
+		info, err := s.f.Stat()
+		if err != nil {
+			s.mapErr = err
+			return
+		}
+		if info.Size() <= 0 || uint64(info.Size()) > uint64(^uint(0)>>1) {
+			s.mapErr = fmt.Errorf("fetch: cannot mmap tarstream size %d", info.Size())
+			return
+		}
+		s.mapped, s.mapErr = unix.Mmap(
+			int(s.f.Fd()),
+			0,
+			int(info.Size()),
+			unix.PROT_READ,
+			unix.MAP_PRIVATE,
+		)
+	})
+	if s.mapErr != nil {
+		return nil, false, s.mapErr
+	}
+	end := fileOffset + length
+	if end < fileOffset || end > uint64(len(s.mapped)) {
+		return nil, false, fmt.Errorf(
+			"fetch: borrowed tarstream range [%d,%d) exceeds mapped size %d",
+			fileOffset,
+			end,
+			len(s.mapped),
+		)
+	}
+	return s.mapped[fileOffset:end], true, nil
+}
+
+func (s *tarFileStream) Close() error {
+	var unmapErr error
+	if s.mapped != nil {
+		unmapErr = unix.Munmap(s.mapped)
+		s.mapped = nil
+	}
+	closeErr := s.f.Close()
+	if unmapErr != nil {
+		return unmapErr
+	}
+	return closeErr
+}
+
+var _ BorrowingStream = (*tarFileStream)(nil)

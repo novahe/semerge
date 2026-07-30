@@ -56,6 +56,23 @@ func TestOpenTarStream(t *testing.T) {
 	if kind, end, err := st.RunAt(4096, size); kind != sparse.Hole || end != 1<<20 || err != nil {
 		t.Fatalf("RunAt(4096) = (%v, %d, %v)", kind, end, err)
 	}
+	borrower, ok := st.(BorrowingStream)
+	if !ok {
+		t.Fatal("local tar stream does not expose BorrowAt")
+	}
+	borrowed, ok, err := borrower.BorrowAt(0, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(borrowed) != 4096 {
+		t.Fatalf("BorrowAt(data) = len %d, ok %v", len(borrowed), ok)
+	}
+	if !bytes.Equal(borrowed, logical[:4096]) {
+		t.Fatal("borrowed data does not match logical content")
+	}
+	if borrowed, ok, err := borrower.BorrowAt(4096, 4096); err != nil || ok || borrowed != nil {
+		t.Fatalf("BorrowAt(hole) = len %d, ok %v, err %v", len(borrowed), ok, err)
+	}
 
 	ctx := context.Background()
 	var wg sync.WaitGroup

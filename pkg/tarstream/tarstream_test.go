@@ -83,6 +83,55 @@ func TestRoundTripSeek(t *testing.T) {
 	}
 }
 
+func TestSourceAtStoredRangeAt(t *testing.T) {
+	logical, holes := fixture()
+	archive := mustWrite(t, "memory.raw", logical, holes)
+
+	src, _, err := SourceAt(bytes.NewReader(archive), int64(len(archive)), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locator, ok := src.(interface {
+		StoredRangeAt(uint64, uint64) (uint64, uint64, bool, error)
+	})
+	if !ok {
+		t.Fatal("SourceAt result does not expose StoredRangeAt")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		offset uint64
+		limit  uint64
+		ok     bool
+	}{
+		{name: "first extent", offset: 0, limit: 4096, ok: true},
+		{name: "extent capped", offset: 4096, limit: 8192, ok: true},
+		{name: "hole", offset: 8192, limit: 4096, ok: false},
+		{name: "second extent", offset: 1 << 20, limit: 4096, ok: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fileOffset, length, gotOK, err := locator.StoredRangeAt(tc.offset, tc.limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotOK != tc.ok {
+				t.Fatalf("ok = %v, want %v", gotOK, tc.ok)
+			}
+			if !gotOK {
+				return
+			}
+			if length == 0 || length > tc.limit {
+				t.Fatalf("length = %d, limit = %d", length, tc.limit)
+			}
+			got := archive[fileOffset : fileOffset+length]
+			want := logical[tc.offset : tc.offset+length]
+			if !bytes.Equal(got, want) {
+				t.Fatal("stored range does not match logical data")
+			}
+		})
+	}
+}
+
 func TestRoundTripSequential(t *testing.T) {
 	logical, holes := fixture()
 	archive := mustWrite(t, "disk/img.raw", logical, holes)

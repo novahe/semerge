@@ -53,8 +53,20 @@ type Stream interface {
 
 	// Close releases resources owned by this stream (e.g. a file descriptor).
 	// manifest streams own none (no-op); a layered stream closes its layers.
-	// It must not run concurrently with RunAt, ReadAt, or Prefetch.
+	// It must not run concurrently with RunAt, ReadAt, Prefetch, BorrowAt, or
+	// use of a view previously returned by BorrowAt.
 	Close() error
+}
+
+// BorrowingStream is an optional local-stream fast path. BorrowAt returns a
+// read-only view of a contiguous Data range without copying it into a caller
+// buffer. The view remains valid until Stream.Close; callers must not retain it
+// beyond that lifetime, mutate it, or use it concurrently with Stream.Close.
+//
+// ok is false when the stream cannot borrow the requested range. Callers must
+// fall back to Stream.ReadAt in that case.
+type BorrowingStream interface {
+	BorrowAt(offset, limit uint64) (data []byte, ok bool, err error)
 }
 
 // ChunkStream is the optional enhancement contract: it lets a caller reuse a
