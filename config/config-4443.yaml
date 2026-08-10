@@ -1,0 +1,41 @@
+# config-4443.yaml — e2b-bench-file-bare 专属 conductor，用 /root/sandbox 的 node-ctl，
+# 独立 :4443 / paths / socket / systemd 单元（-4443 后缀），彻底避开 :4433 上共享的
+# uffd64-bin conductor（e2b-bench-file / sandbox-lsx）。供修正后的 build-ws-template.py 重录 W。
+api: { domain: sandboxes.demo.local, listen: ":4443", tls: { cert: /root/sandbox/e2b-bench-file-bare/config/tls.crt, key: /root/sandbox/e2b-bench-file-bare/config/tls.key } }
+proxy: { auth: enforce }
+
+encryption_key: "2e5ec4b368db50af1641d762e9e1d511c762be97cd4714fff044597bd3aa5461"
+manifest_config: /root/sandbox/e2b-bench-file-bare/config/manifest-obs.yaml
+paths: { run_root: /tmp/e2b-bench-4443/run, base_root: /tmp/e2b-bench-4443/lib, config_socket: /tmp/e2b-bench-4443/node-ctl.socket }
+# 独立 unit 模板名（-4443 后缀），避开 -opt（:4433）与 yyl 的 plain sandbox-runner@
+units: { dir: /run/systemd/system, runner: sandbox-runner-4443@.service, builder: sandbox-builder-4443@.service, runner_pool_size: 20, install: true }
+sandbox:
+  network: { switch: e2bdemo }
+  boot:
+    kernel: /root/sandbox/orchestrator/bin/vmlinux
+    runtime: /root/sandbox/orchestrator/bin/sandbox-runtime.erofs
+    overlay_diff_template: /tmp/demo-e2b-jHCV1A/overlay-1G-fresh.ext4
+  resources:
+    vcpu: 2
+    memory: 8GiB
+    control_socket: /run/kuasar/node-ctl.sock
+builder:
+  insecure_registry: true
+  diff_template: /tmp/demo-e2b-jHCV1A/builder-24G.ext4
+  vcpu: 2
+  memory: 8GiB
+  pull_timeout_sec: 600
+  step_timeout_sec: 300
+  ready_timeout_sec: 120
+  total_timeout_sec: 1800
+
+resource_listen:
+  enabled: true
+  socket: /run/kuasar/node-ctl.sock
+
+
+checkpoint:                                    # local 落盘须本地 fs：NFSv3 不支持 renameat2(RENAME_NOREPLACE)（sink.go 原子提交会 EINVAL）
+  mode: local
+  local_dir: /tmp/e2b-bench-4443/snaps
+  remote:                                      # export 的 store 引用仍落 NFS（普通写，不受影响）
+    ref_location_parent: file:///mnt/sfs_turbo/e2b-bench-file-optimization/snaps

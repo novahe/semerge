@@ -1,0 +1,5 @@
+manifest: { key: "0000000000000000000000000000000000000000000000000000000000000001" }
+store: { endpoint: "unix:///var/yyl/store-obs.sock", pool: 8, timeout: "30s" }
+cache: { endpoint: "unix:///var/yyl/cache-tiered-mine-obs.sock", pool: 100, timeout: 30s }
+chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1024KiB } }
+crypto: { chunk: "aes", manifest: "aes", local: "auto" }
