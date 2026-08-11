@@ -7,6 +7,9 @@
   → connect 恢复 → 等 ready → 预热 health+exec ×WARM_CURLS（打 bash-tools 工作集）
   → pause#2（header {"drop_caches":false,"merge_ref":false}，同 build_ws_coldboot.py）→ export → W
 
+  gateway 访问经 node proxy 按 sandbox id 转发（同 bench.py；forwardAccessToken 来自 create
+  响应，鉴权用 X-Access-Token）。e2b profile 用 Sandbox.connect 拿 commands.run 起 gateway。
+
   - 层结构（实测）：B 无父层 → 1-layer。W 从 B 恢复而来且 pause 传 merge_ref=false
     （不 flatten 父层）→ W 链式引用 B，restore 为 2 memory layers。本 build 上
     2-layer restore 工作正常（uffd64 老 bug 未触发，bench 120+ 次零失败）；
@@ -91,10 +94,11 @@ def connect_sandbox(sid):
         sys.exit(f"✗ connect HTTP {r.status_code}: {r.text[:200]}")
 
 
-def wait_ready(ip):
+def wait_ready(sid, fat):
+    """等 gateway /health 200（经 node proxy 按 sid 转发）。"""
     end = time.time() + READY_WAIT
     while time.time() < end:
-        if openclaw_net.curl_gateway(ip, "/health").get("http") == 200:
+        if openclaw_net.curl_gateway_proxy(sid, fat, "/health").get("http") == 200:
             return True
         time.sleep(2)
     return False
@@ -106,32 +110,32 @@ def main():
     tid = f"{PROFILE}-img-" + base64.urlsafe_b64encode(("manifest://" + KEY).encode()).decode().rstrip("=")
     print(f"• cold-boot [{PROFILE}] from manifest://{KEY[:12]}… 一次产出 B（冷）+ W（工作集）")
     domain = os.environ["E2B_DOMAIN"]
-    s = None        # e2b 分支的 SDK Sandbox；bare 走裸 api_request + launch metadata
+    s = None        # e2b 分支的 SDK Sandbox（commands.run 起 gateway）；bare 走 launch metadata
     sid = None
+    fat = None      # forwardAccessToken（node proxy 鉴权，来自 create 响应）
     hosts_added = False
     if PROFILE == "bare":
+        # bare：原始 API create（抓 forwardAccessToken）+ launch metadata 注入 gateway（随 boot 自起）
         r = e2b_env.api_request("POST", "/sandboxes",
                                 json={"templateID": tid, "timeout": SANDBOX_TIMEOUT,
                                       "metadata": {"kuasar-sandbox.launch": json.dumps(LAUNCH)}})
         if r.status_code != 201:
             sys.exit(f"✗ create HTTP {r.status_code}: {r.text[:300]}")
-        sid = r.json()["sandboxID"]
+        j = r.json()
+        sid, fat = j["sandboxID"], j["forwardAccessToken"]
     else:
-        s = Sandbox.create(tid, timeout=SANDBOX_TIMEOUT)
-        sid = s.sandbox_id
-        add_hosts(sid, domain)   # 仅 e2b：数据面域名 → 127.0.0.1
+        # e2b：原始 API create 抓 forwardAccessToken；Sandbox.connect 拿 commands.run 起 gateway
+        # （SDK 不暴露 forwardAccessToken，故 create 不走 Sandbox.create）。
+        r = e2b_env.api_request("POST", "/sandboxes",
+                                json={"templateID": tid, "timeout": SANDBOX_TIMEOUT})
+        if r.status_code != 201:
+            sys.exit(f"✗ create HTTP {r.status_code}: {r.text[:300]}")
+        j = r.json()
+        sid, fat = j["sandboxID"], j["forwardAccessToken"]
+        s = Sandbox.connect(sid, timeout=SANDBOX_TIMEOUT)
+        add_hosts(sid, domain)   # 仅 e2b：envd 数据面域名 → 127.0.0.1
         hosts_added = True
-    # floating_ip 从 conductor 启动中写的 per-sandbox YAML(--port=N) 推导；admission 后
-    # ~0.25s 才落盘，单次取会 race 成 None → 后续 gateway 健康检查全打到 None。轮询等它。
-    ip, _end = None, time.time() + 15
-    while time.time() < _end:
-        ip = openclaw_net.floating_ip(sid)
-        if ip:
-            break
-        time.sleep(0.25)
-    print(f"  ✓ created  sid={sid}  floating={ip}")
-    if not ip:
-        sys.exit("✗ 拿不到 floating IP（per-sandbox YAML 未写出，看 conductor 日志）")
+    print(f"  ✓ created  sid={sid}  proxy={openclaw_net.proxy_url()}")
     try:
         # ① 起 gateway + 等 ready（bare：launch 已在 create 时注入，随 boot 自起）
         if PROFILE != "bare":
@@ -140,7 +144,7 @@ def main():
             except Exception as e:
                 print(f"  commands.run: {type(e).__name__}（setsid 后台不受影响）")
         print("[1/5] 等 gateway /health 200 …")
-        if not wait_ready(ip):
+        if not wait_ready(sid, fat):
             sys.exit(f"✗ gateway {READY_WAIT}s 未 ready")
         print("  ✓ gateway ready")
         if READY_SETTLE > 0:
@@ -163,7 +167,7 @@ def main():
         t0 = time.time()
         connect_sandbox(sid)
         print(f"  ✓ resumed  ({(time.time()-t0)*1000:.0f}ms)")
-        if not wait_ready(ip):
+        if not wait_ready(sid, fat):
             sys.exit("✗ resume 后 gateway 未 ready")
         print("  ✓ gateway ready (post-resume)")
 
@@ -171,8 +175,8 @@ def main():
         profile = "health+exec" if WARM_HEALTH else "exec-only"
         print(f"[4/5] 预热 {profile} ×{WARM_CURLS}（聚焦 bash-tools 工作集）")
         for k in range(WARM_CURLS):
-            rh = openclaw_net.curl_gateway(ip, "/health") if WARM_HEALTH else {"http": 200}
-            r = openclaw_net.curl_exec(ip, "date")
+            rh = openclaw_net.curl_gateway_proxy(sid, fat, "/health") if WARM_HEALTH else {"http": 200}
+            r = openclaw_net.curl_exec_proxy(sid, fat, "date")
             print(f"  warm{k+1}: health={rh.get('http')} exec_ok={r.get('ok')}")
             if rh.get("http") != 200 or not r.get("ok"):
                 sys.exit(f"✗ warm 失败 health={rh} exec={r}")

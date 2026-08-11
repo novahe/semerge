@@ -10,7 +10,7 @@
 |---|---|
 | `build_bw_coldboot.py` | 一次冷启动顺序产出 B+W 快照（同 guest，变量最少） |
 | `bench.py` | B vs W restore 延迟基准（`--b` / `--w` 条件执行，exec/health 探针） |
-| `openclaw_net.py` | host 经 vswitch floating IP 直连 gateway 的 curl/exec 辅助 |
+| `openclaw_net.py` | gateway 的 curl/exec 辅助：bench 走 node proxy 按 sid 转发（`*_proxy`），build 走 floating IP 直连 |
 | `e2b_env.py` | 解析 `e2b-env.sh` 注入 `os.environ`，让脚本自包含 |
 | `e2b-env.sh` | 环境配置（conductor 地址、API key、TLS 证书、floating IP 段等） |
 | `config/` | conductor 参考 config + TLS 证书 |
@@ -19,7 +19,7 @@
 
 1. conductor :4443 在跑（`node-ctl conductor serve --config config/config-4443.yaml`）
 2. vswitch + cache-ctl + store-ctl 在跑
-3. `e2b-env.sh` 里的路径与本机一致（尤其 `SSL_CERT_FILE`、`E2B_RUN_ROOT`、`E2B_FIP_BASE`）
+3. `e2b-env.sh` 里的路径与本机一致（尤其 `SSL_CERT_FILE`——bench 经 node proxy :4443 走 TLS）
 
 ## 快速开始
 

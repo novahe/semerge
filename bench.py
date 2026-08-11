@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """bench.py — B（无工作集）vs W（工作集快照）冷启动对比（原生 openclaw，不经 envd）。
 
-run 阶段从 host 经 eBPF vswitch tap 直达 gateway（template --bind lan 监听 0.0.0.0:18789）：
-  host → 100.100.96.(port-1) → eBPF NAT → guest eth0 → gateway
+run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 监听 0.0.0.0:18789），
+走生产数据面（贴近实际使用）：
+  host → orchestrator 反向 proxy（:4443，TLS）→ E2b-Sandbox-Id/Port + X-Access-Token
+       → gateway
+  X-Access-Token = POST /sandboxes 响应的 forwardAccessToken（kat1…，SDK 不暴露，故 create
+  走原始 API 抓取）。比 floating-IP 直连多 ~18ms/次（TLS 握手 + proxy 一跳）。
 
 两种探针（--probe）：
   exec   ★ POST /tools/invoke {tool:exec} 在 gateway host 跑命令。首 curl 懒加载 bash-tools
@@ -19,34 +23,28 @@ import argparse, json, os, re, socket, subprocess, sys, time
 
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
-from e2b import Sandbox
 import openclaw_net
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
 
 
 def create(template, tries=4):
-    """Sandbox.create 带重试：orchestrator 偶发 500（被 SDK 吞成 KeyError('code')）。"""
+    """POST /sandboxes 带重试，返回 (sid, forwardAccessToken)。
+    走原始 API 而非 SDK：SDK 不暴露 forwardAccessToken（node proxy 鉴权必需），且能避开
+    SDK 把 orchestrator 偶发 500 吞成 KeyError('code')。"""
     last = None
     for _ in range(tries):
         try:
-            return Sandbox.create(template, timeout=120)
+            r = e2b_env.api_request("POST", "/sandboxes",
+                                    json={"templateID": template, "timeout": 120})
+            if r.status_code == 201:
+                j = r.json()
+                return j["sandboxID"], j["forwardAccessToken"]
+            last = RuntimeError(f"create HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
             last = e
-            time.sleep(1.0)
+        time.sleep(1.0)
     raise last
-
-
-def wait_floating_ip(sid, timeout=15):
-    """floating_ip 从 conductor 启动中写的 per-sandbox YAML(--port=N) 推导，admission 后
-    ~0.25s 才落盘；轮询直到非 None，避免 race 误判 'no floating IP'。"""
-    end = time.time() + timeout
-    while time.time() < end:
-        ip = openclaw_net.floating_ip(sid)
-        if ip:
-            return ip
-        time.sleep(0.25)
-    return None
 
 
 def wait_launch_ms(sid, timeout=60):
@@ -70,12 +68,12 @@ def wait_launch_ms(sid, timeout=60):
     return None
 
 
-def probe(ip, mode):
-    """返回 (ok, total_ms, text)。"""
+def probe(sid, token, mode):
+    """返回 (ok, total_ms, text)。经 node proxy 按 sid 转发到 gateway。"""
     if mode == "exec":
-        r = openclaw_net.curl_exec(ip, "date")
+        r = openclaw_net.curl_exec_proxy(sid, token, "date")
         return r.get("ok") is True, r.get("total", 0) * 1000, r.get("text", "")[:30]
-    r = openclaw_net.curl_gateway(ip)
+    r = openclaw_net.curl_gateway_proxy(sid, token)
     ok = r.get("http") == 200
     return ok, r.get("total", 0) * 1000, ""
 
@@ -83,21 +81,16 @@ def probe(ip, mode):
 def run_rounds(template, n, label, mode):
     res = {k: [] for k in ('create', 'cold', 'warm')}
     for i in range(n):
-        s = None
+        sid = token = None
         try:
-            t0 = time.time()
-            s = create(template)
-            sid = s.sandbox_id
+            sid, token = create(template)
             # create 异步返回（admission）；tc 用 conductor 服务端精确值 launchMs
             # （轮询只为检测其出现，值本身精确、无客户端计时偏差）。
             tc = wait_launch_ms(sid)
             if tc is None:
                 raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-            ip = wait_floating_ip(sid)
-            if not ip:
-                raise RuntimeError(f"no floating IP for {sid}")
-            ok1, c1, t1 = probe(ip, mode)              # cold
-            ok2, c2, t2 = probe(ip, mode)              # warm
+            ok1, c1, t1 = probe(sid, token, mode)      # cold
+            ok2, c2, t2 = probe(sid, token, mode)      # warm
             if ok1:
                 res['create'].append(tc); res['cold'].append(c1)
             if ok2:
@@ -108,8 +101,8 @@ def run_rounds(template, n, label, mode):
         except Exception as e:
             print(f"  [{label} {i+1}] ✗ {type(e).__name__}: {e}")
         finally:
-            if s:
-                try: s.kill()
+            if sid:
+                try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
                 except Exception: pass
     return res
 
@@ -191,8 +184,8 @@ def main():
     if not args.b and not args.w:
         sys.exit("✗ 至少传一个 --b 或 --w")
 
-    hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，host 经 vswitch tap，无 envd）",
-           f"n={args.iterations}  floating-IP base={openclaw_net.FLOATING_IP_BASE}"]
+    hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
+           f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
     if args.b:
         hdr.append(f"B: {args.b[:48]}…")
     if args.w:
