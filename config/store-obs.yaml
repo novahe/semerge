@@ -1,0 +1,13 @@
+# store-obs.yaml — store-ctl（OBS backend，华为云 cn-north-4）实际运行配置。
+# 固化自 /root/sandbox-yyl/yyl/store-obs-cn-north-4.yaml（运行中：accelerator store-ctl serve，
+# cwd /root/sandbox-yyl，监听 /var/yyl/store-obs.sock）。
+# 本 bench 的 manifest-obs.yaml 的 store endpoint 即指向 /var/yyl/store-obs.sock。
+# NOTE: access_key/secret_key 暂不写入，使用前需补（见线下 /root/sandbox-yyl/yyl/store-obs-cn-north-4.yaml）。
+listen: /var/yyl/store-obs.sock
+backend: obs
+obs:
+  bucket: test-yzh-675900
+  endpoint: https://obs.cn-north-4.myhuaweicloud.com
+  access_key: ""      # 使用前填写
+  secret_key: ""      # 使用前填写
+  insecure: true

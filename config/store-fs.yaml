@@ -1,0 +1,8 @@
+# store-fs.yaml — store-ctl（filesystem backend）实际运行配置。
+# 固化自 /root/sandbox-yyl/yyl/store-fs.yaml（运行中：accelerator store-ctl serve，
+# cwd /root/sandbox-yyl，监听 /var/yyl/store-fs.sock）。
+listen: /var/yyl/store-fs.sock
+backend: fs
+cache_listen: /var/yyl/cache.sock
+fs:
+  root: /mnt/sfs_turbo/test-obs-yyl

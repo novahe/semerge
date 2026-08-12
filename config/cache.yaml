@@ -1,0 +1,33 @@
+# cache.yaml — cache-ctl（tiered：L1 内嵌 RocksDB + origin 回源 store-obs）实际运行配置。
+# 固化自 /root/sandbox-yyl/yyl/cache-tiered-mine-obs.yaml（运行中：accelerator cache-ctl serve，
+# cwd /root/sandbox-yyl，监听 /var/yyl/cache-tiered-mine-obs.sock）。
+# 本 bench 的 manifest-obs.yaml 的 cache endpoint 即指向 /var/yyl/cache-tiered-mine-obs.sock，
+# origin 回源到 /var/yyl/store-obs.sock（store-obs）。
+mode: tiered
+listen: /var/yyl/cache-tiered-mine-obs.sock
+health_listen: 0.0.0.0:7075
+rpc_timeout: 2s
+
+freq:
+  counters: 8M
+  reset_after: 1M
+  reset_interval: 1h
+  persist_interval: 5m
+
+# tiers 数组的顺序即 tier chain 的查找顺序。最多一个 embedded。
+tiers:
+  - type: embedded             # 进程内嵌 RocksDB (L1) — 我专用，独立路径
+    rocks:
+      path: /var/yyl/cache/accel-l1-mine-obs
+      disk_bytes: 10GiB
+      mem_ratio: 0.1
+      direct_reads: false
+      bloom_bits: 15
+
+origin:
+  type: store                  # origin 回源 store-obs（只读）
+  store:
+    endpoint: /var/yyl/store-obs.sock   # store-ctl gRPC endpoint
+    pool: 4                    # 独立 grpc.ClientConn 数(round-robin)
+    timeout: 2s
+  max_inflight: 16             # 到 origin 的最大并发 RPC 数
