@@ -759,7 +759,7 @@ proxy: { mode: external, auth: enforce, park_timeout: 30s, metrics_listen: 127.0
 mmds:
   enabled: true
   listen: 127.0.0.1:$MMDS_PORT
-  routes: { enabled: true, max_routes_per_sandbox: 32, reserved_path_prefixes: [/latest/api/, /internal/, /] }
+  routes: { enabled: true, max_routes_per_sandbox: 8, reserved_path_prefixes: [/latest/api/, /internal/, /] }
 encryption_key: "$enc_key"
 manifest_config: $MANIFEST_CONFIG
 paths: { run_root: $RUNROOT, base_root: $BASEROOT, config_socket: $CFG_SOCKET }
@@ -799,7 +799,7 @@ data_listen: "$PROXY_LISTEN"
 proxy_socket: $PROXY_SOCK
 shm_path: $PROXY_SHM
 route_capacity: 65536
-workers: 2
+workers: 4
 tls: { cert: $cert, key: $key }
 auth: enforce
 park_timeout: 30s

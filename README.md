@@ -149,46 +149,35 @@ python3 build_bw_code_interpreter.py
 每轮流程：
 
 ~~~text
-create → launchMs → 第一次 probe → 第二次 probe → delete
+create → 立即第一次 probe → 读取 launchMs → 第二次 probe → delete
 ~~~
 
 - create(launchMs)：conductor 服务端 acceptedAt → launch terminal 的耗时，不是客户端 HTTP create wall time。
 - 非 e2b 场景：包含 runtime readiness、用户进程 app_started 确认和状态提交。
 - e2b 场景：在上述基础上还包含 envd /init 初始化。
-- e2e1：从客户端发起 create 到第一次 probe 返回的端到端耗时。
+- e2e1：从客户端发起 create，到 create 返回后立即执行的第一次 probe 返回的端到端耗时；
+  中间不插入 `wait_launch_ms` 轮询。
 - run1/cold = e2e1 - create(launchMs)。
 - run2/warm：只统计第二次 probe 本身。
 - p50：严格中位数；偶数样本取两个中间值的平均，输出保留 1 位小数。
 
 ## code-interpreter + e2b 基线
 
-2026-08-12，当前 B/W template，commands.run("date")，3 组 × 10 轮；B/W 共
-60 次命令全部成功并返回 date stdout。原始日志保留在：
+2026-08-13（Asia/Shanghai），nova 环境，当前 B/W template，
+commands.run("date")，B/W 各 30 轮；所有成功样本均返回 date stdout。
+统计口径是 create 后立即执行首个 probe，未在 e2e1 前插入 `wait_launch_ms` 轮询。
 
-~~~text
-/tmp/ws-bench-code-interpreter-date-baseline-group2.log
-/tmp/ws-bench-code-interpreter-date-baseline-group3.log
-~~~
-
-每组结果：
-
-| 组 | B run1 cold | W run1 cold | 提速 |
-|---:|---:|---:|---:|
-| 1 | 726ms | 43ms | 16.95× |
-| 2 | 641ms | 37ms | 17.15× |
-| 3 | 714ms | 35ms | 20.21× |
-
-合并 30 轮的严格统计：
+30 轮严格统计：
 
 | 指标 | B | W |
 |---|---:|---:|
-| create(launchMs) | avg 188.7ms，p50 190.5ms，min 87，max 404 | avg 144.7ms，p50 129.5ms，min 87，max 276 |
-| run1 e2e | avg 882.4ms，p50 826.5ms，min 585，max 1873 | avg 183.2ms，p50 167.5ms，min 125，max 348 |
-| run1 cold | avg 693.9ms，p50 647.5ms，min 456，max 1470 | avg 38.5ms，p50 38.0ms，min 29，max 73 |
-| run2 warm | avg 8.1ms，p50 8.0ms，min 7，max 9 | avg 8.2ms，p50 8.0ms，min 7，max 10 |
+| create(launchMs) | avg 168ms，p50 122.4ms，min 91，max 277 | avg 145ms，p50 131.2ms，min 94，max 211 |
+| run1 e2e | avg 860ms，p50 949.2ms，min 564，max 1122 | avg 172ms，p50 158.9ms，min 123，max 237 |
+| run1 cold | avg 692ms，p50 783.9ms，min 433，max 924 | avg 27ms，p50 26.6ms，min 25，max 31 |
+| run2 warm | avg 9ms，p50 8.4ms，min 8，max 10 | avg 8ms，p50 8.1ms，min 7，max 9 |
 
-结论：run1 cold 平均提速 18.02×（693.9ms → 38.5ms），create 差异为
-+44.0ms（B-W）。上述数据已根据两份原始日志和第 1 组终端逐轮数据复算。
+结论：run1 cold 平均提速 25.56×（692ms → 27ms），create 差异为
++23ms（B-W）。
 
 ## 配置参数
 

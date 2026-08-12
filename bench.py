@@ -16,13 +16,14 @@ run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 
   run      e2b SDK Sandbox.commands.run()，命令在 guest 的 envd 中执行；适用于
            e2bdev/code-interpreter 一类镜像，W 会预热 envd 命令执行工作集。
 
-每轮：create → launchMs → 第一次 node-proxy probe → 第二次 probe → kill。
+每轮：create → 立即第一次 probe → 读取 launchMs → 第二次 probe → kill。
 - B = `*-bare-snp-template.id`（drop-caches=true，无预热）
 - W = `*-e2b-ws-template.id` 或 `*-bare-ws-template.id`（drop-caches=false + 预热）
 
 计时：create(launchMs) 保留 conductor 的服务端启动耗时；e2e1 是从发起 create
-到第一次 node-proxy probe 完成的客户端端到端耗时；run1(cold) = e2e1 - create(launchMs)。
-run2(warm) 仍只统计第二次 probe 本身。e2b `run` probe 的 SDK 目标由
+到 create 返回后立即执行的第一次 probe 完成的客户端端到端耗时，期间不插入
+launchMs 轮询；run1(cold) = e2e1 - create(launchMs)。run2(warm) 仍只统计第二次
+probe 本身。e2b `run` probe 的 SDK 目标由
 E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
@@ -31,6 +32,7 @@ import argparse, json, os, re, socket, subprocess, sys, time
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
 import openclaw_net
+from e2b import Sandbox  # run 探针用 SDK sandbox 认证；exec/health 用 forwardAccessToken 走 node proxy
 
 DEFAULT_RUN_COMMAND = "date"
 
@@ -111,18 +113,15 @@ def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
         try:
             e2e_start = time.perf_counter()
             sid, token = create(template)
-            # create 异步返回（admission）；tc 用 conductor 服务端精确值 launchMs
-            # （轮询只为检测其出现，值本身精确、无客户端计时偏差）。
-            tc = wait_launch_ms(sid)
-            if tc is None:
-                raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
             if mode == "run":
-                from e2b import Sandbox
-                # run 使用 SDK 自己的 sandbox 认证；create 返回的 forwardAccessToken
-                # 只给 exec/health 的原始 node-proxy curl 使用。
                 sandbox = Sandbox.connect(sid, timeout=120)
             ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
             e2e1 = (time.perf_counter() - e2e_start) * 1000
+            # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
+            # 避免轮询 wait_launch_ms 污染端到端耗时。
+            tc = wait_launch_ms(sid)
+            if tc is None:
+                raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
             run1 = e2e1 - tc
             ok2, c2, _ = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
             if ok1:
@@ -159,6 +158,20 @@ def stats(xs):
     mid = n // 2
     p50 = xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
     return f"avg={sum(xs)/n:.0f}ms p50={p50:.1f}ms min={min(xs):.0f}ms max={max(xs):.0f}ms (n={n})"
+
+
+SUMMARY_STAT_WIDTH = 50
+
+
+def stats_fixed(xs):
+    """返回用于汇总表的定宽统计摘要。"""
+    if not xs:
+        return "(无样本)"
+    xs = sorted(xs); n = len(xs)
+    mid = n // 2
+    p50 = xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
+    return (f"avg={sum(xs)/n:4.0f}ms p50={p50:6.1f}ms "
+            f"min={min(xs):4.0f}ms max={max(xs):4.0f}ms n={n:2d}")
 
 
 def docker_curl(mode, port=18790):
@@ -265,12 +278,11 @@ def main():
 
     print("\n=== 汇总 ===")
     def col(label, key):
-        parts = []
-        if B:
-            parts.append(f"B {stats(B[key])}")
-        if W:
-            parts.append(f"W {stats(W[key])}")
-        print(f"  {label:<16} " + " | ".join(parts))
+        b = stats_fixed(B[key]) if B else "(无样本)"
+        w = stats_fixed(W[key]) if W else "(无样本)"
+        print(f"  {label:<18} {b:<{SUMMARY_STAT_WIDTH}} | {w}")
+    print(f"  {'指标':<18} {'B':<{SUMMARY_STAT_WIDTH}} | W")
+    print(f"  {'-' * 18} {'-' * SUMMARY_STAT_WIDTH} | {'-' * SUMMARY_STAT_WIDTH}")
     col("create(launchMs)", "create")
     col(f"{args.probe}1 e2e", "e2e")
     col(f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""), "cold")
