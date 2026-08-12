@@ -127,6 +127,7 @@ METRICS_PORT=39095 \
 | switch/MGMT MAC | 按 NS 的 SHA-256 派生，并检查 switch MAC 和 connector 派生 MAC |
 | Unix socket | 位于该 NS 的 work/run 目录 |
 | systemd unit | `*-<NS>*` |
+| Cloud Hypervisor CPU model | runner/builder 的 systemd drop-in，默认 `auto` |
 | 配置、状态、日志、快照目录 | 位于 `<NS>-work` 或 `<NS>-snaps` |
 
 脚本使用宿主机级全局锁 `/run/kuasar/deploy-ns.lock` 串行化变更，并额外
@@ -159,7 +160,24 @@ VSWITCH_PORTS=128 ./deploy-ns.sh up nova /root/sandbox/orchestrator/bin/x86_64
 
 常用环境变量还包括 `WORKDIR`、`DOMAIN`、`MAC`、`FIP_BASE`、`UNIT_DIR`、
 `RUNNER_POOL_SIZE`、`BUILDER_POOL_SIZE`、`AUTO_CREATE_TEMPLATES` 和
-`DEPLOY_GLOBAL_LOCKFILE`。
+`DEPLOY_GLOBAL_LOCKFILE`。脚本默认通过以下 NS 独立的 systemd drop-in 把
+Cloud Hypervisor CPU model 传给 runner/builder：
+
+```text
+/run/systemd/system/sandbox-runner-<NS>@.service.d/10-cloud-hypervisor.conf
+/run/systemd/system/sandbox-builder-<NS>@.service.d/10-cloud-hypervisor.conf
+```
+
+默认内容为：
+
+```ini
+[Service]
+Environment="CLOUD_HYPERVISOR_CPUS_MODEL=auto"
+```
+
+如需覆盖，可在 `up` 或 `replace` 前设置
+`CLOUD_HYPERVISOR_CPUS_MODEL`；脚本会校验值并重新生成该 NS 的 drop-in。
+`prepare` 时同样会把 drop-in 写入 `<NS>-work/systemd/`。
 
 ## 冒烟测试
 

@@ -22,6 +22,7 @@
 #
 # 可用环境变量覆盖（换环境时设这些即可）：
 #   WORKDIR API_PORT PROXY_PORT MMDS_PORT METRICS_PORT MAC DOMAIN MANIFEST_CONFIG MANIFEST_KEY FIP_BASE UNIT_DIR
+#   CLOUD_HYPERVISOR_CPUS_MODEL
 #   NFS_ROOT NFS_DIR NFS_SNAPSHOT_DIR REMOTE_SNAPSHOT_PARENT AUTO_CREATE_TEMPLATES VSWITCH_PORTS
 #
 # 存储分工：NFS_DIR/REMOTE_SNAPSHOT_PARENT 只用于 snapshot；MANIFEST_CONFIG 独立指向
@@ -53,6 +54,7 @@ API_PORT_USER_SET=0; [ -n "${API_PORT+x}" ] && API_PORT_USER_SET=1
 PROXY_PORT_USER_SET=0; [ -n "${PROXY_PORT+x}" ] && PROXY_PORT_USER_SET=1
 MMDS_PORT_USER_SET=0; [ -n "${MMDS_PORT+x}" ] && MMDS_PORT_USER_SET=1
 METRICS_PORT_USER_SET=0; [ -n "${METRICS_PORT+x}" ] && METRICS_PORT_USER_SET=1
+CH_CPU_MODEL_USER_SET=0; [ -n "${CLOUD_HYPERVISOR_CPUS_MODEL+x}" ] && CH_CPU_MODEL_USER_SET=1
 PROXY_LISTEN_USER_SET=0; [ -n "${PROXY_LISTEN+x}" ] && PROXY_LISTEN_USER_SET=1
 VSWITCH_PORTS_USER_SET=0; [ -n "${VSWITCH_PORTS+x}" ] && VSWITCH_PORTS_USER_SET=1
 FIP_USER_SET=0
@@ -175,6 +177,12 @@ else
   UNIT_DIR=/run/systemd/system
 fi
 UNIT_MIRROR_DIR="${UNIT_MIRROR_DIR:-${WORKDIR:+$WORKDIR/systemd}}"
+CLOUD_HYPERVISOR_CPUS_MODEL="${CLOUD_HYPERVISOR_CPUS_MODEL:-auto}"
+case "$CLOUD_HYPERVISOR_CPUS_MODEL" in
+  ''|*[!A-Za-z0-9_.:-]*) die "CLOUD_HYPERVISOR_CPUS_MODEL 含有不安全字符：$CLOUD_HYPERVISOR_CPUS_MODEL" ;;
+esac
+RUNNER_DROPIN_DIR="$UNIT_DIR/${RUNNER_TEMPLATE}.d"
+BUILDER_DROPIN_DIR="$UNIT_DIR/${BUILDER_TEMPLATE}.d"
 NFS_ROOT="${NFS_ROOT:-/mnt/sfs_turbo}"
 NFS_DIR="${NFS_DIR:-${NFS_SNAPSHOT_DIR:-${NFS_ROOT}/${NS}-snaps}}"
 NFS_DIR="$(readlink -m -- "$NFS_DIR")"
@@ -198,7 +206,7 @@ elif [ -n "$WORKDIR" ]; then
 else
   BUILDER_DIFF_TEMPLATE=/opt/sandbox/overlay-templates/builder-24G.ext4
 fi
-RUNNER_POOL_SIZE="${RUNNER_POOL_SIZE:-0}"
+RUNNER_POOL_SIZE="${RUNNER_POOL_SIZE:-100}"
 BUILDER_POOL_SIZE="${BUILDER_POOL_SIZE:-0}"
 AUTO_CREATE_TEMPLATES="${AUTO_CREATE_TEMPLATES:-1}"
 
@@ -260,6 +268,10 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
   if [ "$MAC_USER_SET" -eq 0 ]; then
     [ -n "$(read_state mac)" ] && MAC="$(read_state mac)"
   fi
+  if [ "$CH_CPU_MODEL_USER_SET" -eq 0 ]; then
+    [ -n "$(read_state cloud_hypervisor_cpus_model)" ] && \
+      CLOUD_HYPERVISOR_CPUS_MODEL="$(read_state cloud_hypervisor_cpus_model)"
+  fi
   if [ "$CMD" = status ] || [ "$CMD" = down ] || [ "$FIP_USER_SET" -eq 0 ]; then
     saved_fip="$(read_state fip_base)"
     if [ -n "$saved_fip" ]; then
@@ -288,6 +300,10 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
 fi
 
 validate_ports
+
+case "$CLOUD_HYPERVISOR_CPUS_MODEL" in
+  ''|*[!A-Za-z0-9_.:-]*) die "CLOUD_HYPERVISOR_CPUS_MODEL 含有不安全字符：$CLOUD_HYPERVISOR_CPUS_MODEL" ;;
+esac
 
 NODE_CTL="$(readlink -f "$BINS/node-ctl" 2>/dev/null || true)"
 CONNECTOR="$(readlink -f "$BINS/connector-ctl" 2>/dev/null || true)"
@@ -833,9 +849,24 @@ RestartSec=1
 KillMode=control-group
 UNIT
   chmod 644 "$UNIT_DIR/$NETNS_UNIT" "$UNIT_DIR/$VS_UNIT" "$UNIT_DIR/$NODE_UNIT" "$UNIT_DIR/$PROXY_UNIT"
+  mkdir -p "$RUNNER_DROPIN_DIR" "$BUILDER_DROPIN_DIR"
+  cat > "$RUNNER_DROPIN_DIR/10-cloud-hypervisor.conf" <<UNIT
+[Service]
+# Passed through node-ctl run-sandbox to the Cloud Hypervisor process.
+Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+UNIT
+  cat > "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf" <<UNIT
+[Service]
+# Keep builder-launched Cloud Hypervisor processes on the same default CPU model.
+Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+UNIT
+  chmod 644 "$RUNNER_DROPIN_DIR/10-cloud-hypervisor.conf" "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf"
   if [ -n "$UNIT_MIRROR_DIR" ] && [ "$UNIT_MIRROR_DIR" != "$UNIT_DIR" ]; then
     mkdir -p "$UNIT_MIRROR_DIR"
     cp "$UNIT_DIR/$NETNS_UNIT" "$UNIT_DIR/$VS_UNIT" "$UNIT_DIR/$NODE_UNIT" "$UNIT_DIR/$PROXY_UNIT" "$UNIT_MIRROR_DIR/"
+    mkdir -p "$UNIT_MIRROR_DIR/${RUNNER_TEMPLATE}.d" "$UNIT_MIRROR_DIR/${BUILDER_TEMPLATE}.d"
+    cp "$RUNNER_DROPIN_DIR/10-cloud-hypervisor.conf" "$UNIT_MIRROR_DIR/${RUNNER_TEMPLATE}.d/"
+    cp "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf" "$UNIT_MIRROR_DIR/${BUILDER_TEMPLATE}.d/"
   fi
   [ "$CMD" = prepare ] || systemctl daemon-reload
 }
@@ -1144,6 +1175,13 @@ stop_environment() {
   if [ "$remove_units" = 1 ]; then
     rm -f "$UNIT_DIR/$NETNS_UNIT" "$UNIT_DIR/$VS_UNIT" "$UNIT_DIR/$NODE_UNIT" "$UNIT_DIR/$PROXY_UNIT" \
       "$UNIT_DIR/$RUNNER_TEMPLATE" "$UNIT_DIR/$BUILDER_TEMPLATE"
+    rm -f "$RUNNER_DROPIN_DIR/10-cloud-hypervisor.conf" "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf"
+    rmdir "$RUNNER_DROPIN_DIR" "$BUILDER_DROPIN_DIR" 2>/dev/null || true
+    if [ -n "$UNIT_MIRROR_DIR" ] && [ "$UNIT_MIRROR_DIR" != "$UNIT_DIR" ]; then
+      rm -f "$UNIT_MIRROR_DIR/${RUNNER_TEMPLATE}.d/10-cloud-hypervisor.conf" \
+        "$UNIT_MIRROR_DIR/${BUILDER_TEMPLATE}.d/10-cloud-hypervisor.conf"
+      rmdir "$UNIT_MIRROR_DIR/${RUNNER_TEMPLATE}.d" "$UNIT_MIRROR_DIR/${BUILDER_TEMPLATE}.d" 2>/dev/null || true
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f "$PIDFILE" "$STATEFILE"
@@ -1221,6 +1259,7 @@ do_up() {
   state_set bins "$BINS"
   state_set fip_base "$FIP_BASE"
   state_set mac "$MAC"
+  state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set manifest_config "$MANIFEST_CONFIG"
   state_set nfs_dir "$NFS_DIR"
@@ -1288,6 +1327,7 @@ ENV
   echo "  ports    mmds=:$MMDS_PORT metrics=:$METRICS/$PROXY_METRICS"
   echo "  network  vswitch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
   echo "  units    $NETNS_UNIT $VS_UNIT $NODE_UNIT $PROXY_UNIT"
+  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
   echo "  cfg      $CFGDIR/{conductor,proxy}.yaml"
   echo "  manifest $MANIFEST_CONFIG (yyl store/cache)"
   echo "  snapshots $NFS_DIR (remote=$REMOTE_SNAPSHOT_PARENT)"
@@ -1314,6 +1354,7 @@ do_prepare() {
   state_set bins "$BINS"
   state_set fip_base "$FIP_BASE"
   state_set mac "$MAC"
+  state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set manifest_config "$MANIFEST_CONFIG"
   state_set nfs_dir "$NFS_DIR"
@@ -1330,6 +1371,7 @@ do_prepare() {
   echo "  bins     $BINS"
   echo "  config   $CFGDIR/{conductor,proxy}.yaml"
   echo "  units    $UNIT_DIR"
+  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
   echo "  manifest $MANIFEST_CONFIG (yyl store/cache)"
   echo "  snapshots $NFS_DIR (remote=$REMOTE_SNAPSHOT_PARENT)"
   echo "  network  vswitch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
@@ -1356,7 +1398,7 @@ do_down() {
 # ════════════════════════════════════════════════════════════════════════════
 do_status() {
   [ "$CMD" = status ] || return 0
-  echo "NS=$NS switch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC"
+  echo "NS=$NS switch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC ch_cpu_model=$CLOUD_HYPERVISOR_CPUS_MODEL"
   for unit in "$NETNS_UNIT" "$VS_UNIT" "$NODE_UNIT" "$PROXY_UNIT"; do
     if command -v systemctl >/dev/null 2>&1 && unit_active "$unit"; then echo "  ${c_grn}✓${c_off} unit $unit active"; else echo "  ${c_red}✗${c_off} unit $unit inactive"; fi
   done
