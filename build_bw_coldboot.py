@@ -13,14 +13,14 @@
   - 层结构（实测）：B 无父层 → 1-layer。W 从 B 恢复而来且 pause 传 merge_ref=false
     （不 flatten 父层）→ W 链式引用 B，restore 为 2 memory layers。本 build 上
     2-layer restore 工作正常（uffd64 老 bug 未触发，bench 120+ 次零失败）；
-    若需要独立 1-layer W，改传 merge_ref=true 且 B export 用 keepSource=true
-    （flatten 要求父层是 local ref）。
+    若需要独立 1-layer W，需要使用服务端支持的 flatten/export 流程；toTemplate 导出
+    不读取导出后的源保留参数，源 sandbox 由本脚本最后的 DELETE 清理。
   - PROFILE=bare（无 envd）：gateway 由 create 时的 kuasar-sandbox.launch metadata 注入
     （标准用法，launch spec 同 make_bare_snapshot.py）。
 
 用法：
   PROFILE=bare python3 build_bw_coldboot.py
-  bench: python3 bench.py --b "$(cat bare-snp-template.id)" --w "$(cat ws-template-bare.id)" --probe exec
+  bench: python3 bench.py --b "$(cat openclaw-bare-snp-template.id)" --w "$(cat openclaw-bare-ws-template.id)" --probe health
 """
 import base64, json, os, sys, time
 
@@ -32,15 +32,22 @@ import openclaw_net
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
 KEY = os.environ.get("MANIFEST_KEY", "65c3599e5f52264c63549b5069cf313065a6255fad1c9190d5b55a3c809bfa3f")
-OUT_B = os.environ.get("OUT_B", os.path.join(PARENT, "bare-snp-template.id"))   # bench_bare.py 的默认模板文件
-OUT_W = os.environ.get("OUT_W", os.path.join(PARENT, "ws-template-bare.id"))
+PROFILE = os.environ.get("PROFILE", "e2b").strip().lower()  # e2b | bare
+IMAGE_NAME = os.environ.get("IMAGE_NAME", "openclaw").strip()
+if PROFILE == "bare":
+    DEFAULT_OUT_B = f"{IMAGE_NAME}-bare-snp-template.id"
+    DEFAULT_OUT_W = f"{IMAGE_NAME}-bare-ws-template.id"
+else:
+    DEFAULT_OUT_B = f"{IMAGE_NAME}-e2b-bare-snp-template.id"
+    DEFAULT_OUT_W = f"{IMAGE_NAME}-e2b-ws-template.id"
+OUT_B = os.environ.get("OUT_B", os.path.join(PARENT, DEFAULT_OUT_B))
+OUT_W = os.environ.get("OUT_W", os.path.join(PARENT, DEFAULT_OUT_W))
 SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "600"))  # 两段式流程长，放宽空闲回收
 READY_WAIT = int(os.environ.get("READY_WAIT", "120"))
 WARM_CURLS = int(os.environ.get("WARM_CURLS", "4"))
 WARM_HEALTH = os.environ.get("WARM_HEALTH", "1").lower() not in ("0", "false", "no")
 QUIESCE_SECONDS = float(os.environ.get("QUIESCE_SECONDS", "0"))
 READY_SETTLE = float(os.environ.get("READY_SETTLE", "2"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
-PROFILE = os.environ.get("PROFILE", "e2b").strip().lower()  # e2b | bare
 DATAPLANE_PORTS = ("49983", "49999")
 
 GW_CMD = ("cd /app && setsid sh -c 'exec openclaw gateway --allow-unconfigured "
@@ -70,7 +77,7 @@ def del_hosts(sid, domain):
 
 def export_sandbox(sid):
     r = e2b_env.api_request("POST", f"/sandboxes/{sid}/export",
-                            json={"toTemplate": True, "keepSource": False}, timeout=180)
+                            json={"toTemplate": True}, timeout=180)
     if r.status_code != 200:
         sys.exit(f"✗ export HTTP {r.status_code}: {r.text[:300]}")
     return r.json().get("result", "")
@@ -162,7 +169,7 @@ def main():
         open(OUT_B, "w").write(b + "\n")
         print(f"  ✓ wrote {OUT_B}")
 
-        # ③ connect 恢复（gateway 随内存回来；export keepSource=false 只重指 SnapshotRef）
+        # ③ connect 恢复（gateway 随内存回来；toTemplate export 不会删除源 sandbox）
         print("[3/5] connect 恢复 …")
         t0 = time.time()
         connect_sandbox(sid)
@@ -199,7 +206,7 @@ def main():
         print("\n=== done ===")
         print(f"B（冷）:     {OUT_B}")
         print(f"W（工作集）: {OUT_W}")
-        print(f"bench: python3 bench.py --b \"$(cat {OUT_B})\" --w \"$(cat {OUT_W})\" --probe exec")
+        print(f"bench: python3 bench.py --b \"$(cat {OUT_B})\" --w \"$(cat {OUT_W})\" --probe health")
     finally:
         if sid is not None:
             e2b_env.api_request("DELETE", f"/sandboxes/{sid}")   # kill 就是它的封装

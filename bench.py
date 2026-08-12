@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench.py — B（无工作集）vs W（工作集快照）冷启动对比（原生 openclaw，不经 envd）。
+"""bench.py — B（无工作集）vs W（工作集快照）冷启动对比。
 
 run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 监听 0.0.0.0:18789），
 走生产数据面（贴近实际使用）：
@@ -13,10 +13,17 @@ run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 
          运行时（重模块）+ spawn，是 working-set 的理想负载——W（drop-caches=false + 预热）应明显快于 B。
          需 patched openclaw image（HTTP exec 已开，见 README「exec 补丁」）。
   health   GET /health（27B，轻）。只碰 gateway 核心，B/W 差异很小，作 baseline。
+  run      e2b SDK Sandbox.commands.run()，命令在 guest 的 envd 中执行；适用于
+           e2bdev/code-interpreter 一类镜像，W 会预热 envd 命令执行工作集。
 
-每轮：create（restore wall）→ 探针 cold → 探针 warm → kill。
-- B = ./paused-template.id（drop-caches=true，无预热）
-- W = ws-template.id（drop-caches=false + 预热；build-ws-template.py 产出）
+每轮：create → launchMs → 第一次 node-proxy probe → 第二次 probe → kill。
+- B = `*-bare-snp-template.id`（drop-caches=true，无预热）
+- W = `*-e2b-ws-template.id` 或 `*-bare-ws-template.id`（drop-caches=false + 预热）
+
+计时：create(launchMs) 保留 conductor 的服务端启动耗时；e2e1 是从发起 create
+到第一次 node-proxy probe 完成的客户端端到端耗时；run1(cold) = e2e1 - create(launchMs)。
+run2(warm) 仍只统计第二次 probe 本身。e2b `run` probe 的 SDK 目标由
+E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
 import argparse, json, os, re, socket, subprocess, sys, time
@@ -24,6 +31,8 @@ import argparse, json, os, re, socket, subprocess, sys, time
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
 import openclaw_net
+
+DEFAULT_RUN_COMMAND = "date"
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
 
@@ -68,8 +77,23 @@ def wait_launch_ms(sid, timeout=60):
     return None
 
 
-def probe(sid, token, mode):
-    """返回 (ok, total_ms, text)。经 node proxy 按 sid 转发到 gateway。"""
+def run_command_probe(sandbox, command, user="root", cwd="/", timeout=30):
+    """通过 SDK/envd 执行 guest 命令，返回 (ok, total_ms, text)。"""
+    t0 = time.time()
+    result = sandbox.commands.run(command, user=user, cwd=cwd, timeout=timeout)
+    total_ms = (time.time() - t0) * 1000
+    text = (getattr(result, "stdout", "") or getattr(result, "stderr", "") or "")
+    ok = getattr(result, "exit_code", 1) == 0
+    return ok, total_ms, text[:80].replace("\n", " ")
+
+
+def probe(sid, token, mode, sandbox, command=DEFAULT_RUN_COMMAND,
+          user="root", cwd="/", timeout=30):
+    """返回 (ok, total_ms, text)。支持 node proxy 或 SDK/envd。"""
+    if mode == "run":
+        if sandbox is None:
+            raise RuntimeError("run probe 缺少已连接的 Sandbox")
+        return run_command_probe(sandbox, command, user, cwd, timeout)
     if mode == "exec":
         r = openclaw_net.curl_exec_proxy(sid, token, "date")
         return r.get("ok") is True, r.get("total", 0) * 1000, r.get("text", "")[:30]
@@ -78,40 +102,63 @@ def probe(sid, token, mode):
     return ok, r.get("total", 0) * 1000, ""
 
 
-def run_rounds(template, n, label, mode):
-    res = {k: [] for k in ('create', 'cold', 'warm')}
+def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
+               run_user="root", run_cwd="/", run_timeout=30):
+    res = {k: [] for k in ('create', 'e2e', 'cold', 'warm')}
     for i in range(n):
         sid = token = None
+        sandbox = None
         try:
+            e2e_start = time.perf_counter()
             sid, token = create(template)
             # create 异步返回（admission）；tc 用 conductor 服务端精确值 launchMs
             # （轮询只为检测其出现，值本身精确、无客户端计时偏差）。
             tc = wait_launch_ms(sid)
             if tc is None:
                 raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-            ok1, c1, t1 = probe(sid, token, mode)      # cold
-            ok2, c2, t2 = probe(sid, token, mode)      # warm
+            if mode == "run":
+                from e2b import Sandbox
+                # run 使用 SDK 自己的 sandbox 认证；create 返回的 forwardAccessToken
+                # 只给 exec/health 的原始 node-proxy curl 使用。
+                sandbox = Sandbox.connect(sid, timeout=120)
+            ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
+            e2e1 = (time.perf_counter() - e2e_start) * 1000
+            run1 = e2e1 - tc
+            ok2, c2, _ = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
             if ok1:
-                res['create'].append(tc); res['cold'].append(c1)
+                res['create'].append(tc); res['e2e'].append(e2e1); res['cold'].append(run1)
             if ok2:
                 res['warm'].append(c2)
-            print(f"  [{label} {i+1}/{n}] sid={sid[:8]}.. create {tc:5.0f}  "
-                  f"{mode}1(cold)={c1:5.0f}  {mode}2(warm)={c2:4.0f}  "
+            print(f"  [{label} {i+1}/{n}] sid={sid[:8]}.. create(launchMs) {tc:5.0f}  "
+                  f"e2e1={e2e1:5.0f}  {mode}1(e2e-create)={run1:5.0f}  "
+                  f"{mode}2(warm)={c2:4.0f}  "
                   + ('✓ ' + t1[:24] if ok1 else f"✗ {t1}"))
         except Exception as e:
             print(f"  [{label} {i+1}] ✗ {type(e).__name__}: {e}")
         finally:
-            if sid:
+            if sandbox is not None:
+                # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口，
+                # 同时避免只 DELETE sid 而遗留本轮 Sandbox 对象的连接状态。
+                try:
+                    sandbox.kill()
+                except Exception:
+                    try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
+                    except Exception: pass
+                sandbox = None
+            elif sid:
                 try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
                 except Exception: pass
     return res
 
 
 def stats(xs):
+    """返回统计摘要；p50 对偶数样本取两个中间值的平均。"""
     if not xs:
         return "(无样本)"
     xs = sorted(xs); n = len(xs)
-    return f"avg={sum(xs)/n:.0f}ms p50={xs[n//2]:.0f}ms min={min(xs):.0f}ms max={max(xs):.0f}ms (n={n})"
+    mid = n // 2
+    p50 = xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
+    return f"avg={sum(xs)/n:.0f}ms p50={p50:.1f}ms min={min(xs):.0f}ms max={max(xs):.0f}ms (n={n})"
 
 
 def docker_curl(mode, port=18790):
@@ -170,22 +217,36 @@ def run_docker_probe(mode, container="ws-docker-debug", port=18790):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="B vs W 冷启动对比（原生 openclaw，host 经 tap 直 curl/exec）")
+    ap = argparse.ArgumentParser(description="B vs W 冷启动对比（openclaw proxy 或 envd commands.run）")
     ap.add_argument("-n", "--iterations", type=int, default=10)
     ap.add_argument("--b", default=None,
                     help="B template（传入才跑 B；默认不跑）")
     ap.add_argument("--w", default=None,
                     help="W template（传入才跑 W；默认不跑）")
-    ap.add_argument("--probe", choices=("exec", "health"), default="exec",
-                    help="探针：exec（/tools/invoke，重，需 patched image）或 health（/health，轻 baseline）")
+    ap.add_argument("--probe", choices=("exec", "health", "run"), default="exec",
+                    help="探针：exec/health 走 node proxy；run 走 SDK Sandbox.commands.run/envd")
+    ap.add_argument("--command", default=DEFAULT_RUN_COMMAND,
+                    help="--probe run 时在 guest 中执行的命令（默认 date）")
+    ap.add_argument("--run-user", default="root",
+                    help="--probe run 的 guest 用户（code-interpreter manifest 默认 root）")
+    ap.add_argument("--run-cwd", default="/",
+                    help="--probe run 的 guest 工作目录（code-interpreter manifest 默认 /）")
+    ap.add_argument("--run-timeout", type=int, default=30,
+                    help="--probe run 的单次 commands.run 超时秒数")
     ap.add_argument("--docker", action="store_true",
                     help="额外重启 ws-docker-debug 并执行 Docker cold/warm 对照")
     args = ap.parse_args()
     if not args.b and not args.w:
         sys.exit("✗ 至少传一个 --b 或 --w")
+    if args.docker and args.probe == "run":
+        sys.exit("✗ --docker 仅支持 exec/health 探针")
 
-    hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
-           f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
+    if args.probe == "run":
+        hdr = [f"# working-set 对比（e2b envd，probe=commands.run）",
+               f"n={args.iterations}  command={args.command}  user={args.run_user} cwd={args.run_cwd}"]
+    else:
+        hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
+               f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
     if args.b:
         hdr.append(f"B: {args.b[:48]}…")
     if args.w:
@@ -195,10 +256,12 @@ def main():
     B = W = None
     if args.b:
         print("\n=== B（无工作集，drop-caches=true）===")
-        B = run_rounds(args.b, args.iterations, "B", args.probe)
+        B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
+                       args.run_user, args.run_cwd, args.run_timeout)
     if args.w:
         print("\n=== W（工作集，drop-caches=false）===")
-        W = run_rounds(args.w, args.iterations, "W", args.probe)
+        W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
+                       args.run_user, args.run_cwd, args.run_timeout)
 
     print("\n=== 汇总 ===")
     def col(label, key):
@@ -208,7 +271,8 @@ def main():
         if W:
             parts.append(f"W {stats(W[key])}")
         print(f"  {label:<16} " + " | ".join(parts))
-    col("create", "create")
+    col("create(launchMs)", "create")
+    col(f"{args.probe}1 e2e", "e2e")
     col(f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""), "cold")
     col(f"{args.probe}2 (warm)", "warm")
 
