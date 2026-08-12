@@ -26,6 +26,7 @@ manifest/store/cache 服务，只为 node-ctl 配置外部 manifest 存储的访
 node-ctl conductor   → API 控制面，例如 nova :443
 node-proxy           → sandbox 数据面，例如 nova :8443
 connector/vswitch    → 独立 Linux netns、管理网卡和 floating-IP /20
+proxy worker         → 默认跟随 connector 的 mgmt-extract namespace
 ```
 
 ## 前置条件
@@ -130,6 +131,25 @@ METRICS_PORT=39095 \
 | Cloud Hypervisor CPU model | runner/builder 的 systemd drop-in，默认 `auto` |
 | 配置、状态、日志、快照目录 | 位于 `<NS>-work` 或 `<NS>-snaps` |
 
+`PROXY_NETNS` 默认是 `e2b<NS>_mgmt`。脚本先创建这个 connector 管理 namespace，
+再以 `--mgmt-extract=$PROXY_NETNS:$MGMT:...` 启动 connector；`MGMT` 管理 veth
+由 connector 自己创建到该 namespace。proxy 的 `proxy_netns` 同样指向这个
+namespace，因此默认 proxy worker 不在宿主机 namespace 中。脚本不创建额外的
+proxy namespace、proxy↔switch veth 或桥接。
+
+如果 connector 已经由外部 unit 提供了独立管理 namespace，可以显式设置
+`PROXY_NETNS=<existing-mgmt-ns>`。此时该 namespace 必须预先存在，脚本只把它
+同时传给 `--mgmt-extract` 和 `proxy.yaml`，不会创建或删除该 namespace。vswitch unit 会在 connector 完成
+管理面后设置实际 mgmt namespace 的 `route_localnet` 和 `ip_forward`，并设置
+vswitch namespace 的 `ip_forward`。宿主机的 `data_listen`（例如 `:8443`）仍由
+external proxy master 监听；proxy unit 显式 `Requires/After` vswitch unit，确保
+先有 vswitch namespace 和 connector 管理面，proxy 才启动。
+
+vswitch unit 与 netns unit 分离：单独执行
+`systemctl restart kuasar-vswitch-<NS>.service` 时不会删除 vswitch netns 或 tap
+设备。只有 `deploy-ns.sh down/replace` 才会调用 connector 的完整清理并删除
+该 NS 的 switch 资源；外部提供的 `PROXY_NETNS` 不由脚本删除。
+
 脚本使用宿主机级全局锁 `/run/kuasar/deploy-ns.lock` 串行化变更，并额外
 使用每个 NS 的锁，避免并发操作导致端口、FIP、MAC 或 unit 状态竞争。
 
@@ -204,6 +224,36 @@ ws-bench → node-proxy :<PROXY_PORT>
 ```text
 /root/sandbox/nova-work/smoke-tmp/ws-bench.log
 ```
+
+当前 nova 重建后的 `health` 冒烟基线（`n=1`）如下，后续更换二进制或修改
+部署网络后应使用相同条件对比：
+
+```text
+scenario         bare
+template         snapshot template (ws-template-bare.id)
+create          72ms
+health1 (cold)  68ms
+health2 (warm)   7ms
+result          PASS
+```
+
+本次基线使用的快照模板 ID：
+
+```text
+bare-snp-ZmlsZTovL2ZmM2VjOTFiMmRiYTMzMDhkY2E0NmZmNWJlNjMyMjUxZTkxN2UyMmJkMmIwYTMyM2RkZWFlMTlhZjdmZTA1Zjcuc25hcHNob3RAc2hhMjU2OmZmM2VjOTFiMmRiYTMzMDhkY2E0NmZmNWJlNjMyMjUxZTkxN2UyMmJkMmIwYTMyM2RkZWFlMTlhZjdmZTA1ZjdAbG9jYXRpb246MDE5ZmY0ZjktY2U3ZC03YWNlLWFmYzMtYzQwNjRhNzU0ZmE3
+```
+
+对应文件：`/root/sandbox/nova-work/ws-bench/ws-template-bare.id`。
+需要固定该模板复跑时：
+
+```bash
+SMOKE_TEMPLATE_ID="$(tr -d '[:space:]' < /root/sandbox/nova-work/ws-bench/ws-template-bare.id)" \
+SMOKE_PROBE=health SMOKE_ITERATIONS=1 /root/sandbox/nova-work/smoke.sh
+```
+
+如果 `create` 或 `health1 (cold)` 后续出现明显波动，优先查看
+`<NS>-work/smoke-tmp/ws-bench.log` 以及 `<NS>-work/var/lib/logs/` 下的
+conductor、proxy、vswitch 原始日志。
 
 如果自动发现不到模板，可以显式指定模板 ID：
 

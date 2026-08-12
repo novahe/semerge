@@ -39,7 +39,7 @@ def diagnose(sid):
 
 def load(path=None):
     """解析 <dir>/e2b-env.sh 的 export 行，写入 os.environ。返回 os.environ。"""
-    p = path or _ENV_FILE
+    p = path or os.environ.get("E2B_ENV_FILE") or _ENV_FILE
     if not os.path.isfile(p):
         sys.exit(f"✗ 找不到 env 文件：{p}")
     for line in open(p):

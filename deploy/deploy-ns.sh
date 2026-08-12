@@ -14,14 +14,15 @@
 #              NS=nova 保留示例默认值；其他 NS 未显式覆盖时自动探测端口并派生 FIP/MAC。
 #
 # 派生值（NS=nova 示例）：
-#   vswitch=e2bnova  netns=e2bnova_ns  mgmt=e2bnovam0  tapfd=/run/kuasar/connector/e2bnova/
+#   vswitch=e2bnova  netns=e2bnova_ns  proxy_netns=e2bnova_mgmt  mgmt=e2bnovam0
+#   tapfd=/run/kuasar/connector/e2bnova/
 #   run=/run/sandbox-nova  base=/var/lib/sandbox-nova  saved=/var/lib/sandbox-saved-nova
 #   cfg=/etc/node-ctl-nova  runner=sandbox-runner-nova@.service
 #   vswitch ports=128（可 env VSWITCH_PORTS 覆盖）
 #   api 端口=443（可 env API_PORT 覆盖）  mmds=19254（env MMDS_PORT） metrics=9095/9096
 #
 # 可用环境变量覆盖（换环境时设这些即可）：
-#   WORKDIR API_PORT PROXY_PORT MMDS_PORT METRICS_PORT MAC DOMAIN MANIFEST_CONFIG MANIFEST_KEY FIP_BASE UNIT_DIR
+#   WORKDIR API_PORT PROXY_PORT MMDS_PORT METRICS_PORT MAC DOMAIN MANIFEST_CONFIG MANIFEST_KEY FIP_BASE UNIT_DIR PROXY_NETNS
 #   CLOUD_HYPERVISOR_CPUS_MODEL
 #   NFS_ROOT NFS_DIR NFS_SNAPSHOT_DIR REMOTE_SNAPSHOT_PARENT AUTO_CREATE_TEMPLATES VSWITCH_PORTS
 #
@@ -47,6 +48,7 @@ esac
 
 case "$NS" in ''|*[!A-Za-z0-9_-]*) die "NS 只能包含字母、数字、下划线和短横线：$NS" ;; esac
 [ "${#NS}" -le 10 ] || die "NS 太长：e2b<NS>m0 不能超过 Linux 网卡名长度限制"
+PROXY_NETNS_USER_SET=0; [ -n "${PROXY_NETNS:-}" ] && PROXY_NETNS_USER_SET=1
 BINS="$(readlink -f -- "$BINS_INPUT" 2>/dev/null || true)"
 [ -d "$BINS" ] || die "bins_dir 不存在或不是目录：$BINS_INPUT"
 
@@ -79,7 +81,9 @@ fi
 # ── 派生值 ──────────────────────────────────────────────────────────────────
 SWITCH="e2b${NS}"
 NETNS="e2b${NS}_ns"
+PROXY_NETNS="${PROXY_NETNS:-e2b${NS}_mgmt}"
 MGMT="e2b${NS}m0"
+case "$PROXY_NETNS" in ''|*[!A-Za-z0-9_.-]*) [ -z "$PROXY_NETNS" ] || die "PROXY_NETNS 含有不安全字符：$PROXY_NETNS" ;; esac
 if [ -n "$WORKDIR" ]; then
   RUNROOT="$WORKDIR/run"
   BASEROOT="$WORKDIR/var/lib"
@@ -265,6 +269,9 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
   if [ "$VSWITCH_PORTS_USER_SET" -eq 0 ]; then
     [ -n "$(read_state vswitch_ports)" ] && VSWITCH_PORTS="$(read_state vswitch_ports)"
   fi
+  if [ "$PROXY_NETNS_USER_SET" -eq 0 ]; then
+    [ -n "$(read_state proxy_netns)" ] && PROXY_NETNS="$(read_state proxy_netns)"
+  fi
   if [ "$MAC_USER_SET" -eq 0 ]; then
     [ -n "$(read_state mac)" ] && MAC="$(read_state mac)"
   fi
@@ -339,7 +346,15 @@ parse_ipv4 "$FIP_BASE" || die "FIP_BASE 不是合法 IPv4：$FIP_BASE"
 
 port_in_use() { ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$") { found=1 } END { exit !found }'; }
 netns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -Fqx "$NETNS"; }
+proxy_netns_exists() { [ -n "$PROXY_NETNS" ] && ip netns list 2>/dev/null | awk '{print $1}' | grep -Fqx "$PROXY_NETNS"; }
 link_exists() { ip link show "$1" >/dev/null 2>&1; }
+proxy_port_in_use() {
+  if [ -n "$PROXY_NETNS" ]; then
+    ip netns exec "$PROXY_NETNS" ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$") { found=1 } END { exit !found }'
+  else
+    port_in_use "$1"
+  fi
+}
 unit_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
 mac_in_use() {
@@ -468,9 +483,12 @@ nat_apply() { # 只删除 NAT_STATE 中由本 NS 脚本实际新增的规则
   local action="$1" item remove_fip="$FIP_CIDR" remove_mgmt="$MGMT"
   if [ "$action" = add ]; then
     : > "$NAT_STATE"
-    printf 'meta_fip=%s\nmeta_mgmt=%s\n' "$FIP_CIDR" "$MGMT" >> "$NAT_STATE"
-    nat_add forward_out filter FORWARD -o "$MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT
-    nat_add forward_in filter FORWARD -i "$MGMT" -j ACCEPT
+    printf 'meta_fip=%s\nmeta_mgmt=%s\nmeta_proxy_netns=%s\n' "$FIP_CIDR" "$MGMT" "$PROXY_NETNS" >> "$NAT_STATE"
+    if [ -z "$PROXY_NETNS" ]; then
+      # Connector's default mgmt-extract namespace is the caller/host netns.
+      nat_add forward_out filter FORWARD -o "$MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      nat_add forward_in filter FORWARD -i "$MGMT" -j ACCEPT
+    fi
     nat_add masquerade nat POSTROUTING -s "$FIP_CIDR" -j MASQUERADE
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     return 0
@@ -606,6 +624,13 @@ select_auto_fip() {
 check_conflicts() {
   local bad=0 p unit
   netns_exists && { echo "${c_red}  ✗ netns $NETNS 已存在（先 down 或换 NS）${c_off}"; bad=1; }
+  if [ -n "$PROXY_NETNS" ]; then
+    if [ "$PROXY_NETNS_USER_SET" -eq 1 ]; then
+      proxy_netns_exists || { echo "${c_red}  ✗ connector 管理 netns $PROXY_NETNS 不存在${c_off}"; bad=1; }
+    else
+      proxy_netns_exists && { echo "${c_red}  ✗ connector 管理 netns $PROXY_NETNS 已存在（先 down 或换 NS）${c_off}"; bad=1; }
+    fi
+  fi
   link_exists "$MGMT" && { echo "${c_red}  ✗ 管理网卡 $MGMT 已存在${c_off}"; bad=1; }
   mac_in_use "$MAC" && { echo "${c_red}  ✗ switch MAC $MAC 已被宿主机使用${c_off}"; bad=1; }
   mac_in_use "$MGMT_MAC" && { echo "${c_red}  ✗ connector 派生的管理 MAC $MGMT_MAC 已被宿主机使用${c_off}"; bad=1; }
@@ -734,7 +759,7 @@ proxy: { mode: external, auth: enforce, park_timeout: 30s, metrics_listen: 127.0
 mmds:
   enabled: true
   listen: 127.0.0.1:$MMDS_PORT
-  routes: { enabled: true, max_routes_per_sandbox: 32, reserved_path_prefixes: [/latest/api/, /internal/] }
+  routes: { enabled: true, max_routes_per_sandbox: 32, reserved_path_prefixes: [/latest/api/, /internal/, /] }
 encryption_key: "$enc_key"
 manifest_config: $MANIFEST_CONFIG
 paths: { run_root: $RUNROOT, base_root: $BASEROOT, config_socket: $CFG_SOCKET }
@@ -769,6 +794,7 @@ YAML
   cat > "$CFGDIR/proxy.yaml" <<YAML
 config_socket: $CFG_SOCKET
 paths: { run_root: $RUNROOT }
+proxy_netns: $PROXY_NETNS
 data_listen: "$PROXY_LISTEN"
 proxy_socket: $PROXY_SOCK
 shm_path: $PROXY_SHM
@@ -785,9 +811,16 @@ YAML
 }
 
 write_units() {
-  local ip_bin sysctl_bin sh_bin
+  local ip_bin sysctl_bin sh_bin netns_start netns_stop
   ip_bin="$(command -v ip)"; sysctl_bin="$(command -v sysctl)"; sh_bin="$(command -v sh)"
   mkdir -p "$UNIT_DIR"
+  if [ "$PROXY_NETNS_USER_SET" -eq 0 ]; then
+    netns_start="ip netns list | grep -Eq \"^$NETNS( |$)\" || $ip_bin netns add $NETNS; ip netns list | grep -Eq \"^$PROXY_NETNS( |$)\" || $ip_bin netns add $PROXY_NETNS"
+    netns_stop="$ip_bin netns del $PROXY_NETNS 2>/dev/null || true; $ip_bin netns del $NETNS 2>/dev/null || true"
+  else
+    netns_start="ip netns list | grep -Eq \"^$NETNS( |$)\" || $ip_bin netns add $NETNS"
+    netns_stop="$ip_bin netns del $NETNS 2>/dev/null || true"
+  fi
   cat > "$UNIT_DIR/$NETNS_UNIT" <<UNIT
 [Unit]
 Description=kuasar ${NS} vswitch network namespace
@@ -796,8 +829,8 @@ Before=$VS_UNIT
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$sh_bin -c 'ip netns list | awk '\''{print \$1}'\'' | grep -Fqx '\''$NETNS'\'' || $ip_bin netns add '\''$NETNS'\'''
-ExecStop=$ip_bin netns del $NETNS
+ExecStart=$sh_bin -c '$netns_start'
+ExecStop=$sh_bin -c '$netns_stop'
 UNIT
   cat > "$UNIT_DIR/$VS_UNIT" <<UNIT
 [Unit]
@@ -808,9 +841,13 @@ Requires=$NETNS_UNIT
 
 [Service]
 Type=notify
-ExecStart=$CONNECTOR vswitch serve $SWITCH --netns=$NETNS --ports=$VSWITCH_PORTS --mac-addr=$MAC --floating-ip-base=$FIP_BASE --mode=tap --tapfd-listen=$TAPFD_SOCK --mgmt-extract=:$MGMT:169.254.169.254,0.0.0.0/0 --mgmt-service=169.254.169.254:80:127.0.0.1:$MMDS_PORT
-ExecStartPost=$sh_bin -c 'for i in 1 2 3 4 5 6 7 8 9 10; do $ip_bin link show $MGMT >/dev/null 2>&1 && break; sleep 1; done; $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1'
-ExecStop=$CONNECTOR vswitch stop $SWITCH --force
+ExecStart=$CONNECTOR vswitch serve $SWITCH --netns=$NETNS --ports=$VSWITCH_PORTS --mac-addr=$MAC --floating-ip-base=$FIP_BASE --mode=tap --tapfd-listen=$TAPFD_SOCK --mgmt-extract=$PROXY_NETNS:$MGMT:169.254.169.254,0.0.0.0/0 --mgmt-service=169.254.169.254:80:127.0.0.1:$MMDS_PORT
+# Configure route_localnet on the connector mgmt device and enable forwarding
+# in both connector-managed namespaces.
+ExecStartPost=$sh_bin -c 'for i in 1 2 3 4 5 6 7 8 9 10; do if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link show $MGMT >/dev/null 2>&1; else $ip_bin link show $MGMT >/dev/null 2>&1; fi && break; sleep 1; done; if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link set lo up; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.all.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.ip_forward=1; else $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $sysctl_bin -w net.ipv4.ip_forward=1; fi; $ip_bin netns exec $NETNS $ip_bin link set lo up; $ip_bin netns exec $NETNS $sysctl_bin -w net.ipv4.ip_forward=1'
+# Deliberately no ExecStop connector cleanup: systemctl restart of this
+# daemon must preserve tap devices and sandbox network namespaces. Full
+# cleanup is performed only by deploy-ns.sh down/replace.
 StandardOutput=append:$LOGDIR/vswitch.log
 StandardError=append:$LOGDIR/vswitch.log
 Restart=on-failure
@@ -836,8 +873,8 @@ UNIT
   cat > "$UNIT_DIR/$PROXY_UNIT" <<UNIT
 [Unit]
 Description=kuasar node-ctl external proxy ($NS)
-After=$NODE_UNIT
-Requires=$NODE_UNIT
+After=$VS_UNIT $NODE_UNIT
+Requires=$VS_UNIT $NODE_UNIT
 
 [Service]
 Type=simple
@@ -981,10 +1018,12 @@ PROXY_PORT='__PROXY_PORT__'
 MMDS_PORT='__MMDS_PORT__'
 METRICS_PORT='__METRICS_PORT__'
 PROXY_METRICS_PORT='__PROXY_METRICS_PORT__'
+PROXY_NETNS='__PROXY_NETNS__'
 CFG_SOCKET='__CFG_SOCKET__'
 TAPFD_SOCKET='__TAPFD_SOCKET__'
 TENANT_ENV='__TENANT_ENV__'
 WS_BENCH_DIR='__WS_BENCH_DIR__'
+WS_BENCH_WORK_DIR='__WS_BENCH_WORK_DIR__'
 TMPDIR='__TMPDIR__'
 mkdir -p "$TMPDIR"
 
@@ -992,6 +1031,13 @@ pass() { echo "  ✓ $*"; }
 skip() { echo "  - $*"; }
 fail() { echo "  ✗ $*" >&2; exit 1; }
 port_up() { ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$") { ok=1 } END { exit !ok }'; }
+proxy_port_up() {
+  if [ -n "$PROXY_NETNS" ]; then
+    ip netns exec "$PROXY_NETNS" ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$") { ok=1 } END { exit !ok }'
+  else
+    port_up "$1"
+  fi
+}
 unit_up() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
 echo "━━━ smoke NS=$NS ━━━"
@@ -1003,11 +1049,13 @@ done
 [ -S "$TAPFD_SOCKET" ] || fail "missing tapfd socket: $TAPFD_SOCKET"
 pass "control/tapfd sockets"
 
-for pair in "api $API_PORT" "proxy $PROXY_PORT" "mmds $MMDS_PORT" "metrics $METRICS_PORT" "proxy-metrics $PROXY_METRICS_PORT"; do
+for pair in "api $API_PORT" "proxy $PROXY_PORT" "metrics $METRICS_PORT" "proxy-metrics $PROXY_METRICS_PORT"; do
   name="${pair%% *}"; port="${pair##* }"
   port_up "$port" || fail "$name is not listening on :$port"
   pass "$name :$port"
 done
+proxy_port_up "$MMDS_PORT" || fail "mmds is not listening in ${PROXY_NETNS:-host} on :$MMDS_PORT"
+pass "mmds ${PROXY_NETNS:-host} :$MMDS_PORT"
 
 health_code="$(curl -ksS --noproxy '*' -o "$TMPDIR/health.body" -w '%{http_code}' \
   "https://127.0.0.1:$API_PORT/health" -H "Host: api.$DOMAIN" || true)"
@@ -1029,6 +1077,8 @@ if [ -f "$TENANT_ENV" ]; then
   smoke_template="${SMOKE_TEMPLATE_ID:-}"
   if [ -z "$smoke_template" ]; then
     for candidate in \
+      "$WS_BENCH_WORK_DIR/ws-template-bare.id" \
+      "$WS_BENCH_WORK_DIR/bare-snp-template.id" \
       "$WS_BENCH_DIR/ws-template-bare.id" \
       "$WS_BENCH_DIR/snapshots/unencrypted/bare-workingset.id" \
       "$WS_BENCH_DIR/snapshots/unencrypted/bare-baseline.id" \
@@ -1077,10 +1127,12 @@ SMOKE
     -e "s|__MMDS_PORT__|$MMDS_PORT|g" \
     -e "s|__METRICS_PORT__|$METRICS|g" \
     -e "s|__PROXY_METRICS_PORT__|$PROXY_METRICS|g" \
+    -e "s|__PROXY_NETNS__|$PROXY_NETNS|g" \
     -e "s|__CFG_SOCKET__|$CFG_SOCKET|g" \
     -e "s|__TAPFD_SOCKET__|$TAPFD_SOCK|g" \
     -e "s|__TENANT_ENV__|$CFGDIR/tenant.env|g" \
     -e "s|__WS_BENCH_DIR__|$REPO_ROOT/ws-bench|g" \
+    -e "s|__WS_BENCH_WORK_DIR__|$WORKDIR/ws-bench|g" \
     -e "s|__TMPDIR__|$smoke_root/smoke-tmp|g" \
     -e "s|__NETNS_UNIT__|$NETNS_UNIT|g" \
     -e "s|__VS_UNIT__|$VS_UNIT|g" \
@@ -1147,6 +1199,7 @@ deployment_present() {
   unit_active "$NODE_UNIT" && return 0
   unit_active "$PROXY_UNIT" && return 0
   netns_exists && return 0
+  proxy_netns_exists && return 0
   link_exists "$MGMT" && return 0
   [ -e "$CFG_SOCKET" ] && return 0
   [ -e "$TAPFD_SOCK" ] && return 0
@@ -1160,12 +1213,20 @@ stop_environment() {
   command -v systemctl >/dev/null 2>&1 && {
     stop_instance_units "sandbox-runner-${NS}"
     stop_instance_units "sandbox-builder-${NS}"
-    systemctl stop "$PROXY_UNIT" "$NODE_UNIT" "$VS_UNIT" "$NETNS_UNIT" >/dev/null 2>&1 || true
+    # Stop the daemon first. The vswitch unit intentionally has no ExecStop
+    # cleanup: a daemon restart must leave persistent tap devices intact.
+    systemctl stop "$PROXY_UNIT" "$NODE_UNIT" "$VS_UNIT" >/dev/null 2>&1 || true
   }
   stop_legacy_processes
+  # Full down/replace is the explicit cleanup boundary. Connector removes its
+  # mgmt/tap links before the switch namespace is removed.
   [ -x "$connector_path" ] && "$connector_path" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
-  for i in $(seq 1 20); do netns_exists || break; sleep 0.25; done
+  command -v systemctl >/dev/null 2>&1 && systemctl stop "$NETNS_UNIT" >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do ! netns_exists && break; sleep 0.25; done
   netns_exists && ip netns del "$NETNS" >/dev/null 2>&1 || true
+  if [ "$PROXY_NETNS_USER_SET" -eq 0 ]; then
+    proxy_netns_exists && ip netns del "$PROXY_NETNS" >/dev/null 2>&1 || true
+  fi
   link_exists "$MGMT" && ip link del "$MGMT" >/dev/null 2>&1 || true
   rm -f "$TAPFD_SOCK"
   rmdir "$TAPFD_DIR" 2>/dev/null || true
@@ -1261,6 +1322,7 @@ do_up() {
   state_set mac "$MAC"
   state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
   state_set vswitch_ports "$VSWITCH_PORTS"
+  state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
   state_set nfs_dir "$NFS_DIR"
   state_set remote_snapshot_parent "$REMOTE_SNAPSHOT_PARENT"
@@ -1312,12 +1374,12 @@ ENV
 
   systemctl start "$PROXY_UNIT"
   for i in $(seq 1 60); do
-    port_in_use "$PROXY_PORT" && port_in_use "$MMDS_PORT" && break
+    port_in_use "$PROXY_PORT" && proxy_port_in_use "$MMDS_PORT" && break
     unit_active "$PROXY_UNIT" || die "proxy 未就绪"
     sleep 0.5
   done
   port_in_use "$PROXY_PORT" || die "proxy data_listen 未监听 :$PROXY_PORT"
-  port_in_use "$MMDS_PORT" || die "proxy MMDS 未监听 :$MMDS_PORT"
+  proxy_port_in_use "$MMDS_PORT" || die "proxy MMDS 未监听于 ${PROXY_NETNS:-host} :$MMDS_PORT"
 
   ok "NS=$NS 部署完成（systemd 管理，存储后端未启动）"
   echo "  workdir  $WORKDIR"
@@ -1325,7 +1387,7 @@ ENV
   echo "  api      https://api.$DOMAIN:$API_PORT"
   echo "  proxy    $PROXY_LISTEN"
   echo "  ports    mmds=:$MMDS_PORT metrics=:$METRICS/$PROXY_METRICS"
-  echo "  network  vswitch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
+  echo "  network  vswitch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
   echo "  units    $NETNS_UNIT $VS_UNIT $NODE_UNIT $PROXY_UNIT"
   echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
   echo "  cfg      $CFGDIR/{conductor,proxy}.yaml"
@@ -1356,6 +1418,7 @@ do_prepare() {
   state_set mac "$MAC"
   state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
   state_set vswitch_ports "$VSWITCH_PORTS"
+  state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
   state_set nfs_dir "$NFS_DIR"
   state_set remote_snapshot_parent "$REMOTE_SNAPSHOT_PARENT"
@@ -1374,7 +1437,7 @@ do_prepare() {
   echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
   echo "  manifest $MANIFEST_CONFIG (yyl store/cache)"
   echo "  snapshots $NFS_DIR (remote=$REMOTE_SNAPSHOT_PARENT)"
-  echo "  network  vswitch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
+  echo "  network  vswitch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
   echo "  logs     $LOGDIR"
   echo "  state    $STATEFILE"
   echo "  smoke    $SMOKE_FILE"
@@ -1398,16 +1461,22 @@ do_down() {
 # ════════════════════════════════════════════════════════════════════════════
 do_status() {
   [ "$CMD" = status ] || return 0
-  echo "NS=$NS switch=$SWITCH netns=$NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC ch_cpu_model=$CLOUD_HYPERVISOR_CPUS_MODEL"
+  echo "NS=$NS switch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC ch_cpu_model=$CLOUD_HYPERVISOR_CPUS_MODEL"
   for unit in "$NETNS_UNIT" "$VS_UNIT" "$NODE_UNIT" "$PROXY_UNIT"; do
     if command -v systemctl >/dev/null 2>&1 && unit_active "$unit"; then echo "  ${c_grn}✓${c_off} unit $unit active"; else echo "  ${c_red}✗${c_off} unit $unit inactive"; fi
   done
   if netns_exists; then echo "  ${c_grn}✓${c_off} netns $NETNS"; else echo "  ${c_red}✗${c_off} netns $NETNS"; fi
+  if proxy_netns_exists; then echo "  ${c_grn}✓${c_off} connector mgmt netns $PROXY_NETNS (proxy worker)"; else echo "  ${c_red}✗${c_off} connector mgmt netns $PROXY_NETNS"; fi
   for socket in "$CFG_SOCKET" "$TAPFD_SOCK"; do
     [ -S "$socket" ] && echo "  ${c_grn}✓${c_off} socket $socket" || echo "  ${c_red}✗${c_off} socket $socket"
   done
   for port_name in API_PORT PROXY_PORT MMDS_PORT METRICS PROXY_METRICS; do
-    if port_in_use "${!port_name}"; then echo "  ${c_grn}✓${c_off} $port_name :${!port_name}"; else echo "  ${c_red}✗${c_off} $port_name :${!port_name}"; fi
+    if [ "$port_name" = MMDS_PORT ]; then
+      port_check=proxy_port_in_use
+    else
+      port_check=port_in_use
+    fi
+    if "$port_check" "${!port_name}"; then echo "  ${c_grn}✓${c_off} $port_name :${!port_name}"; else echo "  ${c_red}✗${c_off} $port_name :${!port_name}"; fi
   done
   [ -f "$TENANT_ENV" ] && echo "  tenant $TENANT_ENV" || echo "  tenant (not onboarded)"
   [ -f "$MANIFEST_CONFIG" ] && echo "  storage manifest_config $MANIFEST_CONFIG (external)" || echo "  storage manifest_config missing: $MANIFEST_CONFIG"
