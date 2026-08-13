@@ -28,6 +28,7 @@ E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
 import argparse, json, os, re, socket, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 e2b_env.load()
@@ -59,26 +60,48 @@ def create(template, tries=4):
     raise last
 
 
+class LaunchFailure(RuntimeError):
+    """The control plane reached a terminal launch failure for this SID."""
+
+
 def wait_launch_ms(sid, timeout=60):
     """node-ctl create 异步返回（admission 即返回）；轮询 GET /sandboxes/{sid}
-    直到出现 launchMs——这是 conductor 在 launch terminal 写入的【服务端精确】boot
-    耗时（acceptedAt→terminal，含 restore/runtime-ready/envd-init，ms，亚毫秒精度）。
+    直到 launch terminal 成功且 state=running——这是 conductor 在 launch terminal
+    写入的【服务端精确】boot 耗时（acceptedAt→terminal，含 restore/runtime-ready/
+    envd-init，ms，亚毫秒精度）。失败样本也可能带 launchMs，因此不能只检查
+    该字段；否则真正的 readiness EOF 会被下一次数据面 probe 伪装成 HTTP 404。
     轮询只为同步检测（值与日志 starting_total_duration 完全一致），不引入客户端计时偏差。
-    返回 (float ms, launchTiming) 或 (None, None)（launch 失败/超时）。"""
+    成功返回 (float ms, launchTiming)；失败/删除直接抛出 LaunchFailure。"""
     end = time.time() + timeout
     while time.time() < end:
         r = e2b_env.api_request("GET", f"/sandboxes/{sid}")
         if r.status_code == 404:
-            return None, None
+            raise LaunchFailure(f"launch failure: sandbox {sid} disappeared (GET HTTP 404)")
         try:
             body = r.json()
+            launch_result = body.get("launchResult", body.get("launch_result"))
+            if isinstance(launch_result, dict):
+                result = launch_result.get("result")
+                detail = launch_result.get("error") or launch_result.get("err")
+            else:
+                result = launch_result
+                detail = body.get("launchError") or body.get("launch_error")
+            if body.get("launchSuccess") is False or result in ("failure", "failed"):
+                suffix = f": {detail}" if detail else ""
+                raise LaunchFailure(f"launch failure for {sid}{suffix}")
+            if body.get("state") == "dead":
+                raise LaunchFailure(f"launch failure: sandbox {sid} state=dead{(': ' + str(detail)) if detail else ''}")
             ms = body.get("launchMs")
-            if ms is not None:
+            # A failed launch can publish launchMs before rollback removes the
+            # row. Accept it only once the authoritative state is running.
+            if ms is not None and body.get("state") == "running":
                 return float(ms), body.get("launchTiming")
-        except Exception:
+        except LaunchFailure:
+            raise
+        except (ValueError, TypeError, KeyError):
             pass
         time.sleep(0.01)
-    return None, None
+    raise LaunchFailure(f"launch failure/timeout: sandbox {sid} did not reach state=running with launchMs")
 
 
 TIMING_PHASES = (
@@ -190,73 +213,294 @@ def _show_progress(label, completed, total):
     sys.stdout.flush()
 
 
-def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
-               run_user="root", run_cwd="/", run_timeout=30):
+def _new_results():
     res = {k: [] for k in ('create', 'create_api', 'e2e', 'cold', 'warm')}
     res["phases"] = {}
     res["accounted"] = []
     res["unaccounted"] = []
-    _show_progress(label, 0, n)
-    for i in range(n):
-        sid = token = None
-        sandbox = None
-        try:
-            e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
-            sid, token = create(template)
-            create_return = time.perf_counter()         # 1.0 create interface return
-            create_api_ms = (create_return - e2e_start) * 1000
+    res["samples"] = []
+    res["discarded"] = 0
+    return res
+
+
+def _merge_results(dst, src):
+    for key in ('create', 'create_api', 'e2e', 'cold', 'warm', 'accounted', 'unaccounted'):
+        dst[key].extend(src[key])
+    for name, values in src["phases"].items():
+        dst["phases"].setdefault(name, []).extend(values)
+    dst["samples"].extend(src["samples"])
+    dst["discarded"] += src["discarded"]
+
+
+def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
+              run_user="root", run_cwd="/", run_timeout=30):
+    """Run one isolated sandbox lifecycle and return (results, failure)."""
+    res = _new_results()
+    sid = token = None
+    sandbox = None
+    error = None
+    create_api_ms = e2e1 = tc = None
+    try:
+        e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
+        sid, token = create(template)
+        create_return = time.perf_counter()         # 1.0 create interface return
+        create_api_ms = (create_return - e2e_start) * 1000
+        if mode == "run":
+            sandbox = Sandbox.connect(sid, timeout=120)
+        ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
+        probe_return = time.perf_counter()           # 2.0 probe return
+        e2e1 = (probe_return - e2e_start) * 1000     # 0.0 -> 2.0
+        # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
+        # 避免轮询 wait_launch_ms 污染端到端耗时。
+        tc, timing = wait_launch_ms(sid)
+        if tc is None:
+            raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
+        run1 = e2e1 - tc if ok1 else None
+        if ok1:
+            ok2, c2, t2 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
+        else:
+            ok2, c2, t2 = False, None, "probe1 failed"
+        if not ok1:
+            error = f"sid={sid} error={t1}"
+        elif not ok2:
+            error = f"sid={sid} error={t2 or 'warm probe failed'}"
+        else:
+            # A sample is atomic: only publish it after create, cold probe,
+            # launch timing and warm probe have all succeeded.
+            phase_values = dict(launch_timing_rows(timing, minimum_ms=0.0)) if timing else {}
             res['create_api'].append(create_api_ms)
-            if mode == "run":
-                sandbox = Sandbox.connect(sid, timeout=120)
-            ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
-            probe_return = time.perf_counter()           # 2.0 probe return
-            e2e1 = (probe_return - e2e_start) * 1000     # 0.0 -> 2.0
-            probe_e2e_ms = (probe_return - create_return) * 1000
-            # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
-            # 避免轮询 wait_launch_ms 污染端到端耗时。
-            tc, timing = wait_launch_ms(sid)
-            if tc is None:
-                raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-            run1 = e2e1 - tc if ok1 else None
-            if ok1:
-                ok2, c2, t2 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
-            else:
-                ok2, c2, t2 = False, None, "probe1 failed"
-            if ok1:
-                res['create'].append(tc); res['e2e'].append(e2e1); res['cold'].append(run1)
-                if timing:
-                    for name, value in launch_timing_rows(timing, minimum_ms=0.0):
-                        res["phases"].setdefault(name, []).append(value)
-                    if timing.get("accountedMs") is not None:
-                        res["accounted"].append(float(timing["accountedMs"]))
-                    if timing.get("unaccountedMs") is not None:
-                        res["unaccounted"].append(float(timing["unaccountedMs"]))
-            if ok2:
-                res['warm'].append(c2)
-            if not ok1:
-                _clear_progress()
-                print(f"  sid={sid} error={t1}")
-            elif not ok2:
-                _clear_progress()
-                print(f"  sid={sid} error={t2 or 'warm probe failed'}")
-        except Exception as e:
-            _clear_progress()
-            print(f"  sid={sid or '<none>'} error={type(e).__name__}: {e}")
-        finally:
-            if sandbox is not None:
-                # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口，
-                # 同时避免只 DELETE sid 而遗留本轮 Sandbox 对象的连接状态。
-                try:
-                    sandbox.kill()
-                except Exception:
-                    try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
-                    except Exception: pass
-                sandbox = None
-            elif sid:
+            res['create'].append(tc)
+            res['e2e'].append(e2e1)
+            res['cold'].append(run1)
+            res['warm'].append(c2)
+            for name, value in phase_values.items():
+                res["phases"].setdefault(name, []).append(value)
+            if timing and timing.get("accountedMs") is not None:
+                res["accounted"].append(float(timing["accountedMs"]))
+            if timing and timing.get("unaccountedMs") is not None:
+                res["unaccounted"].append(float(timing["unaccountedMs"]))
+            res["samples"].append({
+                "sid": sid,
+                "create_api": create_api_ms,
+                "create": tc,
+                "e2e": e2e1,
+                "cold": run1,
+                "warm": c2,
+                "phases": phase_values,
+            })
+    except Exception as e:
+        error = f"sid={sid or '<none>'} error={type(e).__name__}: {e}"
+    finally:
+        if sandbox is not None:
+            # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口，
+            # 同时避免只 DELETE sid 而遗留本轮 Sandbox 对象的连接状态。
+            try:
+                sandbox.kill()
+            except Exception:
                 try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
                 except Exception: pass
-            _show_progress(label, i + 1, n)
-    return res
+        elif sid:
+            try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
+            except Exception: pass
+    failure = None
+    if error:
+        res["discarded"] = 1
+        failure = {
+            "sid": sid,
+            "error": error,
+            "create_api_ms": create_api_ms,
+            "e2e_ms": e2e1,
+            "launch_ms": tc,
+        }
+    return res, failure
+
+
+def append_failure_log(path, label, concurrency, mode, template, failure,
+                       round_number=None):
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "variant": label,
+        "concurrency": concurrency,
+        "probe": mode,
+        "template": template,
+        **failure,
+    }
+    if round_number is not None:
+        record["round"] = round_number
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as log:
+        log.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _run_sample_batch(template, sample_count, label, mode, command,
+                      run_user, run_cwd, run_timeout, concurrency,
+                      failure_log, progress_offset=0, progress_total=None,
+                      round_number=None, progress_label=None):
+    """Run one batch and return only after every sample in that batch ends."""
+    if sample_count < 1:
+        raise ValueError("sample_count must be greater than zero")
+    progress_total = progress_total or sample_count
+    progress_label = progress_label or label
+    result = _new_results()
+    _show_progress(progress_label, progress_offset, progress_total)
+    with ThreadPoolExecutor(max_workers=min(concurrency, sample_count)) as pool:
+        futures = [pool.submit(run_round, template, mode, command,
+                               run_user, run_cwd, run_timeout)
+                   for _ in range(sample_count)]
+        for completed, future in enumerate(as_completed(futures), 1):
+            batch_result, failure = future.result()
+            _merge_results(result, batch_result)
+            if failure:
+                _clear_progress()
+                print(f"  {failure['error']}")
+                if failure_log:
+                    try:
+                        append_failure_log(
+                            failure_log, label, concurrency, mode, template,
+                            failure, round_number=round_number)
+                    except OSError as e:
+                        print(f"  failure log 写入失败: {e}")
+            _show_progress(progress_label, progress_offset + completed,
+                           progress_total)
+    return result
+
+
+def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
+               run_user="root", run_cwd="/", run_timeout=30, concurrency=1,
+               failure_log=None, rounds=None):
+    """Run samples using either legacy total-count or wave-based semantics.
+
+    With ``rounds`` unset, ``n`` remains the legacy total number of samples and
+    the worker pool continuously fills up to ``concurrency``.  With ``rounds``
+    set, each round starts exactly ``concurrency`` samples and the next round
+    waits until the complete batch has finished.  Thus ``rounds=5`` and
+    ``concurrency=10`` attempts 50 samples in five waves of ten.
+    """
+    if concurrency < 1:
+        raise ValueError("concurrency must be greater than zero")
+    if rounds is None:
+        if n is None or n < 1:
+            raise ValueError("n must be greater than zero")
+        return _run_sample_batch(
+            template, n, label, mode, command, run_user, run_cwd,
+            run_timeout, concurrency, failure_log)
+    if rounds < 1:
+        raise ValueError("rounds must be greater than zero")
+
+    result = _new_results()
+    total = rounds * concurrency
+    completed = 0
+    for round_number in range(1, rounds + 1):
+        if round_number > 1:
+            _clear_progress()
+        print(f"  {label} round {round_number}/{rounds} "
+              f"(concurrency={concurrency})")
+        batch = _run_sample_batch(
+            template, concurrency, label, mode, command, run_user, run_cwd,
+            run_timeout, concurrency, failure_log,
+            progress_offset=completed, progress_total=total,
+            round_number=round_number,
+            progress_label=f"{label} r{round_number}/{rounds}")
+        for sample in batch["samples"]:
+            sample["round"] = round_number
+        _merge_results(result, batch)
+        completed += concurrency
+    return result
+
+
+def print_sample_details(label, concurrency, result, verbose=False):
+    """Print success counts, and optionally one row per successful sandbox."""
+    accepted = len(result["samples"])
+    if not verbose:
+        print(f"  {label} attempted={accepted + result['discarded']} "
+              f"accepted={accepted} discarded={result['discarded']}")
+        return
+
+    print(f"\n=== {label} 每个成功沙箱（concurrency={concurrency}）===")
+    has_round = any("round" in sample for sample in result["samples"])
+    if has_round:
+        print("  sandboxID                               round e2e(ms) create-api launch cold warm")
+        print("  ------------------------------------ ----- -------- ---------- ------ ---- ----")
+    else:
+        print("  sandboxID                               e2e(ms) create-api launch cold warm")
+        print("  ------------------------------------ -------- ---------- ------ ---- ----")
+    for sample in result["samples"]:
+        if has_round:
+            print(f"  {sample['sid']:<36} {sample['round']:>5} {sample['e2e']:>8.1f} "
+                  f"{sample['create_api']:>10.1f} {sample['create']:>6.1f} "
+                  f"{sample['cold']:>4.1f} {sample['warm']:>4.1f}")
+        else:
+            print(f"  {sample['sid']:<36} {sample['e2e']:>8.1f} {sample['create_api']:>10.1f} "
+                  f"{sample['create']:>6.1f} {sample['cold']:>4.1f} {sample['warm']:>4.1f}")
+    print(f"  attempted={accepted + result['discarded']}  accepted={accepted}  "
+          f"discarded={result['discarded']}")
+
+
+def _mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def _p50(values):
+    if not values:
+        return None
+    values = sorted(values)
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def _delta_cell(value, baseline):
+    if value is None or baseline in (None, 0):
+        return "-"
+    return f"{(value / baseline - 1) * 100:+.1f}%"
+
+
+def print_concurrency_trend(label, runs):
+    """Compare aggregate and launch-stage latency across concurrency levels."""
+    available = [(concurrency, result) for concurrency, result in runs if result]
+    # A single concurrency value has no trend or baseline comparison to show;
+    # the per-group summary above already contains the useful measurements.
+    if len(available) < 2:
+        return
+    baseline = available[0][1]
+    baseline_e2e = _mean(baseline["e2e"])
+    print(f"\n=== {label} 并发趋势（相对 c={available[0][0]}）===")
+    print("  concurrency attempted accepted discarded  e2e avg  e2e p50   delta  create-api  launch   cold   warm")
+    print("  ----------- --------- -------- --------- -------- -------- ------- ----------- ------- ------ ------")
+    for concurrency, result in available:
+        e2e_avg = _mean(result["e2e"])
+        values = [_mean(result[key]) for key in ("create_api", "create", "cold", "warm")]
+        cells = [f"{value:.1f}" if value is not None else "-" for value in values]
+        p50 = _p50(result["e2e"])
+        e2e_cell = f"{e2e_avg:.1f}" if e2e_avg is not None else "-"
+        p50_cell = f"{p50:.1f}" if p50 is not None else "-"
+        accepted = len(result["samples"])
+        attempted = accepted + result["discarded"]
+        print(f"  {concurrency:>11} {attempted:>9} {accepted:>8} {result['discarded']:>9} "
+              f"{e2e_cell:>8} {p50_cell:>8} {_delta_cell(e2e_avg, baseline_e2e):>7} "
+              f"{cells[0]:>11} {cells[1]:>7} {cells[2]:>6} {cells[3]:>6}")
+
+    phase_names = []
+    for name, _start, _end in TIMING_PHASES:
+        if any((_mean(result["phases"].get(name, [])) or 0) >= TIMING_DISPLAY_MIN_MS
+               for _concurrency, result in available):
+            phase_names.append(name)
+    if not phase_names:
+        return
+    print(f"\n  {label} 启动节点趋势（单元格为 avg ms / 相对基线变化）")
+    cell_width = 20
+    print(f"  {'阶段':<{SUMMARY_LABEL_WIDTH}}" + "".join(
+        f" {'c=' + str(concurrency):>{cell_width}}" for concurrency, _result in available))
+    print(f"  {'-' * SUMMARY_LABEL_WIDTH}" + "".join(
+        f" {'-' * cell_width}" for _concurrency, _result in available))
+    for name in phase_names:
+        base_value = _mean(baseline["phases"].get(name, []))
+        cells = []
+        for _concurrency, result in available:
+            value = _mean(result["phases"].get(name, []))
+            cell = "-" if value is None else f"{value:.1f} / {_delta_cell(value, base_value)}"
+            cells.append(f" {cell:>{cell_width}}")
+        print(f"  {name:<{SUMMARY_LABEL_WIDTH}}" + "".join(cells))
 
 
 SUMMARY_LABEL_WIDTH = 38
@@ -391,7 +635,14 @@ def run_docker_probe(mode, container="ws-docker-debug", port=18790):
 
 def main():
     ap = argparse.ArgumentParser(description="B vs W 冷启动对比（openclaw proxy 或 envd commands.run）")
-    ap.add_argument("-n", "--iterations", type=int, default=10)
+    ap.add_argument("-n", "--iterations", type=int, default=None,
+                    help="旧模式：每个并发档位的总样本数（与 --rounds 互斥，默认 10）")
+    ap.add_argument("-r", "--rounds", type=int, default=None,
+                    help="分轮模式：每个并发档位的轮数；每轮启动 concurrency 个样本，轮间等待全部结束")
+    ap.add_argument("-c", "--concurrency", type=int, nargs="+", default=[1],
+                    metavar="N", help="并发档位，可传多个值，例如 -c 1 10 30 50（默认 1）")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="显示每个成功沙箱的逐样本耗时明细（失败始终显示）")
     ap.add_argument("--b", default=None,
                     help="B template（传入才跑 B；默认不跑）")
     ap.add_argument("--w", default=None,
@@ -406,60 +657,86 @@ def main():
                     help="--probe run 的 guest 工作目录（code-interpreter manifest 默认 /）")
     ap.add_argument("--run-timeout", type=int, default=30,
                     help="--probe run 的单次 commands.run 超时秒数")
+    ap.add_argument("--failure-log", default=os.path.join(PARENT, "logs", "bench-failures.jsonl"),
+                    help="失败样本 JSONL 日志（默认 logs/bench-failures.jsonl）")
     ap.add_argument("--docker", action="store_true",
                     help="额外重启 ws-docker-debug 并执行 Docker cold/warm 对照")
     args = ap.parse_args()
+    if args.iterations is not None and args.rounds is not None:
+        ap.error("-n/--iterations 与 -r/--rounds 不能同时使用")
+    if args.iterations is None and args.rounds is None:
+        args.iterations = 10
+    if args.iterations is not None and args.iterations < 1:
+        ap.error("-n/--iterations 必须大于 0")
+    if args.rounds is not None and args.rounds < 1:
+        ap.error("-r/--rounds 必须大于 0")
+    if any(value < 1 for value in args.concurrency):
+        ap.error("-c/--concurrency 的值必须大于 0")
     if not args.b and not args.w:
         sys.exit("✗ 至少传一个 --b 或 --w")
     if args.docker and args.probe == "run":
         sys.exit("✗ --docker 仅支持 exec/health 探针")
 
+    if args.rounds is not None:
+        count_header = (f"rounds={args.rounds}/档（每轮 concurrency 个样本，"
+                        "轮间等待完成）")
+    else:
+        count_header = f"n={args.iterations}/档（总样本数）"
     if args.probe == "run":
         hdr = [f"# working-set 对比（e2b envd，probe=commands.run）",
-               f"n={args.iterations}  command={args.command}  user={args.run_user} cwd={args.run_cwd}"]
+               f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
+               f"command={args.command}  user={args.run_user} cwd={args.run_cwd}"]
     elif args.probe == "health":
         hdr = ["# working-set 对比（openclaw + e2b/envd，node-proxy curl /health）",
-               f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
+               f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
+               f"proxy={openclaw_net.proxy_url()}"]
     else:
         hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
-               f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
+               f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
+               f"proxy={openclaw_net.proxy_url()}"]
     if args.b:
         hdr.append(f"B: {args.b[:48]}…")
     if args.w:
         hdr.append(f"W: {args.w[:48]}…")
     print("\n".join(hdr))
 
-    B = W = None
-    if args.b:
-        print("\n=== B（无工作集，drop-caches=true）===")
-        B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
-                       args.run_user, args.run_cwd, args.run_timeout)
-    if args.w:
-        print("\n=== W（工作集，drop-caches=false）===")
-        W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
-                       args.run_user, args.run_cwd, args.run_timeout)
+    runs = []
+    for concurrency in args.concurrency:
+        if args.rounds is not None:
+            run_header = f"rounds={args.rounds}，attempted={args.rounds * concurrency}"
+        else:
+            run_header = f"n={args.iterations}"
+        print(f"\n######## concurrency={concurrency}，{run_header} ########")
+        B = W = None
+        if args.b:
+            print("\n=== B（无工作集，drop-caches=true）===")
+            B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
+                           args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                           args.failure_log, rounds=args.rounds)
+        if args.w:
+            print("\n=== W（工作集，drop-caches=false）===")
+            W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
+                           args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                           args.failure_log, rounds=args.rounds)
 
-    print_stat_table("汇总", [
-        (f"{args.probe}1 e2e", B.get("e2e", []) if B else [], W.get("e2e", []) if W else []),
-        ("create-api", B.get("create_api", []) if B else [], W.get("create_api", []) if W else []),
-        ("create(launchMs)", B.get("create", []) if B else [], W.get("create", []) if W else []),
-        (f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""),
-         B.get("cold", []) if B else [], W.get("cold", []) if W else []),
-        (f"{args.probe}2 (warm)", B.get("warm", []) if B else [], W.get("warm", []) if W else []),
-    ])
-    print_phase_summary(B, W)
+        runs.append((concurrency, B, W))
 
-    if B and W:
-        def sp(key, name):
-            if B[key] and W[key]:
-                b, w = sum(B[key]) / len(B[key]), sum(W[key]) / len(W[key])
-                if w > 0:
-                    print(f"  {name} 提速: {b/w:.2f}×  ({b:.0f}→{w:.0f}ms)")
-        print()
-        sp('cold', f"{args.probe} cold")
-        if B['create'] and W['create']:
-            cb, cw = sum(B['create']) / len(B['create']), sum(W['create']) / len(W['create'])
-            print(f"  create 差异: {cb-cw:+.0f}ms（预期 ≈0）")
+        print_stat_table(f"汇总（concurrency={concurrency}）", [
+            (f"{args.probe}1 e2e", B.get("e2e", []) if B else [], W.get("e2e", []) if W else []),
+            ("create-api", B.get("create_api", []) if B else [], W.get("create_api", []) if W else []),
+            ("create(launchMs)", B.get("create", []) if B else [], W.get("create", []) if W else []),
+            (f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""),
+             B.get("cold", []) if B else [], W.get("cold", []) if W else []),
+            (f"{args.probe}2 (warm)", B.get("warm", []) if B else [], W.get("warm", []) if W else []),
+        ])
+        print_phase_summary(B, W)
+        if B:
+            print_sample_details("B", concurrency, B, verbose=args.verbose)
+        if W:
+            print_sample_details("W", concurrency, W, verbose=args.verbose)
+
+    print_concurrency_trend("B", [(concurrency, B) for concurrency, B, _W in runs])
+    print_concurrency_trend("W", [(concurrency, W) for concurrency, _B, W in runs])
     if args.docker:
         print("\n=== Docker 对照 ===")
         run_docker_probe(args.probe)

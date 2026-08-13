@@ -62,6 +62,12 @@ B="$(cat openclaw-e2b-bare-snp-template.id)"
 W="$(cat openclaw-e2b-ws-template.id)"
 python3 bench.py --b "$B" --w "$W" --probe health -n 50
 
+# 多档并发：每个并发档位各执行 50 个 B/W 样本，并分别输出汇总
+python3 bench.py --b "$B" --w "$W" --probe health -n 50 -c 1 10 30 50
+
+# 分轮并发：每档 5 轮；每轮同时启动该档位数量，轮间等待全部完成
+python3 bench.py --b "$B" --w "$W" --probe health -r 5 -c 1 10 30 50
+
 # 2. openclaw bare：node-proxy → health
 PROFILE=bare IMAGE_NAME=openclaw python3 build_bw_coldboot.py
 B="$(cat openclaw-bare-snp-template.id)"
@@ -75,9 +81,26 @@ W="$(cat code-interpreter-e2b-ws-template.id)"
 python3 bench.py --b "$B" --w "$W" --probe run --command date -n 10
 ~~~
 
-场景 3 每轮内部校验 `commands.run("date")` 成功并返回 stdout；默认汇总模式不打印每轮成功明细，
-只有失败轮次打印 SID 和错误。bench.py 也保留 --probe exec，用于已启用 gateway
-HTTP exec 的 openclaw 镜像。
+场景 3 每轮内部校验 `commands.run("date")` 成功并返回 stdout。bench.py 也保留 --probe exec，
+用于已启用 gateway HTTP exec 的 openclaw 镜像。
+
+`-c/--concurrency` 可接收一个或多个正整数，默认 `1`。旧模式下，`-n/--iterations` 表示每个
+并发档位、每个已选择模板的总样本数，而不是每个 worker 的样本数；例如 `-n 50 -c 1 10 30 50`
+总计分别执行 4 × 50 个 B 样本和 4 × 50 个 W 样本。
+
+`-r/--rounds` 是严格分轮模式，与 `-n` 互斥。每轮启动恰好 `concurrency` 个样本，等待该批
+全部结束后再开始下一轮。例如 `-r 5 -c 1 10 30 50` 对每个模板分别尝试
+`5 × (1 + 10 + 30 + 50) = 455` 个样本；`c=1` 的 5 轮就是 5 次串行测试。失败样本仍会丢弃，
+并计入 `discarded` 和失败 JSONL 日志，不会补偿重试。
+
+每档默认只打印 attempted/accepted/discarded 计数；加 `-v/--verbose` 后才打印每个成功 sandbox 的
+SID 与 e2e/create-api/launch/cold/warm 耗时。失败样本无论是否加 `-v` 都会立即打印 SID 和错误；最后的并发趋势
+表对比各档的总耗时和启动阶段耗时相对基线的变化。任一 create、cold probe、launch timing 或
+warm probe 失败时，整条样本从所有统计中丢弃；关键信息默认追加保存到
+`logs/bench-failures.jsonl`，可用 `--failure-log PATH` 修改路径。
+
+只有选择两个或以上并发档位时才打印并发趋势表；默认的 `-c 1` 或显式单档 `-c 1` 只输出该档
+汇总，不做无意义的自身基线比较。B/W 的 cold 和 create 原始指标保留在汇总表中。
 
 ## 镜像基线
 
@@ -206,8 +229,9 @@ create → 立即第一次 probe → 读取 launchMs → 第二次 probe → del
 - `accountedMs + unaccountedMs` 应等于 `launchMs`（只允许微小的取整误差）。
 - health 场景使用 host 侧 `curl` 经 `node-proxy` 转发到 OpenClaw 的 `/health`，
   不是直连 floating IP，也不是 SDK `commands.run`。
-- `bench.py` 默认不打印每轮成功明细，只输出客户端汇总表和独立的启动阶段汇总表；
-  失败轮次只打印 SID 和错误。阶段按 `points` 的实际时间顺序统计，B/W 两侧平均都小于 3ms 的阶段不显示，
+- `bench.py` 默认不打印每轮成功明细，只输出客户端汇总表、独立的启动阶段汇总表和样本计数；
+  `-v/--verbose` 才打印每个成功沙箱的逐样本明细，失败轮次无论是否加 `-v` 都打印 SID 和错误。
+  阶段按 `points` 的实际时间顺序统计，B/W 两侧平均都小于 3ms 的阶段不显示，
   但不会从 `accountedMs` 中删除；`unaccountedMs` 仅用于内部完整性校对，不放入阶段表。
 - B/W 运行期间只显示单行原地更新的进度条，不输出成功轮次的明细。
 - 汇总表的列头统一为 `avg(ms)`、`p50(ms)`、`min(ms)`、`max(ms)`、`n`，B/W 分组下只显示数值。
