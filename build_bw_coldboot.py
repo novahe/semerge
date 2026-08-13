@@ -146,10 +146,16 @@ def main():
     try:
         # ① 起 gateway + 等 ready（bare：launch 已在 create 时注入，随 boot 自起）
         if PROFILE != "bare":
-            try:
-                s.commands.run(GW_CMD, timeout=15)
-            except Exception as e:
-                print(f"  commands.run: {type(e).__name__}（setsid 后台不受影响）")
+            # The gateway is deliberately long-lived.  A foreground
+            # commands.run waits for the shell/process stream to close even
+            # though the gateway was backgrounded inside that shell, which
+            # turns a successful launch into a client-side timeout.  Start it
+            # through envd and disconnect the output stream immediately; the
+            # guest process keeps running and readiness is verified below via
+            # the node-proxy health request.
+            handle = s.commands.run(GW_CMD, background=True, timeout=15)
+            handle.disconnect()
+            print(f"  commands.run(background) started pid={handle.pid}")
         print("[1/5] 等 gateway /health 200 …")
         if not wait_ready(sid, fat):
             sys.exit(f"✗ gateway {READY_WAIT}s 未 ready")

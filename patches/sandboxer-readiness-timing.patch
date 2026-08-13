@@ -1,0 +1,362 @@
+diff --git a/cmd/sandbox-ctl/readiness.go b/cmd/sandbox-ctl/readiness.go
+index ab25aed..dc0c9c7 100644
+--- a/cmd/sandbox-ctl/readiness.go
++++ b/cmd/sandbox-ctl/readiness.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -25,9 +26,10 @@ type readinessFDWriter struct {
+ 	ready        bool
+ 	closed       bool
+ 	loggedError  bool
++	timing       *sandbox.ReadinessTiming
+ }
+ 
+-func newReadinessFDWriter(fd int, logf func(string, ...any)) (*readinessFDWriter, error) {
++func newReadinessFDWriter(fd int, logf func(string, ...any), timing ...*sandbox.ReadinessTiming) (*readinessFDWriter, error) {
+ 	if fd < 3 {
+ 		return nil, fmt.Errorf("--ready-fd must be at least 3, got %d", fd)
+ 	}
+@@ -48,7 +50,11 @@ func newReadinessFDWriter(fd int, logf func(string, ...any)) (*readinessFDWriter
+ 	if logf == nil {
+ 		logf = func(string, ...any) {}
+ 	}
+-	return &readinessFDWriter{w: f, logf: logf}, nil
++	var t *sandbox.ReadinessTiming
++	if len(timing) > 0 {
++		t = timing[0]
++	}
++	return &readinessFDWriter{w: f, logf: logf, timing: t}, nil
+ }
+ 
+ func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
+@@ -81,7 +87,7 @@ func (w *readinessFDWriter) Notify(event sandbox.ReadinessEvent) {
+ 			_ = w.closeLocked()
+ 			return
+ 		}
+-		if err := w.writeLineLocked(event); err != nil {
++		if err := w.writeReadyLocked(); err != nil {
+ 			w.failLocked("write ready", err)
+ 			return
+ 		}
+@@ -98,6 +104,20 @@ func (w *readinessFDWriter) writeLineLocked(event sandbox.ReadinessEvent) error
+ 	return wireio.WriteAll(w.w, []byte(string(event)+"\n"))
+ }
+ 
++func (w *readinessFDWriter) writeReadyLocked() error {
++	if w.timing == nil {
++		return w.writeLineLocked(sandbox.ReadinessReady)
++	}
++	b, err := json.Marshal(w.timing)
++	if err != nil {
++		return err
++	}
++	if w.logf != nil {
++		w.logf("readiness timing: %s", b)
++	}
++	return wireio.WriteAll(w.w, append(append([]byte("ready\t"), b...), '\n'))
++}
++
+ func (w *readinessFDWriter) failLocked(op string, err error) {
+ 	if errors.Is(err, syscall.EPIPE) {
+ 		w.logOnceLocked("readiness fd reader closed early: %v", err)
+diff --git a/cmd/sandbox-ctl/readiness_test.go b/cmd/sandbox-ctl/readiness_test.go
+index 4716fde..eb2ae19 100644
+--- a/cmd/sandbox-ctl/readiness_test.go
++++ b/cmd/sandbox-ctl/readiness_test.go
+@@ -242,3 +242,31 @@ func TestReadinessFDWriterUsesFullWriteLoop(t *testing.T) {
+ 		t.Fatalf("readiness wire = %q, want %q", got, want)
+ 	}
+ }
++
++func TestReadinessFDWriterTimingPayload(t *testing.T) {
++	r, w, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer r.Close()
++	readyFD := transferReadinessFD(t, w)
++	timing := &sandbox.ReadinessTiming{
++		Version: 1, SandboxCtlStartUnixNs: 100, CHStartUnixNs: 200,
++		CHResumeDoneUnixNs: 300, SandboxInitAckUnixNs: 400,
++	}
++	n, err := newReadinessFDWriter(readyFD, nil, timing)
++	if err != nil {
++		_ = unix.Close(readyFD)
++		t.Fatal(err)
++	}
++	n.Notify(sandbox.ReadinessControlReady)
++	n.Notify(sandbox.ReadinessReady)
++	body, err := io.ReadAll(r)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := "control_ready\nready\t{\"version\":1,\"sandbox_ctl_start_unix_ns\":100,\"ch_start_unix_ns\":200,\"ch_resume_done_unix_ns\":300,\"sandbox_init_ack_unix_ns\":400}\n"
++	if string(body) != want {
++		t.Fatalf("readiness wire = %q, want %q", body, want)
++	}
++}
+diff --git a/cmd/sandbox-ctl/run.go b/cmd/sandbox-ctl/run.go
+index 1050fb5..ac53e3b 100755
+--- a/cmd/sandbox-ctl/run.go
++++ b/cmd/sandbox-ctl/run.go
+@@ -100,12 +100,19 @@ func runCmd(args []string) int {
+ 			readyFDSet = true
+ 		}
+ 	})
++	var readinessTiming *sandbox.ReadinessTiming
++	if readyFDSet {
++		readinessTiming = &sandbox.ReadinessTiming{
++			Version:               1,
++			SandboxCtlStartUnixNs: time.Now().UnixNano(),
++		}
++	}
+ 	var readiness *readinessFDWriter
+ 	if readyFDSet {
+ 		var err error
+ 		readiness, err = newReadinessFDWriter(*readyFD, func(format string, args ...any) {
+ 			log.Printf("[sandbox-ctl] "+format, args...)
+-		})
++		}, readinessTiming)
+ 		if err != nil {
+ 			fmt.Fprintf(os.Stderr, "sandbox-ctl run: %v\n", err)
+ 			return 2
+@@ -274,7 +281,7 @@ func runCmd(args []string) int {
+ 	if restoreR != "" {
+ 		return runRestore(ctx, cfg, manifestCfg, restoreR,
+ 			*sandboxID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
+-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness)
++			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, readinessTiming)
+ 	}
+ 
+ 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
+@@ -295,6 +302,7 @@ func runCmd(args []string) int {
+ 		PingFatalThreshold: *pingFatal,
+ 		Forwards:           forwards,
+ 		NotifyReadiness:    notifyReadiness,
++		ReadinessTiming:    readinessTiming,
+ 	})
+ 	if err != nil {
+ 		fmt.Fprintln(os.Stderr, err)
+@@ -308,8 +316,12 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
+ 	ref string, sandboxID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
+ 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
+ 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
+-	notifyReadiness sandbox.ReadinessNotify,
++	notifyReadiness sandbox.ReadinessNotify, readinessTimings ...*sandbox.ReadinessTiming,
+ ) int {
++	var readinessTiming *sandbox.ReadinessTiming
++	if len(readinessTimings) > 0 {
++		readinessTiming = readinessTimings[0]
++	}
+ 	// Validate host-only restore policy before inspecting the remote reference or
+ 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
+ 	// but the CLI owns NewFetcher and must not dial for an invalid config.
+@@ -372,6 +384,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, manifestCfg *con
+ 		PingFatalThreshold:  pingFatal,
+ 		Forwards:            forwards,
+ 		NotifyReadiness:     notifyReadiness,
++		ReadinessTiming:     readinessTiming,
+ 	})
+ 	if err != nil {
+ 		fmt.Fprintln(os.Stderr, err)
+diff --git a/pkg/restore/restore.go b/pkg/restore/restore.go
+index 60d186d..508311a 100755
+--- a/pkg/restore/restore.go
++++ b/pkg/restore/restore.go
+@@ -75,6 +75,7 @@ type Options struct {
+ 	// NotifyReadiness receives the one-shot startup milestones for this run.
+ 	// nil preserves the historical behavior exactly.
+ 	NotifyReadiness sandbox.ReadinessNotify
++	ReadinessTiming *sandbox.ReadinessTiming
+ }
+ 
+ // Run executes restore. Returns the CH exit code.
+@@ -579,6 +580,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
+ 		Forwards:        opts.Forwards,
+ 		Cgroup:          cg,
+ 		NotifyReadiness: opts.NotifyReadiness,
++		ReadinessTiming: opts.ReadinessTiming,
+ 
+ 		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
+ 			// CH 51 `--restore source_url=file://<dir>` replaces
+@@ -618,6 +620,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
+ 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
+ 				return fmt.Errorf("vm.resume: %w", err)
+ 			}
++			if pc.ReadinessTiming != nil {
++				pc.ReadinessTiming.CHResumeDoneUnixNs = time.Now().UnixNano()
++			}
+ 			pc.Logf("VM resumed, vCPU running")
+ 
+ 			tRestore := time.Now()
+@@ -628,9 +633,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
+ 			if restoreDeadline <= 0 {
+ 				restoreDeadline = config.NoForcedTimeout
+ 			}
+-			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
++			muxSpec, err := openAndEstablishRestoreMUXWithAck(func() (net.Conn, proto.StdioSpec, error) {
+ 				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+-			}, pc.EstablishMUX, pc.NotifyReady)
++			}, pc.EstablishMUX, func() {
++				if pc.ReadinessTiming != nil {
++					pc.ReadinessTiming.SandboxInitAckUnixNs = time.Now().UnixNano()
++				}
++			}, pc.NotifyReady)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -671,11 +680,23 @@ func openAndEstablishRestoreMUX(
+ 	open func() (net.Conn, proto.StdioSpec, error),
+ 	establish func(net.Conn, proto.StdioSpec) error,
+ 	notifyReady func(),
++) (proto.StdioSpec, error) {
++	return openAndEstablishRestoreMUXWithAck(open, establish, nil, notifyReady)
++}
++
++func openAndEstablishRestoreMUXWithAck(
++	open func() (net.Conn, proto.StdioSpec, error),
++	establish func(net.Conn, proto.StdioSpec) error,
++	notifyAck func(),
++	notifyReady func(),
+ ) (proto.StdioSpec, error) {
+ 	conn, spec, err := open()
+ 	if err != nil {
+ 		return proto.StdioSpec{}, fmt.Errorf("notify restore: %w (guest agent unreachable)", err)
+ 	}
++	if notifyAck != nil {
++		notifyAck()
++	}
+ 	if err := establish(conn, spec); err != nil {
+ 		// EstablishMUX did not take ownership on failure.
+ 		_ = conn.Close()
+diff --git a/pkg/sandbox/lifecycle.go b/pkg/sandbox/lifecycle.go
+index e782935..9b235fe 100755
+--- a/pkg/sandbox/lifecycle.go
++++ b/pkg/sandbox/lifecycle.go
+@@ -64,6 +64,9 @@ type RunOptions struct {
+ 	// NotifyReadiness receives the one-shot startup milestones for this run.
+ 	// nil preserves the historical behavior exactly.
+ 	NotifyReadiness ReadinessNotify
++	// ReadinessTiming carries sandbox-ctl/CH/restore points to the readiness
++	// bridge. nil preserves the historical plain readiness wire.
++	ReadinessTiming *ReadinessTiming
+ }
+ 
+ // Run executes one sandbox lifecycle: prepare backends + launch server,
+@@ -454,6 +457,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+ 		Forwards:          opts.Forwards,
+ 		Cgroup:            cg,
+ 		NotifyReadiness:   opts.NotifyReadiness,
++		ReadinessTiming:   opts.ReadinessTiming,
+ 		ReadyOnAppStarted: true,
+ 
+ 		BuildCmd: func(e CmdEnv) (*exec.Cmd, func(), error) {
+diff --git a/pkg/sandbox/readiness.go b/pkg/sandbox/readiness.go
+index e0bca68..0883fed 100644
+--- a/pkg/sandbox/readiness.go
++++ b/pkg/sandbox/readiness.go
+@@ -2,6 +2,19 @@ package sandbox
+ 
+ import "sync"
+ 
++// ReadinessTiming is the sandbox-ctl-side portion of the launch timeline.
++// Unix nanoseconds keep the wire compact and let node-ctl correlate these
++// points with its own wall clock without relying on process-relative clocks.
++// Zero fields mean that the phase does not exist on this boot path (for
++// example, CH resume and restore ACK are absent on a cold image boot).
++type ReadinessTiming struct {
++	Version               int   `json:"version"`
++	SandboxCtlStartUnixNs int64 `json:"sandbox_ctl_start_unix_ns"`
++	CHStartUnixNs         int64 `json:"ch_start_unix_ns,omitempty"`
++	CHResumeDoneUnixNs    int64 `json:"ch_resume_done_unix_ns,omitempty"`
++	SandboxInitAckUnixNs  int64 `json:"sandbox_init_ack_unix_ns,omitempty"`
++}
++
+ // ReadinessEvent is one startup milestone emitted by sandbox-ctl run.
+ type ReadinessEvent string
+ 
+diff --git a/pkg/sandbox/serveandwait.go b/pkg/sandbox/serveandwait.go
+index 7a44f25..d4e0b29 100755
+--- a/pkg/sandbox/serveandwait.go
++++ b/pkg/sandbox/serveandwait.go
+@@ -66,16 +66,17 @@ type CmdEnv struct {
+ //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
+ //     a non-nil return aborts the run (ServeAndWait kills CH).
+ type PostSpawnCtx struct {
+-	Ctx          context.Context
+-	Cmd          *exec.Cmd
+-	Pinger       *guestlink.Pinger
+-	Launch       *guestlink.LaunchServer
+-	EstablishMUX func(net.Conn, proto.StdioSpec) error
+-	Hooks        *resctl.ControllerHooks
+-	Balloon      *resctl.BalloonController
+-	CHSock       string
+-	Logf         func(string, ...any)
+-	NotifyReady  func()
++	Ctx             context.Context
++	Cmd             *exec.Cmd
++	Pinger          *guestlink.Pinger
++	Launch          *guestlink.LaunchServer
++	EstablishMUX    func(net.Conn, proto.StdioSpec) error
++	Hooks           *resctl.ControllerHooks
++	Balloon         *resctl.BalloonController
++	CHSock          string
++	Logf            func(string, ...any)
++	NotifyReady     func()
++	ReadinessTiming *ReadinessTiming
+ }
+ 
+ // VMParams is the input to ServeAndWait — everything the shared
+@@ -157,6 +158,7 @@ type VMParams struct {
+ 	// barrier; restore instead calls PostSpawnCtx.NotifyReady explicitly after
+ 	// its restore ACK and host-side MUX establishment.
+ 	NotifyReadiness   ReadinessNotify
++	ReadinessTiming   *ReadinessTiming
+ 	ReadyOnAppStarted bool
+ }
+ 
+@@ -559,6 +561,9 @@ func ServeAndWait(p VMParams) (int, error) {
+ 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+ 	defer signal.Stop(sigCh)
+ 
++	if p.ReadinessTiming != nil {
++		p.ReadinessTiming.CHStartUnixNs = time.Now().UnixNano()
++	}
+ 	if err := startCH(cmd, p.NetnsFile); err != nil {
+ 		cancelBackends()
+ 		backendWG.Wait()
+@@ -577,16 +582,17 @@ func ServeAndWait(p VMParams) (int, error) {
+ 	})
+ 
+ 	if err := p.PostSpawn(PostSpawnCtx{
+-		Ctx:          backendCtx,
+-		Cmd:          cmd,
+-		Pinger:       pinger,
+-		Launch:       launch,
+-		EstablishMUX: establishMUX,
+-		Hooks:        p.Hooks,
+-		Balloon:      p.Balloon,
+-		CHSock:       chSock,
+-		Logf:         logf,
+-		NotifyReady:  readiness.notifyReady,
++		Ctx:             backendCtx,
++		Cmd:             cmd,
++		Pinger:          pinger,
++		Launch:          launch,
++		EstablishMUX:    establishMUX,
++		Hooks:           p.Hooks,
++		Balloon:         p.Balloon,
++		CHSock:          chSock,
++		Logf:            logf,
++		NotifyReady:     readiness.notifyReady,
++		ReadinessTiming: p.ReadinessTiming,
+ 	}); err != nil {
+ 		_ = cmd.Process.Kill()
+ 		cancelBackends()
+

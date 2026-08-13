@@ -18,6 +18,39 @@ e2b-env.sh 中的路径、TLS 证书和 API 配置正确。若使用 nova 部署
 export E2B_ENV_FILE=/root/sandbox/nova-work/etc/node-ctl-nova/tenant.env
 ~~~
 
+## node-ctl / sandboxer 修改补丁
+
+当前计时链路需要同时更新 sandboxer 和 orchestrator/node-ctl。对应 patch 放在
+`patches/`，只包含本次 readiness timing、launchTiming 和 NS cgroup unit prefix
+相关修改，不包含构建产物，也不包含 orchestrator 中无关的 `docs/`、`release-builder/`
+文件。
+
+应用到干净的对应仓库基线：
+
+~~~bash
+WS_BENCH=/root/sandbox/ws-bench
+
+cd /root/sandbox/sandboxer
+git apply --check "$WS_BENCH/patches/sandboxer-readiness-timing.patch"
+git apply "$WS_BENCH/patches/sandboxer-readiness-timing.patch"
+env GOCACHE=/tmp/e2b-go-build-cache go test ./pkg/sandbox ./pkg/restore ./cmd/sandbox-ctl
+
+cd /root/sandbox/orchestrator
+git apply --check "$WS_BENCH/patches/orchestrator-node-ctl-timing-isolation.patch"
+git apply "$WS_BENCH/patches/orchestrator-node-ctl-timing-isolation.patch"
+env GOCACHE=/tmp/e2b-go-build-cache go test ./internal/config ./internal/nodectl ./internal/orch \
+  ./internal/configsock ./internal/api ./cmd/node-ctl
+~~~
+
+补丁应用后需要重新构建 `sandbox-ctl` 和 `node-ctl`，再执行 nova 的
+`deploy-ns.sh replace`；只替换 node-ctl 不会让旧 sandboxer 进程获得新的 readiness
+时间点。部署验证仍使用本 README 的 `bench.py --probe health` 命令。
+
+补丁文件：
+
+- `patches/sandboxer-readiness-timing.patch`：sandbox-ctl 记录 CH 启动、resume 返回、sandbox-init ACK，并通过 readiness wire 传给 node-ctl。
+- `patches/orchestrator-node-ctl-timing-isolation.patch`：node-ctl 暴露 launchTiming、读取 readiness 时间点，并按 NS 的 systemd runner unit prefix 隔离资源扫描。
+
 ## 快速运行
 
 ~~~bash
@@ -42,8 +75,8 @@ W="$(cat code-interpreter-e2b-ws-template.id)"
 python3 bench.py --b "$B" --w "$W" --probe run --command date -n 10
 ~~~
 
-场景 3 每轮必须打印成功的 date stdout，例如 ✓ Wed Aug 12 ...；只有耗时、没有
-date 输出的轮次不能作为基线。bench.py 也保留 --probe exec，用于已启用 gateway
+场景 3 每轮内部校验 `commands.run("date")` 成功并返回 stdout；默认汇总模式不打印每轮成功明细，
+只有失败轮次打印 SID 和错误。bench.py 也保留 --probe exec，用于已启用 gateway
 HTTP exec 的 openclaw 镜像。
 
 ## 镜像基线
@@ -111,8 +144,9 @@ build_bw_coldboot.py 的流程：
 ~~~
 
 PROFILE=bare 时 gateway 通过 create metadata 的 launch spec 启动；PROFILE=e2b
-时通过 envd commands.run 启动。toTemplate 导出不会删除源 sandbox，流程最后由
-脚本显式 DELETE 清理。
+时通过 envd `commands.run(background=True)` 启动长驻 gateway，并立即用 node-proxy
+`/health` 校验，不等待长驻进程的前台输出流。toTemplate 导出不会删除源 sandbox，
+流程最后由脚本显式 DELETE 清理。
 
 ### code-interpreter + e2b
 
@@ -160,6 +194,48 @@ create → 立即第一次 probe → 读取 launchMs → 第二次 probe → del
 - run1/cold = e2e1 - create(launchMs)。
 - run2/warm：只统计第二次 probe 本身。
 - p50：严格中位数；偶数样本取两个中间值的平均，输出保留 1 位小数。
+
+### launchTiming 与原始日志校对
+
+`GET /api/v1/sandboxes/<sid>` 在 `launchMs` 旁返回 `launchTiming`。其中：
+
+- `points` 是 node-ctl 与 sandbox-ctl 的 RFC3339Nano 时间点；
+- `phasesMs` 是阶段差值，e2b 快照包含 `ch_start_to_resume`、
+  `resume_to_sandbox_init_ack`、`sandbox_init_ack_to_runtime_ready` 和
+  `runtime_ready_to_envd_init_done`；bare 没有 `envd` 阶段；
+- `accountedMs + unaccountedMs` 应等于 `launchMs`（只允许微小的取整误差）。
+- health 场景使用 host 侧 `curl` 经 `node-proxy` 转发到 OpenClaw 的 `/health`，
+  不是直连 floating IP，也不是 SDK `commands.run`。
+- `bench.py` 默认不打印每轮成功明细，只输出客户端汇总表和独立的启动阶段汇总表；
+  失败轮次只打印 SID 和错误。阶段按 `points` 的实际时间顺序统计，B/W 两侧平均都小于 3ms 的阶段不显示，
+  但不会从 `accountedMs` 中删除；`unaccountedMs` 仅用于内部完整性校对，不放入阶段表。
+- B/W 运行期间只显示单行原地更新的进度条，不输出成功轮次的明细。
+- 汇总表的列头统一为 `avg(ms)`、`p50(ms)`、`min(ms)`、`max(ms)`、`n`，B/W 分组下只显示数值。
+- 客户端汇总顺序为 `health1 e2e`、`create-api`、`create(launchMs)`、首 probe cold 和第二次 warm；
+  `create-api` 是客户端 POST create 到收到 201 的墙钟耗时。
+
+阶段含义：
+
+| 阶段 | 时间边界 |
+|---|---|
+| `admission_to_node_prepare` | conductor 接收 create → node-ctl 完成节点准备 |
+| `sandbox_ctl_dispatch` | runner 接手 → sandbox-ctl 开始处理 |
+| `sandbox_ctl_pre_ch` | sandbox-ctl 开始处理 → Cloud Hypervisor 启动 |
+| `ch_start_to_resume` | Cloud Hypervisor 启动 → resume 接口返回 |
+| `resume_to_sandbox_init_ack` | resume 返回 → sandbox-init 初始化完成并 ACK |
+| `sandbox_init_ack_to_runtime_ready` | sandbox-init ACK → node-ctl 收到 runtime ready |
+| `runtime_ready_to_envd_init_done` | node-ctl 收到 runtime ready → envd `/init` 完成，仅 e2b |
+| `envd_init_to_launch_done` | envd `/init` 完成 → launch terminal/state running，仅 e2b |
+| `accountedMs` | 已纳入阶段统计的耗时总和，应接近 `create(launchMs)` |
+
+bare 场景没有 envd 阶段，使用 `ch_start_to_runtime_ready` 和
+`runtime_ready_to_launch_done` 两段替代 e2b 的 runtime/envd 拆分。
+
+ready ack 的原始 wire 同时写入 sandbox-ctl 日志，node-ctl 的
+`sandbox launch terminal` 日志写入完整 `launch_timing`。因此一轮测试完成后，先保存
+`<NS>-work/var/lib/logs/`，再按 sandbox ID 搜索两边日志，检查 CH 启动、resume、
+restore ack、runtime ready、envd init 和 launch terminal 的时间顺序；不能只看
+bench 的聚合结果。
 
 ## code-interpreter + e2b 基线
 

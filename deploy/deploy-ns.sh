@@ -784,6 +784,7 @@ resource_listen:
   socket: $RES_SOCKET
   state_path: $RUNROOT/state.json
   audit_path: $RUNROOT/audit.log
+  cgroup_unit_prefix: sandbox-runner-${NS}@
   resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 2GiB, cpu: 1.5 } }
   watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
   rate_limits: { memory_grant_per_sec_factor: 0.05 }
@@ -891,11 +892,17 @@ UNIT
 [Service]
 # Passed through node-ctl run-sandbox to the Cloud Hypervisor process.
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+# Keep sandbox-ctl/Cloud Hypervisor runtime logs under this NS work directory.
+StandardOutput=append:$LOGDIR/runner.log
+StandardError=append:$LOGDIR/runner.log
 UNIT
   cat > "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf" <<UNIT
 [Service]
 # Keep builder-launched Cloud Hypervisor processes on the same default CPU model.
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+# Keep builder runtime logs under this NS work directory.
+StandardOutput=append:$LOGDIR/builder.log
+StandardError=append:$LOGDIR/builder.log
 UNIT
   chmod 644 "$RUNNER_DROPIN_DIR/10-cloud-hypervisor.conf" "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf"
   if [ -n "$UNIT_MIRROR_DIR" ] && [ "$UNIT_MIRROR_DIR" != "$UNIT_DIR" ]; then
@@ -1245,7 +1252,10 @@ stop_environment() {
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  rm -f "$PIDFILE" "$STATEFILE"
+  # state.json is only the resource controller's transient recovery state;
+  # remove it after all units are stopped so a later up starts from live
+  # per-NS inventory instead of stale reservations.
+  rm -f "$PIDFILE" "$STATEFILE" "$RUNROOT/state.json"
 }
 
 UP_IN_PROGRESS=0

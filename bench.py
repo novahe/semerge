@@ -28,6 +28,7 @@ E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
 import argparse, json, os, re, socket, subprocess, sys, time
+from datetime import datetime
 
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
@@ -63,20 +64,87 @@ def wait_launch_ms(sid, timeout=60):
     直到出现 launchMs——这是 conductor 在 launch terminal 写入的【服务端精确】boot
     耗时（acceptedAt→terminal，含 restore/runtime-ready/envd-init，ms，亚毫秒精度）。
     轮询只为同步检测（值与日志 starting_total_duration 完全一致），不引入客户端计时偏差。
-    返回 float ms 或 None（launch 失败/超时）。"""
+    返回 (float ms, launchTiming) 或 (None, None)（launch 失败/超时）。"""
     end = time.time() + timeout
     while time.time() < end:
         r = e2b_env.api_request("GET", f"/sandboxes/{sid}")
         if r.status_code == 404:
-            return None
+            return None, None
         try:
-            ms = r.json().get("launchMs")
+            body = r.json()
+            ms = body.get("launchMs")
             if ms is not None:
-                return float(ms)
+                return float(ms), body.get("launchTiming")
         except Exception:
             pass
         time.sleep(0.01)
-    return None
+    return None, None
+
+
+TIMING_PHASES = (
+    ("admission_to_node_prepare", "accepted", "node_prepare_done"),
+    ("runner_wait", "runner_assign_start", "runner_commit_start"),
+    ("runner_commit", "runner_commit_start", "runner_commit_done"),
+    ("runner_handoff", "runner_commit_done", "runner_handoff_done"),
+    ("sandbox_ctl_dispatch", "runner_handoff_done", "sandbox_ctl_start"),
+    ("sandbox_ctl_pre_ch", "sandbox_ctl_start", "ch_start"),
+    ("ch_start_to_resume", "ch_start", "ch_resume_done"),
+    ("resume_to_sandbox_init_ack", "ch_resume_done", "sandbox_init_ack"),
+    ("sandbox_init_ack_to_runtime_ready", "sandbox_init_ack", "runtime_ready_received"),
+    ("ch_start_to_runtime_ready", "ch_start", "runtime_ready_received"),
+    ("runtime_ready_to_envd_init_done", "runtime_ready_received", "envd_init_done"),
+    ("envd_init_to_launch_done", "envd_init_done", "launch_done"),
+    ("runtime_ready_to_launch_done", "runtime_ready_received", "launch_done"),
+)
+
+PHASE_DESCRIPTIONS = {
+    "admission_to_node_prepare": "conductor 接收 create 到 node-ctl 完成节点准备",
+    "runner_wait": "node-ctl 开始分配 runner 到 runner commit 开始",
+    "runner_commit": "runner commit 开始到 commit 完成",
+    "runner_handoff": "runner commit 完成到 sandbox runner 接手",
+    "sandbox_ctl_dispatch": "runner 接手到 sandbox-ctl 开始处理",
+    "sandbox_ctl_pre_ch": "sandbox-ctl 开始处理到 Cloud Hypervisor 启动",
+    "ch_start_to_resume": "Cloud Hypervisor 启动到 resume 接口返回",
+    "resume_to_sandbox_init_ack": "resume 返回到 sandbox-init 初始化完成并 ACK",
+    "sandbox_init_ack_to_runtime_ready": "sandbox-init ACK 到 node-ctl 收到 runtime ready",
+    "ch_start_to_runtime_ready": "Cloud Hypervisor 启动到 node-ctl 收到 runtime ready（bare）",
+    "runtime_ready_to_envd_init_done": "node-ctl 收到 runtime ready 到 envd /init 完成（e2b）",
+    "envd_init_to_launch_done": "envd /init 完成到 launch terminal/state running（e2b）",
+    "runtime_ready_to_launch_done": "runtime ready 到 launch terminal/state running（bare）",
+    "accountedMs": "已纳入阶段统计的耗时总和，应接近 create(launchMs)",
+}
+
+TIMING_DISPLAY_MIN_MS = 3.0
+PROGRESS_WIDTH = 24
+
+
+def _timing_point_key(points, name, fallback):
+    """Sort a phase by its RFC3339Nano start point, with a stable fallback."""
+    value = points.get(name)
+    if not value:
+        return (1, fallback)
+    try:
+        # node-ctl emits UTC RFC3339Nano values. fromisoformat handles the
+        # variable fractional-second width after converting Z to an offset.
+        return (0, datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return (1, fallback)
+
+
+def launch_timing_rows(timing, minimum_ms=TIMING_DISPLAY_MIN_MS):
+    """Return chronological phases, optionally hiding sub-3ms display noise."""
+    if not timing:
+        return []
+    phases = timing.get("phasesMs") or {}
+    points = timing.get("points") or {}
+    visible = []
+    for index, (name, start, _end) in enumerate(TIMING_PHASES):
+        value = phases.get(name)
+        if value is None or value < minimum_ms:
+            continue
+        visible.append((_timing_point_key(points, start, index), index, name, value))
+    visible.sort(key=lambda row: (row[0], row[1]))
+    return [(row[2], row[3]) for row in visible]
 
 
 def run_command_probe(sandbox, command, user="root", cwd="/", timeout=30):
@@ -101,39 +169,79 @@ def probe(sid, token, mode, sandbox, command=DEFAULT_RUN_COMMAND,
         return r.get("ok") is True, r.get("total", 0) * 1000, r.get("text", "")[:30]
     r = openclaw_net.curl_gateway_proxy(sid, token)
     ok = r.get("http") == 200
-    return ok, r.get("total", 0) * 1000, ""
+    text = "" if ok else f"HTTP {r.get('http', 0)} {r.get('err', '')}".strip()
+    return ok, r.get("total", 0) * 1000, text
+
+
+def _clear_progress():
+    sys.stdout.write("\r" + (" " * 120) + "\r")
+    sys.stdout.flush()
+
+
+def _show_progress(label, completed, total):
+    """Update one in-place progress line; no per-round success details."""
+    total = max(total, 1)
+    filled = min(PROGRESS_WIDTH, int(PROGRESS_WIDTH * completed / total))
+    bar = "#" * filled + "." * (PROGRESS_WIDTH - filled)
+    line = f"  {label} progress [{bar}] {completed:>{len(str(total))}}/{total}"
+    sys.stdout.write("\r" + line.ljust(90))
+    if completed >= total:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
                run_user="root", run_cwd="/", run_timeout=30):
-    res = {k: [] for k in ('create', 'e2e', 'cold', 'warm')}
+    res = {k: [] for k in ('create', 'create_api', 'e2e', 'cold', 'warm')}
+    res["phases"] = {}
+    res["accounted"] = []
+    res["unaccounted"] = []
+    _show_progress(label, 0, n)
     for i in range(n):
         sid = token = None
         sandbox = None
         try:
-            e2e_start = time.perf_counter()
+            e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
             sid, token = create(template)
+            create_return = time.perf_counter()         # 1.0 create interface return
+            create_api_ms = (create_return - e2e_start) * 1000
+            res['create_api'].append(create_api_ms)
             if mode == "run":
                 sandbox = Sandbox.connect(sid, timeout=120)
             ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
-            e2e1 = (time.perf_counter() - e2e_start) * 1000
+            probe_return = time.perf_counter()           # 2.0 probe return
+            e2e1 = (probe_return - e2e_start) * 1000     # 0.0 -> 2.0
+            probe_e2e_ms = (probe_return - create_return) * 1000
             # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
             # 避免轮询 wait_launch_ms 污染端到端耗时。
-            tc = wait_launch_ms(sid)
+            tc, timing = wait_launch_ms(sid)
             if tc is None:
                 raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-            run1 = e2e1 - tc
-            ok2, c2, _ = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
+            run1 = e2e1 - tc if ok1 else None
+            if ok1:
+                ok2, c2, t2 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
+            else:
+                ok2, c2, t2 = False, None, "probe1 failed"
             if ok1:
                 res['create'].append(tc); res['e2e'].append(e2e1); res['cold'].append(run1)
+                if timing:
+                    for name, value in launch_timing_rows(timing, minimum_ms=0.0):
+                        res["phases"].setdefault(name, []).append(value)
+                    if timing.get("accountedMs") is not None:
+                        res["accounted"].append(float(timing["accountedMs"]))
+                    if timing.get("unaccountedMs") is not None:
+                        res["unaccounted"].append(float(timing["unaccountedMs"]))
             if ok2:
                 res['warm'].append(c2)
-            print(f"  [{label} {i+1}/{n}] sid={sid[:8]}.. create(launchMs) {tc:5.0f}  "
-                  f"e2e1={e2e1:5.0f}  {mode}1(e2e-create)={run1:5.0f}  "
-                  f"{mode}2(warm)={c2:4.0f}  "
-                  + ('✓ ' + t1[:24] if ok1 else f"✗ {t1}"))
+            if not ok1:
+                _clear_progress()
+                print(f"  sid={sid} error={t1}")
+            elif not ok2:
+                _clear_progress()
+                print(f"  sid={sid} error={t2 or 'warm probe failed'}")
         except Exception as e:
-            print(f"  [{label} {i+1}] ✗ {type(e).__name__}: {e}")
+            _clear_progress()
+            print(f"  sid={sid or '<none>'} error={type(e).__name__}: {e}")
         finally:
             if sandbox is not None:
                 # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口，
@@ -147,31 +255,83 @@ def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
             elif sid:
                 try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
                 except Exception: pass
+            _show_progress(label, i + 1, n)
     return res
 
 
-def stats(xs):
-    """返回统计摘要；p50 对偶数样本取两个中间值的平均。"""
+SUMMARY_LABEL_WIDTH = 38
+SUMMARY_VALUE_WIDTH = 9
+SUMMARY_N_WIDTH = 4
+
+
+def stat_cells(xs):
+    """Return fixed cells for avg/p50/min/max/n without embedded labels."""
     if not xs:
-        return "(无样本)"
-    xs = sorted(xs); n = len(xs)
+        return ("-", "-", "-", "-", "-")
+    xs = sorted(xs)
+    n = len(xs)
     mid = n // 2
     p50 = xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
-    return f"avg={sum(xs)/n:.0f}ms p50={p50:.1f}ms min={min(xs):.0f}ms max={max(xs):.0f}ms (n={n})"
+    return (f"{sum(xs) / n:.1f}", f"{p50:.1f}", f"{min(xs):.1f}",
+            f"{max(xs):.1f}", str(n))
 
 
-SUMMARY_STAT_WIDTH = 50
+def _stat_group(cells):
+    return " ".join([
+        f"{cells[0]:>{SUMMARY_VALUE_WIDTH}}",
+        f"{cells[1]:>{SUMMARY_VALUE_WIDTH}}",
+        f"{cells[2]:>{SUMMARY_VALUE_WIDTH}}",
+        f"{cells[3]:>{SUMMARY_VALUE_WIDTH}}",
+        f"{cells[4]:>{SUMMARY_N_WIDTH}}",
+    ])
 
 
-def stats_fixed(xs):
-    """返回用于汇总表的定宽统计摘要。"""
-    if not xs:
-        return "(无样本)"
-    xs = sorted(xs); n = len(xs)
-    mid = n // 2
-    p50 = xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
-    return (f"avg={sum(xs)/n:4.0f}ms p50={p50:6.1f}ms "
-            f"min={min(xs):4.0f}ms max={max(xs):4.0f}ms n={n:2d}")
+def print_stat_table(title, rows):
+    """Print a fixed-width B/W table with statistics in the column headers."""
+    b_header = _stat_group(("avg(ms)", "p50(ms)", "min(ms)", "max(ms)", "n"))
+    w_header = b_header
+    separator = f"  {'-' * SUMMARY_LABEL_WIDTH} {'-' * len(b_header)} | {'-' * len(w_header)}"
+    print(f"\n=== {title} ===")
+    print(f"  {'指标':<{SUMMARY_LABEL_WIDTH}} {'B':^{len(b_header)}} | {'W':^{len(w_header)}}")
+    print(f"  {'':<{SUMMARY_LABEL_WIDTH}} {b_header} | {w_header}")
+    print(separator)
+    for label, b_values, w_values in rows:
+        b = _stat_group(stat_cells(b_values))
+        w = _stat_group(stat_cells(w_values))
+        print(f"  {label:<{SUMMARY_LABEL_WIDTH}} {b} | {w}")
+
+
+def print_phase_summary(B, W):
+    """Print a separate fixed-width B/W summary for launch phases."""
+    b_phases = B.get("phases", {}) if B else {}
+    w_phases = W.get("phases", {}) if W else {}
+
+    rows = []
+    for name, _start, _end in TIMING_PHASES:
+        b_values = b_phases.get(name, [])
+        w_values = w_phases.get(name, [])
+        values = b_values + w_values
+        # Hide phases whose aggregate duration is below the display threshold
+        # for both B and W. Filtering by max(value) would expose a mostly
+        # sub-3ms phase merely because of one outlier.
+        means = [sum(group) / len(group) for group in (b_values, w_values) if group]
+        if values and max(means, default=0.0) >= TIMING_DISPLAY_MIN_MS:
+            rows.append((name, b_values, w_values))
+
+    # accountedMs is a useful total beside the phase aggregate. unaccountedMs
+    # is deliberately omitted here when it is only sub-3ms display noise.
+    for name, key in (("accountedMs", "accounted"),):
+        b_values = B.get(key, []) if B else []
+        w_values = W.get(key, []) if W else []
+        if b_values or w_values:
+            rows.append((name, b_values, w_values))
+
+    print_stat_table("启动阶段汇总（平均 >= 3ms）", rows)
+    print("  阶段说明（单位：ms；列为 avg / p50 / min / max / n）：")
+    for name, _b_values, _w_values in rows:
+        description = PHASE_DESCRIPTIONS.get(name)
+        if description:
+            print(f"    {name:<38} {description}")
 
 
 def docker_curl(mode, port=18790):
@@ -257,6 +417,9 @@ def main():
     if args.probe == "run":
         hdr = [f"# working-set 对比（e2b envd，probe=commands.run）",
                f"n={args.iterations}  command={args.command}  user={args.run_user} cwd={args.run_cwd}"]
+    elif args.probe == "health":
+        hdr = ["# working-set 对比（openclaw + e2b/envd，node-proxy curl /health）",
+               f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
     else:
         hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
                f"n={args.iterations}  proxy={openclaw_net.proxy_url()}"]
@@ -276,17 +439,15 @@ def main():
         W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
                        args.run_user, args.run_cwd, args.run_timeout)
 
-    print("\n=== 汇总 ===")
-    def col(label, key):
-        b = stats_fixed(B[key]) if B else "(无样本)"
-        w = stats_fixed(W[key]) if W else "(无样本)"
-        print(f"  {label:<18} {b:<{SUMMARY_STAT_WIDTH}} | {w}")
-    print(f"  {'指标':<18} {'B':<{SUMMARY_STAT_WIDTH}} | W")
-    print(f"  {'-' * 18} {'-' * SUMMARY_STAT_WIDTH} | {'-' * SUMMARY_STAT_WIDTH}")
-    col("create(launchMs)", "create")
-    col(f"{args.probe}1 e2e", "e2e")
-    col(f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""), "cold")
-    col(f"{args.probe}2 (warm)", "warm")
+    print_stat_table("汇总", [
+        (f"{args.probe}1 e2e", B.get("e2e", []) if B else [], W.get("e2e", []) if W else []),
+        ("create-api", B.get("create_api", []) if B else [], W.get("create_api", []) if W else []),
+        ("create(launchMs)", B.get("create", []) if B else [], W.get("create", []) if W else []),
+        (f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""),
+         B.get("cold", []) if B else [], W.get("cold", []) if W else []),
+        (f"{args.probe}2 (warm)", B.get("warm", []) if B else [], W.get("warm", []) if W else []),
+    ])
+    print_phase_summary(B, W)
 
     if B and W:
         def sp(key, name):

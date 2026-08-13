@@ -100,7 +100,7 @@ METRICS_PORT=39095 \
 | 内容 | 默认路径 |
 |---|---|
 | 工作目录 | `/root/sandbox/<prefix>-work` |
-| 运行日志 | `/root/sandbox/<prefix>-work/var/lib/logs/` |
+| 运行日志 | `/root/sandbox/<prefix>-work/var/lib/logs/`（含 runner.log、builder.log、conductor.log、proxy.log、vswitch.log） |
 | 配置、证书、tenant 凭据 | `/root/sandbox/<prefix>-work/etc/node-ctl-<prefix>/` |
 | runner/socket/state | `/root/sandbox/<prefix>-work/run/` |
 | 冒烟输出 | `/root/sandbox/<prefix>-work/smoke-tmp/` |
@@ -128,6 +128,7 @@ METRICS_PORT=39095 \
 | switch/MGMT MAC | 按 NS 的 SHA-256 派生，并检查 switch MAC 和 connector 派生 MAC |
 | Unix socket | 位于该 NS 的 work/run 目录 |
 | systemd unit | `*-<NS>*` |
+| resource cgroup 盘点 | 共享 runner slice 下按 `sandbox-runner-<NS>@` 前缀过滤，不计入其他 NS |
 | Cloud Hypervisor CPU model | runner/builder 的 systemd drop-in，默认 `auto` |
 | 配置、状态、日志、快照目录 | 位于 `<NS>-work` 或 `<NS>-snaps` |
 
