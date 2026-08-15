@@ -38,7 +38,8 @@ if PROFILE == "bare":
     DEFAULT_OUT_B = f"{IMAGE_NAME}-bare-snp-template.id"
     DEFAULT_OUT_W = f"{IMAGE_NAME}-bare-ws-template.id"
 else:
-    DEFAULT_OUT_B = f"{IMAGE_NAME}-e2b-bare-snp-template.id"
+    # e2b profile：命名不再重复 "bare"（那修饰镜像形态而非 profile）
+    DEFAULT_OUT_B = f"{IMAGE_NAME}-e2b-snp-template.id"
     DEFAULT_OUT_W = f"{IMAGE_NAME}-e2b-ws-template.id"
 OUT_B = os.environ.get("OUT_B", os.path.join(PARENT, DEFAULT_OUT_B))
 OUT_W = os.environ.get("OUT_W", os.path.join(PARENT, DEFAULT_OUT_W))
@@ -76,8 +77,10 @@ def del_hosts(sid, domain):
 
 
 def export_sandbox(sid):
+    # keepSource=True：B 导出后保留源沙箱，供 connect 恢复继续做 W
+    # （#197 起 toTemplate 默认删除源，不保留则步骤③ connect 404）。
     r = e2b_env.api_request("POST", f"/sandboxes/{sid}/export",
-                            json={"toTemplate": True}, timeout=180)
+                            json={"toTemplate": True, "keepSource": True}, timeout=180)
     if r.status_code != 200:
         sys.exit(f"✗ export HTTP {r.status_code}: {r.text[:300]}")
     return r.json().get("result", "")
