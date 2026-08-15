@@ -23,8 +23,9 @@
 #
 # 可用环境变量覆盖（换环境时设这些即可）：
 #   WORKDIR API_PORT PROXY_PORT MMDS_PORT METRICS_PORT MAC DOMAIN MANIFEST_CONFIG MANIFEST_KEY FIP_BASE UNIT_DIR PROXY_NETNS
-#   CLOUD_HYPERVISOR_CPUS_MODEL
-#   NFS_ROOT NFS_DIR NFS_SNAPSHOT_DIR REMOTE_SNAPSHOT_PARENT AUTO_CREATE_TEMPLATES VSWITCH_PORTS
+#   CLOUD_HYPERVISOR_CPUS_MODEL SANDBOX_CH_PATH
+#   NFS_ROOT NFS_DIR NFS_SNAPSHOT_DIR REMOTE_SNAPSHOT_PARENT AUTO_CREATE_TEMPLATES VSWITCH_PORTS PROXY_ROUTE_CAPACITY
+#   GENEVE_LOCATOR GENEVE_TLV_LOCATOR GENEVE_PORT_BASE（vswitch GENEVE slot locator；默认不传=port，兼容旧行为）
 #
 # 存储分工：NFS_DIR/REMOTE_SNAPSHOT_PARENT 只用于 snapshot；MANIFEST_CONFIG 独立指向
 # yyl 上传的 manifest/store/cache 配置（例如 config/manifest-obs.yaml），本脚本不启动 yyl 存储。
@@ -57,6 +58,7 @@ PROXY_PORT_USER_SET=0; [ -n "${PROXY_PORT+x}" ] && PROXY_PORT_USER_SET=1
 MMDS_PORT_USER_SET=0; [ -n "${MMDS_PORT+x}" ] && MMDS_PORT_USER_SET=1
 METRICS_PORT_USER_SET=0; [ -n "${METRICS_PORT+x}" ] && METRICS_PORT_USER_SET=1
 CH_CPU_MODEL_USER_SET=0; [ -n "${CLOUD_HYPERVISOR_CPUS_MODEL+x}" ] && CH_CPU_MODEL_USER_SET=1
+CH_PATH_USER_SET=0; [ -n "${SANDBOX_CH_PATH+x}" ] && CH_PATH_USER_SET=1
 PROXY_LISTEN_USER_SET=0; [ -n "${PROXY_LISTEN+x}" ] && PROXY_LISTEN_USER_SET=1
 VSWITCH_PORTS_USER_SET=0; [ -n "${VSWITCH_PORTS+x}" ] && VSWITCH_PORTS_USER_SET=1
 FIP_USER_SET=0
@@ -106,7 +108,7 @@ PROXY_SOCK="${RUNROOT}/proxy.sock"
 PROXY_SHM="${RUNROOT}/proxy-routes.shm"
 PIDFILE="${RUNROOT}/env.pids"            # 兼容旧版后台脚本
 STATEFILE="${RUNROOT}/deploy.state"
-NAT_STATE="${RUNROOT}/nat.rules"
+NAT_STATE="${RUNROOT}/nat.rules"            # 旧版部署的 NAT 规则记录（现在仅用于清理遗留）
 HOSTS_STATE="${RUNROOT}/hosts.added"
 LOCKFILE="${RUNROOT}/deploy.lock"
 GLOBAL_LOCKFILE="${DEPLOY_GLOBAL_LOCKFILE:-/run/kuasar/deploy-ns.lock}"
@@ -171,8 +173,10 @@ else
   MAC_HEX="$(printf '%s' "$NS" | sha256sum | awk '{print substr($1,1,10)}')"
   MAC="02:${MAC_HEX:0:2}:${MAC_HEX:2:2}:${MAC_HEX:4:2}:${MAC_HEX:6:2}:${MAC_HEX:8:2}"
 fi
-# 复用 yyl 存储后端（不含存储）
-MANIFEST_CONFIG="${MANIFEST_CONFIG:-$REPO_ROOT/e2b-bench-file-bare/config/manifest-obs.yaml}"
+# 复用 yyl 存储后端（不含存储）。默认使用当前 NS 的 node-ctl 配置目录，
+# 例如 WORKDIR=/root/sandbox/nova-work、NS=nova 时为：
+# /root/sandbox/nova-work/etc/node-ctl-nova/manifest-obs.yaml
+MANIFEST_CONFIG="${MANIFEST_CONFIG:-$CFGDIR/manifest-obs.yaml}"
 if [ -n "${UNIT_DIR+x}" ]; then
   UNIT_DIR="$UNIT_DIR"
 elif [ "$CMD" = prepare ] && [ -n "$WORKDIR" ]; then
@@ -184,6 +188,10 @@ UNIT_MIRROR_DIR="${UNIT_MIRROR_DIR:-${WORKDIR:+$WORKDIR/systemd}}"
 CLOUD_HYPERVISOR_CPUS_MODEL="${CLOUD_HYPERVISOR_CPUS_MODEL:-auto}"
 case "$CLOUD_HYPERVISOR_CPUS_MODEL" in
   ''|*[!A-Za-z0-9_.:-]*) die "CLOUD_HYPERVISOR_CPUS_MODEL 含有不安全字符：$CLOUD_HYPERVISOR_CPUS_MODEL" ;;
+esac
+SANDBOX_CH_PATH="${SANDBOX_CH_PATH:-$BINS/cloud-hypervisor}"
+case "$SANDBOX_CH_PATH" in
+  ''|*[!A-Za-z0-9_./:-]*) die "SANDBOX_CH_PATH 含有不安全字符：$SANDBOX_CH_PATH" ;;
 esac
 RUNNER_DROPIN_DIR="$UNIT_DIR/${RUNNER_TEMPLATE}.d"
 BUILDER_DROPIN_DIR="$UNIT_DIR/${BUILDER_TEMPLATE}.d"
@@ -279,6 +287,10 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
     [ -n "$(read_state cloud_hypervisor_cpus_model)" ] && \
       CLOUD_HYPERVISOR_CPUS_MODEL="$(read_state cloud_hypervisor_cpus_model)"
   fi
+  if [ "$CH_PATH_USER_SET" -eq 0 ]; then
+    [ -n "$(read_state sandbox_ch_path)" ] && \
+      SANDBOX_CH_PATH="$(read_state sandbox_ch_path)"
+  fi
   if [ "$CMD" = status ] || [ "$CMD" = down ] || [ "$FIP_USER_SET" -eq 0 ]; then
     saved_fip="$(read_state fip_base)"
     if [ -n "$saved_fip" ]; then
@@ -310,6 +322,9 @@ validate_ports
 
 case "$CLOUD_HYPERVISOR_CPUS_MODEL" in
   ''|*[!A-Za-z0-9_.:-]*) die "CLOUD_HYPERVISOR_CPUS_MODEL 含有不安全字符：$CLOUD_HYPERVISOR_CPUS_MODEL" ;;
+esac
+case "$SANDBOX_CH_PATH" in
+  ''|*[!A-Za-z0-9_./:-]*) die "SANDBOX_CH_PATH 含有不安全字符：$SANDBOX_CH_PATH" ;;
 esac
 
 NODE_CTL="$(readlink -f "$BINS/node-ctl" 2>/dev/null || true)"
@@ -471,36 +486,21 @@ rule_delete() {
   if [ "$table" = nat ]; then iptables -t nat -D "$chain" "$@"; else iptables -D "$chain" "$@"; fi
 }
 
-nat_add() {
-  local kind="$1" table="$2" chain="$3"; shift 3
-  if ! rule_exists "$table" "$chain" "$@"; then
-    rule_add "$table" "$chain" "$@"
-    printf '%s\n' "$kind" >> "$NAT_STATE"
-  fi
-}
-
-nat_apply() { # 只删除 NAT_STATE 中由本 NS 脚本实际新增的规则
-  local action="$1" item remove_fip="$FIP_CIDR" remove_mgmt="$MGMT"
-  if [ "$action" = add ]; then
-    : > "$NAT_STATE"
-    printf 'meta_fip=%s\nmeta_mgmt=%s\nmeta_proxy_netns=%s\n' "$FIP_CIDR" "$MGMT" "$PROXY_NETNS" >> "$NAT_STATE"
-    if [ -z "$PROXY_NETNS" ]; then
-      # Connector's default mgmt-extract namespace is the caller/host netns.
-      nat_add forward_out filter FORWARD -o "$MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT
-      nat_add forward_in filter FORWARD -i "$MGMT" -j ACCEPT
-    fi
-    nat_add masquerade nat POSTROUTING -s "$FIP_CIDR" -j MASQUERADE
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    return 0
-  fi
+# nat_apply: connector #19 之后数据面完全由 vswitch TC 承载（sandbox↔proxy 走 FIP，
+# mgmt VIP/回程路由在 vswitch unit 的 ExecStartPost 配置），host 不再需要
+# MASQUERADE/FORWARD 规则。这里只做遗留清理：删除旧版部署写进 NAT_STATE 的规则，
+# 不再新增任何规则。
+nat_apply() {
+  local action="$1" item remove_fip remove_mgmt
+  [ "$action" = add ] && return 0
   [ -f "$NAT_STATE" ] || return 0
+  remove_fip="$(awk -F= '$1=="meta_fip"{v=$2} END{print v}' "$NAT_STATE")"
+  remove_mgmt="$(awk -F= '$1=="meta_mgmt"{v=$2} END{print v}' "$NAT_STATE")"
   while IFS= read -r item; do
     case "$item" in
-      meta_fip=*) remove_fip="${item#meta_fip=}" ;;
-      meta_mgmt=*) remove_mgmt="${item#meta_mgmt=}" ;;
-      forward_out) rule_delete filter FORWARD -o "$remove_mgmt" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true ;;
-      forward_in) rule_delete filter FORWARD -i "$remove_mgmt" -j ACCEPT 2>/dev/null || true ;;
-      masquerade) rule_delete nat POSTROUTING -s "$remove_fip" -j MASQUERADE 2>/dev/null || true ;;
+      forward_out) [ -n "$remove_mgmt" ] && rule_delete filter FORWARD -o "$remove_mgmt" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true ;;
+      forward_in) [ -n "$remove_mgmt" ] && rule_delete filter FORWARD -i "$remove_mgmt" -j ACCEPT 2>/dev/null || true ;;
+      masquerade) [ -n "$remove_fip" ] && rule_delete nat POSTROUTING -s "$remove_fip" -j MASQUERADE 2>/dev/null || true ;;
     esac
   done < "$NAT_STATE"
   rm -f "$NAT_STATE"
@@ -688,6 +688,7 @@ prepare_assets() {
   [ -x "$NODE_CTL" ] || die "找不到可执行 node-ctl：$BINS/node-ctl"
   [ -x "$CONNECTOR" ] || die "找不到可执行 connector-ctl：$BINS/connector-ctl"
   [ -x "$E2B_KEY_CTL" ] || die "找不到可执行 e2b-key-ctl：$BINS/e2b-key-ctl"
+  [ -x "$SANDBOX_CH_PATH" ] || die "找不到可执行 Cloud Hypervisor：$SANDBOX_CH_PATH（可设置 SANDBOX_CH_PATH 覆盖）"
   [ -f "$BINS/vmlinux" ] || die "找不到 $BINS/vmlinux"
   RUNTIME="$BINS/sandbox-runtime.erofs"
   [ -f "$RUNTIME" ] || RUNTIME="$BINS/sandbox-runtime.bundle"
@@ -729,6 +730,9 @@ remove_hosts() {
 
 write_configs() {
   local cert="$CFGDIR/tls.crt" key="$CFGDIR/tls.key"
+  local proxy_route_capacity="${PROXY_ROUTE_CAPACITY:-$((VSWITCH_PORTS * 2))}"
+  [[ "$proxy_route_capacity" =~ ^[0-9]+$ ]] && [ "$proxy_route_capacity" -ge "$VSWITCH_PORTS" ] && [ "$proxy_route_capacity" -le 65536 ] \
+    || die "PROXY_ROUTE_CAPACITY 非法（必须 >= VSWITCH_PORTS 且 <= 65536）：$proxy_route_capacity"
   local enc_key
   mkdir -p "$RUNROOT" "$BASEROOT" "$SAVED" "$CFGDIR" "$LOGDIR" "$TAPFD_DIR"
   if [ -e "$cert" ] || [ -e "$key" ]; then
@@ -766,7 +770,14 @@ paths: { run_root: $RUNROOT, base_root: $BASEROOT, config_socket: $CFG_SOCKET }
 units: { dir: $UNIT_DIR, runner: $RUNNER_TEMPLATE, builder: $BUILDER_TEMPLATE, runner_pool_size: $RUNNER_POOL_SIZE, builder_pool_size: $BUILDER_POOL_SIZE, install: true }
 sandbox:
   timeout_sec: 300
-  resources: { vcpu: 2, memory: 8GiB, control_socket: $RES_SOCKET }
+  # 节点默认资源策略（#192 字段化 schema）：
+  #   allocatable 256MiB < capacity 8GiB → 每个沙箱自动带气球（--balloon size=cap-alloc），
+  #   build_bw_coldboot*.py 不显式覆盖 allocatable 时出的快照都是气球快照。
+  #   startup 1GiB → 启动期授 1GiB，boot 完成后由资源控制器按需增长。
+  resources:
+    capacity: { cpu: 2, memory: 8GiB }
+    allocatable: { memory: 256MiB }
+    startup: { memory: 1GiB }
   network:
     switch: $SWITCH
     tapfd_socket: $TAPFD_SOCK
@@ -782,7 +793,6 @@ builder: { max_concurrent: 2, diff_template: $BUILDER_DIFF_TEMPLATE, insecure_re
 resource_listen:
   enabled: true
   socket: $RES_SOCKET
-  state_path: $RUNROOT/state.json
   audit_path: $RUNROOT/audit.log
   cgroup_unit_prefix: sandbox-runner-${NS}@
   resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 2GiB, cpu: 1.5 } }
@@ -799,7 +809,7 @@ proxy_netns: $PROXY_NETNS
 data_listen: "$PROXY_LISTEN"
 proxy_socket: $PROXY_SOCK
 shm_path: $PROXY_SHM
-route_capacity: 65536
+route_capacity: $proxy_route_capacity
 workers: 4
 tls: { cert: $cert, key: $key }
 auth: enforce
@@ -833,6 +843,25 @@ RemainAfterExit=yes
 ExecStart=$sh_bin -c '$netns_start'
 ExecStop=$sh_bin -c '$netns_stop'
 UNIT
+  # GENEVE slot locator（connector #24）：默认 port（与旧行为完全一致）。
+  # 需要外部 Geneve gateway 用其它 locator 时设 env，例如：
+  #   GENEVE_LOCATOR=vni  GENEVE_TLV_LOCATOR=0102:81  GENEVE_PORT_BASE=50000
+  # 注意：非 port locator 必须在 switch 首次创建时指定，旧 pinned switch
+  # 不支持原地切换（需 down 后重建）。
+  GENEVE_LOCATOR="${GENEVE_LOCATOR:-}"
+  GENEVE_TLV_LOCATOR="${GENEVE_TLV_LOCATOR:-}"
+  GENEVE_PORT_BASE="${GENEVE_PORT_BASE:-}"
+  VSWITCH_GENEVE_ARGS=()
+  if [ -n "$GENEVE_LOCATOR" ]; then
+    VSWITCH_GENEVE_ARGS+=("--geneve-locator=$GENEVE_LOCATOR")
+  fi
+  if [ -n "$GENEVE_TLV_LOCATOR" ]; then
+    VSWITCH_GENEVE_ARGS+=("--geneve-tlv-locator=$GENEVE_TLV_LOCATOR")
+  fi
+  if [ -n "$GENEVE_PORT_BASE" ]; then
+    VSWITCH_GENEVE_ARGS+=("--geneve-port-base=$GENEVE_PORT_BASE")
+  fi
+
   cat > "$UNIT_DIR/$VS_UNIT" <<UNIT
 [Unit]
 Description=kuasar connector vswitch ($NS)
@@ -842,10 +871,16 @@ Requires=$NETNS_UNIT
 
 [Service]
 Type=notify
-ExecStart=$CONNECTOR vswitch serve $SWITCH --netns=$NETNS --ports=$VSWITCH_PORTS --mac-addr=$MAC --floating-ip-base=$FIP_BASE --mode=tap --tapfd-listen=$TAPFD_SOCK --mgmt-extract=$PROXY_NETNS:$MGMT:169.254.169.254,0.0.0.0/0 --mgmt-service=169.254.169.254:80:127.0.0.1:$MMDS_PORT
+ExecStart=$CONNECTOR vswitch serve $SWITCH --netns=$NETNS --ports=$VSWITCH_PORTS --mac-addr=$MAC --floating-ip-base=$FIP_BASE --mode=tap --tapfd-listen=$TAPFD_SOCK ${VSWITCH_GENEVE_ARGS[*]+${VSWITCH_GENEVE_ARGS[*]}} --mgmt-extract=$PROXY_NETNS:$MGMT:169.254.169.254,0.0.0.0/0 --mgmt-service=169.254.169.254:80:127.0.0.1:$MMDS_PORT
 # Configure route_localnet on the connector mgmt device and enable forwarding
-# in both connector-managed namespaces.
-ExecStartPost=$sh_bin -c 'for i in 1 2 3 4 5 6 7 8 9 10; do if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link show $MGMT >/dev/null 2>&1; else $ip_bin link show $MGMT >/dev/null 2>&1; fi && break; sleep 1; done; if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link set lo up; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.all.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.ip_forward=1; else $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $sysctl_bin -w net.ipv4.ip_forward=1; fi; $ip_bin netns exec $NETNS $ip_bin link set lo up; $ip_bin netns exec $NETNS $sysctl_bin -w net.ipv4.ip_forward=1'
+# in both connector-managed namespaces. Since connector #19 (b71e10c) the
+# service-owned mgmt VIP and the FIP return route are the deployment's job
+# (upstream dist/connector-vswitch.service does the same via MGMT_ADDRS):
+#   - VIP 169.254.169.254/32 on the mgmt dev (ingress TC SNATs replies to it)
+#   - <FIP>/20 dev <mgmt> so backend replies to floating IPs traverse sw-m0
+#     TC DNAT back into the sandbox; without it envd /init times out on MMDS
+#     token fetch and every create dies at failure_stage=envd.
+ExecStartPost=$sh_bin -c 'for i in 1 2 3 4 5 6 7 8 9 10; do if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link show $MGMT >/dev/null 2>&1; else $ip_bin link show $MGMT >/dev/null 2>&1; fi && break; sleep 1; done; if [ -n "$PROXY_NETNS" ]; then $ip_bin netns exec $PROXY_NETNS $ip_bin link set lo up; $ip_bin netns exec $PROXY_NETNS $ip_bin addr replace 169.254.169.254/32 dev $MGMT; $ip_bin netns exec $PROXY_NETNS $ip_bin route replace $FIP_CIDR dev $MGMT metric 100; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.all.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $ip_bin netns exec $PROXY_NETNS $sysctl_bin -w net.ipv4.ip_forward=1; else $ip_bin addr replace 169.254.169.254/32 dev $MGMT; $ip_bin route replace $FIP_CIDR dev $MGMT metric 100; $sysctl_bin -w net.ipv4.conf.$MGMT.route_localnet=1; $sysctl_bin -w net.ipv4.ip_forward=1; fi; $ip_bin netns exec $NETNS $ip_bin link set lo up; $ip_bin netns exec $NETNS $sysctl_bin -w net.ipv4.ip_forward=1'
 # Deliberately no ExecStop connector cleanup: systemctl restart of this
 # daemon must preserve tap devices and sandbox network namespaces. Full
 # cleanup is performed only by deploy-ns.sh down/replace.
@@ -892,6 +927,8 @@ UNIT
 [Service]
 # Passed through node-ctl run-sandbox to the Cloud Hypervisor process.
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+# Select the Cloud Hypervisor binary for runner-launched sandboxes.
+Environment="SANDBOX_CH_PATH=$SANDBOX_CH_PATH"
 # Keep sandbox-ctl/Cloud Hypervisor runtime logs under this NS work directory.
 StandardOutput=append:$LOGDIR/runner.log
 StandardError=append:$LOGDIR/runner.log
@@ -900,6 +937,8 @@ UNIT
 [Service]
 # Keep builder-launched Cloud Hypervisor processes on the same default CPU model.
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
+# Select the Cloud Hypervisor binary for builder-launched sandboxes.
+Environment="SANDBOX_CH_PATH=$SANDBOX_CH_PATH"
 # Keep builder runtime logs under this NS work directory.
 StandardOutput=append:$LOGDIR/builder.log
 StandardError=append:$LOGDIR/builder.log
@@ -1331,6 +1370,7 @@ do_up() {
   state_set fip_base "$FIP_BASE"
   state_set mac "$MAC"
   state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
+  state_set sandbox_ch_path "$SANDBOX_CH_PATH"
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
@@ -1399,7 +1439,7 @@ ENV
   echo "  ports    mmds=:$MMDS_PORT metrics=:$METRICS/$PROXY_METRICS"
   echo "  network  vswitch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
   echo "  units    $NETNS_UNIT $VS_UNIT $NODE_UNIT $PROXY_UNIT"
-  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
+  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL SANDBOX_CH_PATH=$SANDBOX_CH_PATH (runner/builder drop-in)"
   echo "  cfg      $CFGDIR/{conductor,proxy}.yaml"
   echo "  manifest $MANIFEST_CONFIG (yyl store/cache)"
   echo "  snapshots $NFS_DIR (remote=$REMOTE_SNAPSHOT_PARENT)"
@@ -1427,6 +1467,7 @@ do_prepare() {
   state_set fip_base "$FIP_BASE"
   state_set mac "$MAC"
   state_set cloud_hypervisor_cpus_model "$CLOUD_HYPERVISOR_CPUS_MODEL"
+  state_set sandbox_ch_path "$SANDBOX_CH_PATH"
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
@@ -1444,7 +1485,7 @@ do_prepare() {
   echo "  bins     $BINS"
   echo "  config   $CFGDIR/{conductor,proxy}.yaml"
   echo "  units    $UNIT_DIR"
-  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL (runner/builder drop-in)"
+  echo "  ch       CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL SANDBOX_CH_PATH=$SANDBOX_CH_PATH (runner/builder drop-in)"
   echo "  manifest $MANIFEST_CONFIG (yyl store/cache)"
   echo "  snapshots $NFS_DIR (remote=$REMOTE_SNAPSHOT_PARENT)"
   echo "  network  vswitch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS fip=$FIP_CIDR mgmt=$MGMT"
@@ -1471,7 +1512,7 @@ do_down() {
 # ════════════════════════════════════════════════════════════════════════════
 do_status() {
   [ "$CMD" = status ] || return 0
-  echo "NS=$NS switch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC ch_cpu_model=$CLOUD_HYPERVISOR_CPUS_MODEL"
+  echo "NS=$NS switch=$SWITCH netns=$NETNS proxy_netns=$PROXY_NETNS vswitch_ports=$VSWITCH_PORTS api=:$API_PORT proxy=$PROXY_LISTEN fip=$FIP_CIDR mac=$MAC ch_cpu_model=$CLOUD_HYPERVISOR_CPUS_MODEL ch_path=$SANDBOX_CH_PATH"
   for unit in "$NETNS_UNIT" "$VS_UNIT" "$NODE_UNIT" "$PROXY_UNIT"; do
     if command -v systemctl >/dev/null 2>&1 && unit_active "$unit"; then echo "  ${c_grn}✓${c_off} unit $unit active"; else echo "  ${c_red}✗${c_off} unit $unit inactive"; fi
   done

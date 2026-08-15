@@ -33,10 +33,12 @@ proxy worker         → 默认跟随 connector 的 mgmt-extract namespace
 
 - root 权限（`up`、`replace`、`down`）。
 - systemd、`/dev/kvm`、`ip`、`iptables`、`curl`、`openssl` 等宿主机工具。
-- 一个包含 `node-ctl`、`connector-ctl`、`e2b-key-ctl`、`vmlinux` 和
-  `sandbox-runtime.{erofs,bundle}` 的 bins 目录。
-- 独立的 yyl manifest/store/cache 配置文件。默认是：
-  `/root/sandbox/e2b-bench-file-bare/config/manifest-obs.yaml`。
+- 一个包含 `node-ctl`、`connector-ctl`、`e2b-key-ctl`、`cloud-hypervisor`、
+  `vmlinux` 和 `sandbox-runtime.{erofs,bundle}` 的 bins 目录。也可以通过
+  `SANDBOX_CH_PATH` 显式指定 Cloud Hypervisor 路径。
+- 独立的 yyl manifest/store/cache 配置文件。默认是当前 NS 配置目录下的
+  `manifest-obs.yaml`，例如 nova 的
+  `/root/sandbox/nova-work/etc/node-ctl-nova/manifest-obs.yaml`。
 - manifest/store/cache 后端必须已经由宿主机或其他部署提供并处于可用状态；
   本脚本只读取该配置文件，不负责后端生命周期。
 - 如果要跑认证冒烟，需要该 manifest 配置能解析出 64 位 manifest key。
@@ -130,6 +132,7 @@ METRICS_PORT=39095 \
 | systemd unit | `*-<NS>*` |
 | resource cgroup 盘点 | 共享 runner slice 下按 `sandbox-runner-<NS>@` 前缀过滤，不计入其他 NS |
 | Cloud Hypervisor CPU model | runner/builder 的 systemd drop-in，默认 `auto` |
+| Cloud Hypervisor binary | runner/builder 的 `SANDBOX_CH_PATH` drop-in，默认 `<bins_dir>/cloud-hypervisor` |
 | 配置、状态、日志、快照目录 | 位于 `<NS>-work` 或 `<NS>-snaps` |
 
 `PROXY_NETNS` 默认是 `e2b<NS>_mgmt`。脚本先创建这个 connector 管理 namespace，
@@ -162,7 +165,7 @@ NS 共用时，关闭一个 NS 不会删除规则；如果规则原本由宿主�
 manifest 配置和快照目录是两个独立配置：
 
 ```bash
-MANIFEST_CONFIG=/root/sandbox/e2b-bench-file-bare/config/manifest-obs.yaml \
+MANIFEST_CONFIG=/root/sandbox/nova-work/etc/node-ctl-nova/manifest-obs.yaml \
 NFS_DIR=/mnt/sfs_turbo/nova-snaps \
 ./deploy-ns.sh replace nova /root/sandbox/orchestrator/bin/x86_64
 ```
@@ -179,10 +182,21 @@ systemd unit。可通过 `VSWITCH_PORTS` 覆盖，取值范围为 1-4096：
 VSWITCH_PORTS=128 ./deploy-ns.sh up nova /root/sandbox/orchestrator/bin/x86_64
 ```
 
+proxy 路由表容量默认是 `2 × VSWITCH_PORTS`（128 个端口对应 256 个 slot），
+避免 MMDS 按 floating IP 查找时扫描与实际并发规模无关的 65536 个大记录。
+需要额外余量时可设置 `PROXY_ROUTE_CAPACITY`；该值必须不小于
+`VSWITCH_PORTS` 且不大于 65536：
+
+```bash
+VSWITCH_PORTS=128 PROXY_ROUTE_CAPACITY=512 \
+./deploy-ns.sh replace nova /root/sandbox/orchestrator/bin/x86_64
+```
+
 常用环境变量还包括 `WORKDIR`、`DOMAIN`、`MAC`、`FIP_BASE`、`UNIT_DIR`、
-`RUNNER_POOL_SIZE`、`BUILDER_POOL_SIZE`、`AUTO_CREATE_TEMPLATES` 和
+`RUNNER_POOL_SIZE`、`BUILDER_POOL_SIZE`、`AUTO_CREATE_TEMPLATES`、
+`PROXY_ROUTE_CAPACITY`、`CLOUD_HYPERVISOR_CPUS_MODEL`、`SANDBOX_CH_PATH` 和
 `DEPLOY_GLOBAL_LOCKFILE`。脚本默认通过以下 NS 独立的 systemd drop-in 把
-Cloud Hypervisor CPU model 传给 runner/builder：
+Cloud Hypervisor CPU model 和二进制路径传给 runner/builder：
 
 ```text
 /run/systemd/system/sandbox-runner-<NS>@.service.d/10-cloud-hypervisor.conf
@@ -194,11 +208,13 @@ Cloud Hypervisor CPU model 传给 runner/builder：
 ```ini
 [Service]
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=auto"
+Environment="SANDBOX_CH_PATH=/root/sandbox/orchestrator/bin/x86_64/cloud-hypervisor"
 ```
 
 如需覆盖，可在 `up` 或 `replace` 前设置
-`CLOUD_HYPERVISOR_CPUS_MODEL`；脚本会校验值并重新生成该 NS 的 drop-in。
-`prepare` 时同样会把 drop-in 写入 `<NS>-work/systemd/`。
+`CLOUD_HYPERVISOR_CPUS_MODEL` 或 `SANDBOX_CH_PATH`；脚本会校验值并重新生成
+该 NS 的 runner/builder drop-in。`prepare` 时同样会把 drop-in 写入
+`<NS>-work/systemd/`。
 
 ## 冒烟测试
 
