@@ -41,15 +41,27 @@ DEFAULT_RUN_COMMAND = "date"
 PARENT = os.path.dirname(os.path.abspath(__file__))
 
 
-def create(template, tries=4):
+
+def create(template, tries=4, allocatable_memory=None):
     """POST /sandboxes 带重试，返回 (sid, forwardAccessToken)。
     走原始 API 而非 SDK：SDK 不暴露 forwardAccessToken（node proxy 鉴权必需），且能避开
-    SDK 把 orchestrator 偶发 500 吞成 KeyError('code')。"""
+    SDK 把 orchestrator 偶发 500 吞成 KeyError('code')。
+
+    ``allocatable_memory`` 为空时保持旧行为；指定时与快照制作脚本一致，
+    通过 kuasar-sandbox.resource 覆盖本次 sandbox 的 allocatable.memory。
+    """
     last = None
     for _ in range(tries):
         try:
+            body = {"templateID": template, "timeout": 120}
+            if allocatable_memory:
+                body["metadata"] = {
+                    "kuasar-sandbox.resource": json.dumps({
+                        "allocatable": {"memory": allocatable_memory},
+                    })
+                }
             r = e2b_env.api_request("POST", "/sandboxes",
-                                    json={"templateID": template, "timeout": 120})
+                                    json=body)
             if r.status_code == 201:
                 j = r.json()
                 return j["sandboxID"], j["forwardAccessToken"]
@@ -233,7 +245,8 @@ def _merge_results(dst, src):
 
 
 def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
-              run_user="root", run_cwd="/", run_timeout=30):
+              run_user="root", run_cwd="/", run_timeout=30,
+              allocatable_memory=None):
     """Run one isolated sandbox lifecycle and return (results, failure)."""
     res = _new_results()
     sid = token = None
@@ -242,7 +255,7 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
     create_api_ms = e2e1 = tc = None
     try:
         e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
-        sid, token = create(template)
+        sid, token = create(template, allocatable_memory=allocatable_memory)
         create_return = time.perf_counter()         # 1.0 create interface return
         create_api_ms = (create_return - e2e_start) * 1000
         if mode == "run":
@@ -336,7 +349,8 @@ def append_failure_log(path, label, concurrency, mode, template, failure,
 def _run_sample_batch(template, sample_count, label, mode, command,
                       run_user, run_cwd, run_timeout, concurrency,
                       failure_log, progress_offset=0, progress_total=None,
-                      round_number=None, progress_label=None):
+                      round_number=None, progress_label=None,
+                      allocatable_memory=None):
     """Run one batch and return only after every sample in that batch ends."""
     if sample_count < 1:
         raise ValueError("sample_count must be greater than zero")
@@ -346,7 +360,8 @@ def _run_sample_batch(template, sample_count, label, mode, command,
     _show_progress(progress_label, progress_offset, progress_total)
     with ThreadPoolExecutor(max_workers=min(concurrency, sample_count)) as pool:
         futures = [pool.submit(run_round, template, mode, command,
-                               run_user, run_cwd, run_timeout)
+                               run_user, run_cwd, run_timeout,
+                               allocatable_memory)
                    for _ in range(sample_count)]
         for completed, future in enumerate(as_completed(futures), 1):
             batch_result, failure = future.result()
@@ -368,7 +383,7 @@ def _run_sample_batch(template, sample_count, label, mode, command,
 
 def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
                run_user="root", run_cwd="/", run_timeout=30, concurrency=1,
-               failure_log=None, rounds=None):
+               failure_log=None, rounds=None, allocatable_memory=None):
     """Run samples using either legacy total-count or wave-based semantics.
 
     With ``rounds`` unset, ``n`` remains the legacy total number of samples and
@@ -384,7 +399,8 @@ def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
             raise ValueError("n must be greater than zero")
         return _run_sample_batch(
             template, n, label, mode, command, run_user, run_cwd,
-            run_timeout, concurrency, failure_log)
+            run_timeout, concurrency, failure_log,
+            allocatable_memory=allocatable_memory)
     if rounds < 1:
         raise ValueError("rounds must be greater than zero")
 
@@ -401,7 +417,8 @@ def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
             run_timeout, concurrency, failure_log,
             progress_offset=completed, progress_total=total,
             round_number=round_number,
-            progress_label=f"{label} r{round_number}/{rounds}")
+            progress_label=f"{label} r{round_number}/{rounds}",
+            allocatable_memory=allocatable_memory)
         for sample in batch["samples"]:
             sample["round"] = round_number
         _merge_results(result, batch)
@@ -657,6 +674,8 @@ def main():
                     help="--probe run 的 guest 工作目录（code-interpreter manifest 默认 /）")
     ap.add_argument("--run-timeout", type=int, default=30,
                     help="--probe run 的单次 commands.run 超时秒数")
+    ap.add_argument("--allocatable-memory", default=None,
+                    help="覆盖本次 sandbox 的 allocatable.memory，例如 256MiB；默认不覆盖")
     ap.add_argument("--failure-log", default=os.path.join(PARENT, "logs", "bench-failures.jsonl"),
                     help="失败样本 JSONL 日志（默认 logs/bench-failures.jsonl）")
     ap.add_argument("--docker", action="store_true",
@@ -694,6 +713,8 @@ def main():
         hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
                f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
                f"proxy={openclaw_net.proxy_url()}"]
+    if args.allocatable_memory:
+        hdr.append(f"resource: allocatable.memory={args.allocatable_memory}")
     if args.b:
         hdr.append(f"B: {args.b[:48]}…")
     if args.w:
@@ -712,12 +733,14 @@ def main():
             print("\n=== B（无工作集，drop-caches=true）===")
             B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
                            args.run_user, args.run_cwd, args.run_timeout, concurrency,
-                           args.failure_log, rounds=args.rounds)
+                           args.failure_log, rounds=args.rounds,
+                           allocatable_memory=args.allocatable_memory)
         if args.w:
             print("\n=== W（工作集，drop-caches=false）===")
             W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
                            args.run_user, args.run_cwd, args.run_timeout, concurrency,
-                           args.failure_log, rounds=args.rounds)
+                           args.failure_log, rounds=args.rounds,
+                           allocatable_memory=args.allocatable_memory)
 
         runs.append((concurrency, B, W))
 
