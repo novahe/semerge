@@ -110,3 +110,13 @@
 - ② sandboxer：sensor 步长 64→256MiB，或 urgency=high 时按差额放量（一行级）
 - ① orchestrator：下行校正加速率限制（对称复用 memory_grant_per_sec_factor），或 restore 后 N 秒内以快照 allocatable 为下限
 - ③ host：内核 cmdline 加 `psi=1` 重启，恢复 sensor 快路径（运维项）
+
+## 8. 修复实测（fix/balloon-pressure-relief @ 94077f9）
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 强制卡顿（dd 1.6G tmpfs ×3 沙箱）| 7.7-11.6s | **5.6s** |
+| 下行校正 | 一步 1.2GiB→256MiB | 阶梯 ≤256MiB/跳（日志 `stepping down`）|
+| sensor 步长 | 64MiB/次恒定 | high 紧迫度 ×4=256MiB |
+
+**剩余 5.6s 的定性**：guest 内部 reclaim 对 host 完全不可见——events_poll 三个信号（cgroup OOM、high 计数、RSS/memory.high>0.95）随阶梯同步下移永不触发（实测修复轮 granted=0 次）。**点亮 PSI（host `psi=1` 重启）是下一步关键**，sensor 将获得亚毫秒级 stall 感知，三修复合力应把卡顿压到亚秒。
