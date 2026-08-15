@@ -27,13 +27,60 @@ probe 本身。e2b `run` probe 的 SDK 目标由
 E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
-import argparse, json, os, re, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
 import openclaw_net
+
+# restore 会把快照物化到节点 checkpoint.local_dir/<sid>/（~1GiB/次）；DELETE 不清理，
+# 会把磁盘写满并让回写脉冲污染后续样本（dispatch/pre_ch 毛刺）。每样本 DELETE 后
+# 顺手清掉自己的物化目录。
+# 路径解析顺序：E2B_CHECKPOINT_DIR 显式覆盖 → E2B_ENV_FILE 同目录 conductor.yaml 的
+# checkpoint.local_dir（权威来源）→ 按 env 文件所在 workdir 派生 <workdir>/var/lib-saved。
+def _resolve_checkpoint_dir():
+    explicit = os.environ.get("E2B_CHECKPOINT_DIR")
+    if explicit:
+        return explicit
+    env_file = os.environ.get("E2B_ENV_FILE") or os.path.join(PARENT, "e2b-env.sh")
+    cfg_dir = os.path.dirname(os.path.abspath(env_file))
+    conductor = os.path.join(cfg_dir, "conductor.yaml")
+    try:
+        with open(conductor, "r", encoding="utf-8") as f:
+            for line in f:
+                # flow 映射形态：checkpoint: { mode: local, local_dir: /path, ... }
+                m = re.search(r"local_dir:\s*([^,}]+)", line)
+                if m:
+                    return m.group(1).strip().strip(chr(39)).rstrip(chr(92))
+    except OSError:
+        pass
+    # 兜底：tenant.env 位于 <workdir>/etc/node-ctl-<ns>/ → <workdir>/var/lib-saved
+    workdir = os.path.dirname(os.path.dirname(cfg_dir))
+    return os.path.join(workdir, "var", "lib-saved")
+
+CHECKPOINT_DIR = _resolve_checkpoint_dir()
+
+def cleanup_checkpoint_materialization(sid):
+    """Best-effort 删除本样本的快照物化目录（DELETE 后 sandbox-ctl 已释放句柄）。
+    保留 paused 沙箱语义：这里只在 DELETE 成功后调用，paused 沙箱不会走到这。"""
+    if not sid:
+        return
+    d = os.path.join(CHECKPOINT_DIR, sid)
+    for attempt in range(3):
+        try:
+            if os.path.islink(d) or (os.path.exists(d) and not os.path.isdir(d)):
+                os.remove(d); return
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+                if not os.path.isdir(d):
+                    return
+            else:
+                return
+        except OSError:
+            pass
+        time.sleep(0.3 * (attempt + 1))
 from e2b import Sandbox  # run 探针用 SDK sandbox 认证；exec/health 用 forwardAccessToken 走 node proxy
 
 DEFAULT_RUN_COMMAND = "date"
@@ -315,6 +362,8 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
         elif sid:
             try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
             except Exception: pass
+        if sid:
+            cleanup_checkpoint_materialization(sid)
     failure = None
     if error:
         res["discarded"] = 1
@@ -383,7 +432,8 @@ def _run_sample_batch(template, sample_count, label, mode, command,
 
 def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
                run_user="root", run_cwd="/", run_timeout=30, concurrency=1,
-               failure_log=None, rounds=None, allocatable_memory=None):
+               failure_log=None, rounds=None, allocatable_memory=None,
+               round_interval=None):
     """Run samples using either legacy total-count or wave-based semantics.
 
     With ``rounds`` unset, ``n`` remains the legacy total number of samples and
@@ -423,6 +473,12 @@ def run_rounds(template, n, label, mode, command=DEFAULT_RUN_COMMAND,
             sample["round"] = round_number
         _merge_results(result, batch)
         completed += concurrency
+        if round_number < rounds:
+            # 轮间隔随并发度 1-5s：让上一波的 teardown（停 unit、快照物化回写、
+            # vsock 释放）落地，避免污染下一波样本的 launch/health 计时。
+            interval = round_interval if round_interval is not None else min(5.0, max(1.0, concurrency / 10.0))
+            if interval > 0:
+                time.sleep(interval)
     return result
 
 
@@ -678,6 +734,8 @@ def main():
                     help="覆盖本次 sandbox 的 allocatable.memory，例如 256MiB；默认不覆盖")
     ap.add_argument("--failure-log", default=os.path.join(PARENT, "logs", "bench-failures.jsonl"),
                     help="失败样本 JSONL 日志（默认 logs/bench-failures.jsonl）")
+    ap.add_argument("--round-interval", type=float, default=None,
+                    help="轮间隔秒数；默认按并发度自动 1-5s（c=10→1s, c=25→2.5s, c=50→5s），0=不间隔")
     ap.add_argument("--docker", action="store_true",
                     help="额外重启 ws-docker-debug 并执行 Docker cold/warm 对照")
     args = ap.parse_args()
@@ -734,13 +792,15 @@ def main():
             B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
                            args.run_user, args.run_cwd, args.run_timeout, concurrency,
                            args.failure_log, rounds=args.rounds,
-                           allocatable_memory=args.allocatable_memory)
+                           allocatable_memory=args.allocatable_memory,
+                           round_interval=args.round_interval)
         if args.w:
             print("\n=== W（工作集，drop-caches=false）===")
             W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
                            args.run_user, args.run_cwd, args.run_timeout, concurrency,
                            args.failure_log, rounds=args.rounds,
-                           allocatable_memory=args.allocatable_memory)
+                           allocatable_memory=args.allocatable_memory,
+                           round_interval=args.round_interval)
 
         runs.append((concurrency, B, W))
 
