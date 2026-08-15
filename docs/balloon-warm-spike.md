@@ -85,3 +85,28 @@
 - bench 侧快照物化清理（ws-bench `6fba970`）消掉的是另一类毛刺（物化写盘脉冲污染 dispatch/pre_ch），与本问题独立
 - DB fsync 串行税：orchestrator `feat/db-synchronous-env` + 上游 issue kuasar-sandbox/orchestrator#202
 - 上游可提 issue：TargetFreeBuffer 公式对 page-cache 重负载偏激进 + MaxStep=TargetFreeBuffer 的一步穿透；修复（压力全额放气）可随 PR
+
+---
+
+## 7. 更正与补全（2026-08-15 深夜，压力注入实验后）
+
+强制复现（`--probe run --command 'dd … /dev/shm 1.6G'`，3 沙箱全卡 7.7-11.6s）暴露了更完整的三层结构，**§2 的"Hint 挤牙膏"只是次要路径**：
+
+```
+20:52:44.09  heartbeat: controller adjusted alloc 1.2GiB → 256MiB   ← 元凶①
+             气球一步充到 7.9GiB，无视快照记录的工作集
+20:52:44.19  sensor 救火：+64MiB (urgency=normal reason=high_event) ← 元凶②
+20:52:45-48  +64MiB × 8 次，欠 ~1GiB 要 16 次 ≈ 卡 8s
+```
+
+1. **元凶①（orchestrator 资源控制器）**：restore 继承快照 allocatable（1.2GiB）后，heartbeat 的策略校正**一步**砍回节点策略 256MiB（`controller.go heartbeatOnce` 应用 `NewAllocatable`）——下行无速率限制（上行有 `memory_grant_per_sec_factor`，下行没有）
+2. **元凶②（sandboxer sensor 步长）**：压力传感器 `RequestBudget` 每次只 +64MiB（`StartSensor(ctx, 64<<20)` 硬编码于 lifecycle.go:514 / restore.go:659），高紧迫度也不放量
+3. **放大器（host 内核）**：PSI 未启用（`/proc/pressure` 不存在），sensor 降级 events_poll（100ms 轮询 OOM 事件），丢掉亚毫秒快路径
+4. **误报源（guest 内核）**：tmpfs 零页/page cache 在 `MemAvailable` 里计为"可用"，guest 上报虚高 → Hint 路径的挤压误判（§2 的机制，真实但次要）
+
+**Hint 压力全额放气补丁**（§4"已打"）针对第 4 层的低报场景，无害保留，但不在主路径上。
+
+**修正后的修复菜单（按性价比排序）**：
+- ② sandboxer：sensor 步长 64→256MiB，或 urgency=high 时按差额放量（一行级）
+- ① orchestrator：下行校正加速率限制（对称复用 memory_grant_per_sec_factor），或 restore 后 N 秒内以快照 allocatable 为下限
+- ③ host：内核 cmdline 加 `psi=1` 重启，恢复 sensor 快路径（运维项）
