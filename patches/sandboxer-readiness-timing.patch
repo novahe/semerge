@@ -102,7 +102,7 @@ index 4716fde..eb2ae19 100644
 +	}
 +}
 diff --git a/cmd/sandbox-ctl/run.go b/cmd/sandbox-ctl/run.go
-index 1050fb5..ac53e3b 100755
+index ad7aebd..c2410d2 100755
 --- a/cmd/sandbox-ctl/run.go
 +++ b/cmd/sandbox-ctl/run.go
 @@ -100,12 +100,19 @@ func runCmd(args []string) int {
@@ -166,7 +166,7 @@ index 1050fb5..ac53e3b 100755
  	if err != nil {
  		fmt.Fprintln(os.Stderr, err)
 diff --git a/pkg/restore/restore.go b/pkg/restore/restore.go
-index 60d186d..508311a 100755
+index f677101..7dc7d89 100755
 --- a/pkg/restore/restore.go
 +++ b/pkg/restore/restore.go
 @@ -75,6 +75,7 @@ type Options struct {
@@ -177,7 +177,7 @@ index 60d186d..508311a 100755
  }
  
  // Run executes restore. Returns the CH exit code.
-@@ -579,6 +580,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
+@@ -571,6 +572,7 @@ func Run(ctx context.Context, opts Options) (int, error) {
  		Forwards:        opts.Forwards,
  		Cgroup:          cg,
  		NotifyReadiness: opts.NotifyReadiness,
@@ -185,8 +185,8 @@ index 60d186d..508311a 100755
  
  		BuildCmd: func(e sandbox.CmdEnv) (*exec.Cmd, func(), error) {
  			// CH 51 `--restore source_url=file://<dir>` replaces
-@@ -618,6 +620,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
- 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).Resume(); err != nil {
+@@ -610,6 +612,9 @@ func Run(ctx context.Context, opts Options) (int, error) {
+ 			if err := (chapi.Client{Sock: pc.CHSock, RespDeadline: opts.HostCfg.CHApiDeadline()}).ResumeContext(pc.Ctx); err != nil {
  				return fmt.Errorf("vm.resume: %w", err)
  			}
 +			if pc.ReadinessTiming != nil {
@@ -195,13 +195,13 @@ index 60d186d..508311a 100755
  			pc.Logf("VM resumed, vCPU running")
  
  			tRestore := time.Now()
-@@ -628,9 +633,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
+@@ -620,9 +625,13 @@ func Run(ctx context.Context, opts Options) (int, error) {
  			if restoreDeadline <= 0 {
  				restoreDeadline = config.NoForcedTimeout
  			}
 -			muxSpec, err := openAndEstablishRestoreMUX(func() (net.Conn, proto.StdioSpec, error) {
 +			muxSpec, err := openAndEstablishRestoreMUXWithAck(func() (net.Conn, proto.StdioSpec, error) {
- 				return guestlink.OpenMUXViaRestore(pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
+ 				return guestlink.OpenMUXViaRestoreContext(pc.Ctx, pc.Pinger.Client, 1, netSpec, snapCfg.ProtoFiles(), restoreDeadline)
 -			}, pc.EstablishMUX, pc.NotifyReady)
 +			}, pc.EstablishMUX, func() {
 +				if pc.ReadinessTiming != nil {
@@ -211,7 +211,7 @@ index 60d186d..508311a 100755
  			if err != nil {
  				return err
  			}
-@@ -671,11 +680,23 @@ func openAndEstablishRestoreMUX(
+@@ -663,11 +672,23 @@ func openAndEstablishRestoreMUX(
  	open func() (net.Conn, proto.StdioSpec, error),
  	establish func(net.Conn, proto.StdioSpec) error,
  	notifyReady func(),
@@ -236,7 +236,7 @@ index 60d186d..508311a 100755
  		// EstablishMUX did not take ownership on failure.
  		_ = conn.Close()
 diff --git a/pkg/sandbox/lifecycle.go b/pkg/sandbox/lifecycle.go
-index e782935..9b235fe 100755
+index f19d845..467e9d5 100755
 --- a/pkg/sandbox/lifecycle.go
 +++ b/pkg/sandbox/lifecycle.go
 @@ -64,6 +64,9 @@ type RunOptions struct {
@@ -249,7 +249,7 @@ index e782935..9b235fe 100755
  }
  
  // Run executes one sandbox lifecycle: prepare backends + launch server,
-@@ -454,6 +457,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
+@@ -458,6 +461,7 @@ func Run(ctx context.Context, opts RunOptions) (int, error) {
  		Forwards:          opts.Forwards,
  		Cgroup:            cg,
  		NotifyReadiness:   opts.NotifyReadiness,
@@ -282,12 +282,12 @@ index e0bca68..0883fed 100644
  type ReadinessEvent string
  
 diff --git a/pkg/sandbox/serveandwait.go b/pkg/sandbox/serveandwait.go
-index 7a44f25..d4e0b29 100755
+index 7cd12dc..6743431 100755
 --- a/pkg/sandbox/serveandwait.go
 +++ b/pkg/sandbox/serveandwait.go
-@@ -66,16 +66,17 @@ type CmdEnv struct {
- //     EstablishMUX → guestlink.Pinger.Start → Balloon.Start → Hooks.SettledRestore;
- //     a non-nil return aborts the run (ServeAndWait kills CH).
+@@ -69,16 +69,17 @@ type CmdEnv struct {
+ //     continues into the normal graceful CH shutdown/escalation path while
+ //     backend services remain on their separate VM lifecycle context.
  type PostSpawnCtx struct {
 -	Ctx          context.Context
 -	Cmd          *exec.Cmd
@@ -313,7 +313,7 @@ index 7a44f25..d4e0b29 100755
  }
  
  // VMParams is the input to ServeAndWait — everything the shared
-@@ -157,6 +158,7 @@ type VMParams struct {
+@@ -160,6 +161,7 @@ type VMParams struct {
  	// barrier; restore instead calls PostSpawnCtx.NotifyReady explicitly after
  	// its restore ACK and host-side MUX establishment.
  	NotifyReadiness   ReadinessNotify
@@ -321,42 +321,21 @@ index 7a44f25..d4e0b29 100755
  	ReadyOnAppStarted bool
  }
  
-@@ -559,6 +561,9 @@ func ServeAndWait(p VMParams) (int, error) {
- 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
- 	defer signal.Stop(sigCh)
- 
+@@ -582,6 +584,9 @@ func ServeAndWait(p VMParams) (int, error) {
+ 		backendWG.Wait()
+ 		return -1, fmt.Errorf("sandbox start cancelled: %w", err)
+ 	}
 +	if p.ReadinessTiming != nil {
 +		p.ReadinessTiming.CHStartUnixNs = time.Now().UnixNano()
 +	}
  	if err := startCH(cmd, p.NetnsFile); err != nil {
  		cancelBackends()
  		backendWG.Wait()
-@@ -577,16 +582,17 @@ func ServeAndWait(p VMParams) (int, error) {
- 	})
- 
- 	if err := p.PostSpawn(PostSpawnCtx{
--		Ctx:          backendCtx,
--		Cmd:          cmd,
--		Pinger:       pinger,
--		Launch:       launch,
--		EstablishMUX: establishMUX,
--		Hooks:        p.Hooks,
--		Balloon:      p.Balloon,
--		CHSock:       chSock,
--		Logf:         logf,
--		NotifyReady:  readiness.notifyReady,
-+		Ctx:             backendCtx,
-+		Cmd:             cmd,
-+		Pinger:          pinger,
-+		Launch:          launch,
-+		EstablishMUX:    establishMUX,
-+		Hooks:           p.Hooks,
-+		Balloon:         p.Balloon,
-+		CHSock:          chSock,
-+		Logf:            logf,
-+		NotifyReady:     readiness.notifyReady,
+@@ -610,6 +615,7 @@ func ServeAndWait(p VMParams) (int, error) {
+ 		CHSock:       chSock,
+ 		Logf:         logf,
+ 		NotifyReady:  readiness.notifyReady,
 +		ReadinessTiming: p.ReadinessTiming,
  	}); err != nil {
- 		_ = cmd.Process.Kill()
- 		cancelBackends()
-
+ 		if !runShutdownRequested(p.Ctx) {
+ 			_ = cmd.Process.Kill()
