@@ -60,11 +60,13 @@ def curl_gateway_proxy(sid, token, path="/health", timeout=10):
     return {"http": 0, "err": s or out.stderr.strip() or "no-match"}
 
 
-def curl_exec_proxy(sid, token, command="date", timeout=15):
+def curl_exec_proxy(sid, token, command="date", timeout=None):
     """经 node proxy POST /tools/invoke {tool:exec}（路由+鉴权同 curl_gateway_proxy）。
     返回 {ok,http,total,exit_code,text}。total = curl 墙钟（含 bash-tools 模块懒加载 + spawn）。
     exec 首次会懒加载 bash-tools 运行时（重），是 working-set 探针的理想负载。
     gateway 自身还要求 --auth token（fake-token），故另带 Authorization: Bearer。"""
+    if timeout is None:
+        timeout = int(os.environ.get("EXEC_PROBE_TIMEOUT", "15"))
     body = _json.dumps({"tool": "exec", "args": {"command": command, "host": "gateway"}})
     cmd = ["curl", "--noproxy", "*", "-sS", "--max-time", str(timeout),
            "-H", "Authorization: Bearer fake-token",

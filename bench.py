@@ -180,20 +180,20 @@ TIMING_PHASES = (
 )
 
 PHASE_DESCRIPTIONS = {
-    "admission_to_node_prepare": "conductor 接收 create 到 node-ctl 完成节点准备",
-    "runner_wait": "node-ctl 开始分配 runner 到 runner commit 开始",
-    "runner_commit": "runner commit 开始到 commit 完成",
-    "runner_handoff": "runner commit 完成到 sandbox runner 接手",
-    "sandbox_ctl_dispatch": "runner 接手到 sandbox-ctl 开始处理",
-    "sandbox_ctl_pre_ch": "sandbox-ctl 开始处理到 Cloud Hypervisor 启动",
-    "ch_start_to_resume": "Cloud Hypervisor 启动到 resume 接口返回",
-    "resume_to_sandbox_init_ack": "resume 返回到 sandbox-init 初始化完成并 ACK",
-    "sandbox_init_ack_to_runtime_ready": "sandbox-init ACK 到 node-ctl 收到 runtime ready",
-    "ch_start_to_runtime_ready": "Cloud Hypervisor 启动到 node-ctl 收到 runtime ready（bare）",
-    "runtime_ready_to_envd_init_done": "node-ctl 收到 runtime ready 到 envd /init 完成（e2b）",
-    "envd_init_to_launch_done": "envd /init 完成到 launch terminal/state running（e2b）",
-    "runtime_ready_to_launch_done": "runtime ready 到 launch terminal/state running（bare）",
-    "accountedMs": "已纳入阶段统计的耗时总和，应接近 create(launchMs)",
+    "admission_to_node_prepare": "conductor 收到创建请求，到选好节点、完成准备",
+    "runner_wait": "给沙箱分配执行器（runner），含排队等待",
+    "runner_commit": "runner 登记接管这个沙箱",
+    "runner_handoff": "runner 接管收尾、准备拉起沙箱进程",
+    "sandbox_ctl_dispatch": "拉起 sandbox-ctl 进程（systemd 启动 + 进程自举 + 解析参数），到它开始干活",
+    "sandbox_ctl_pre_ch": "sandbox-ctl 备料：打开快照、重建磁盘、申请内存、起后端服务，直到拉起虚拟机",
+    "ch_start_to_resume": "虚拟机进程启动、装载快照状态，到『恢复运行』(/vm.resume) 接口返回",
+    "resume_to_sandbox_init_ack": "虚拟机真正跑起来：客户机内核恢复运行，里面的 sandbox-init 初始化完成并向宿主机报到",
+    "sandbox_init_ack_to_runtime_ready": "客户机报到传导到 node-ctl，标记为『运行时就绪』",
+    "ch_start_to_runtime_ready": "虚拟机启动到 node-ctl 确认就绪（bare 镜像无 envd，走此路径）",
+    "runtime_ready_to_envd_init_done": "虚拟机就绪后，向客户机里的 envd 服务下发初始化配置（要等 envd 起来、失败重试），直到成功",
+    "envd_init_to_launch_done": "envd 配置完成，conductor 把沙箱标记为 running（e2b）",
+    "runtime_ready_to_launch_done": "运行时就绪到 conductor 标记 running（bare 镜像路径）",
+    "accountedMs": "上面各阶段耗时加总（校验用）：应≈ create(launchMs)，差值是未覆盖的缝隙（unaccountedMs）",
 }
 
 TIMING_DISPLAY_MIN_MS = 3.0

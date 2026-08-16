@@ -50,6 +50,14 @@ WARM_HEALTH = os.environ.get("WARM_HEALTH", "1").lower() not in ("0", "false", "
 QUIESCE_SECONDS = float(os.environ.get("QUIESCE_SECONDS", "0"))
 READY_SETTLE = float(os.environ.get("READY_SETTLE", "2"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
 DATAPLANE_PORTS = ("49983", "49999")
+# 覆盖本次（及产出的快照所记录）的 allocatable.memory；=capacity（如 8GiB）时
+# alloc==cap → CH 不加气球设备，用于产"无气球"对照快照。
+ALLOCATABLE_MEMORY = os.environ.get("ALLOCATABLE_MEMORY", "").strip() or None
+def _resource_meta(extra=None):
+    meta = dict(extra or {})
+    if ALLOCATABLE_MEMORY:
+        meta["kuasar-sandbox.resource"] = json.dumps({"allocatable": {"memory": ALLOCATABLE_MEMORY}})
+    return meta
 
 GW_CMD = ("cd /app && setsid sh -c 'exec openclaw gateway --allow-unconfigured "
           "--verbose --bind lan --auth token --token fake-token' "
@@ -128,7 +136,7 @@ def main():
         # bare：原始 API create（抓 forwardAccessToken）+ launch metadata 注入 gateway（随 boot 自起）
         r = e2b_env.api_request("POST", "/sandboxes",
                                 json={"templateID": tid, "timeout": SANDBOX_TIMEOUT,
-                                      "metadata": {"kuasar-sandbox.launch": json.dumps(LAUNCH)}})
+                                      "metadata": _resource_meta({"kuasar-sandbox.launch": json.dumps(LAUNCH)})})
         if r.status_code != 201:
             sys.exit(f"✗ create HTTP {r.status_code}: {r.text[:300]}")
         j = r.json()
@@ -137,7 +145,8 @@ def main():
         # e2b：原始 API create 抓 forwardAccessToken；Sandbox.connect 拿 commands.run 起 gateway
         # （SDK 不暴露 forwardAccessToken，故 create 不走 Sandbox.create）。
         r = e2b_env.api_request("POST", "/sandboxes",
-                                json={"templateID": tid, "timeout": SANDBOX_TIMEOUT})
+                                json={"templateID": tid, "timeout": SANDBOX_TIMEOUT,
+                                      "metadata": _resource_meta()})
         if r.status_code != 201:
             sys.exit(f"✗ create HTTP {r.status_code}: {r.text[:300]}")
         j = r.json()
