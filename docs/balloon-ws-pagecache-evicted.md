@@ -83,7 +83,64 @@ python3 build_bw_coldboot.py
 
 ## 复现 / 诊断
 
-- 复现：`python3 bench.py --w "$(cat openclaw-e2b-ws-balloon-template.id)" --probe health -n 1`
-- 诊断脚本：`python3 debug_cold7s.py <template.id>`（envd 采样 PSI/meminfo/gateway 态 + gw.log tail）。
+### 复现步骤（不依赖 ws-bench 脚本，两条 curl 即可）
+
+前置：从 tenant.env 取四个值（API 地址、key、CA、数据面地址）：
+
+```bash
+export E2B_API_URL=https://api.sandboxes.nova.local:443
+export E2B_SANDBOX_URL=https://sandboxes.nova.local:8443
+export E2B_API_KEY=<tenant.env 里的 key>
+export SSL_CERT_FILE=<tenant.env 里的 CA 路径>
+```
+
+① 用坏模板创建沙箱（坏模板 = 气球挤压态下制作的 W 快照；修复后模板作对照）：
+
+```bash
+TPL=$(cat openclaw-e2b-ws-balloon-template.id)     # 坏；对照组用 *-q2-template.id
+RESP=$(curl -s --cacert $SSL_CERT_FILE -X POST "$E2B_API_URL/sandboxes" \
+  -H "Authorization: Bearer $E2B_API_KEY" -H "Content-Type: application/json" \
+  -d "{\"templateID\":\"$TPL\",\"timeout\":120}")
+SID=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["sandboxID"])')
+TOKEN=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["forwardAccessToken"])')
+```
+
+② 计时发 health——create 一返回就发（这是唯一关键测量），紧接着再发一次作 warm：
+
+```bash
+curl --noproxy '*' -s -o /dev/null --cacert $SSL_CERT_FILE \
+  -w 'cold: HTTP%{http_code} %{time_total}s\n' \
+  -H "E2b-Sandbox-Id: $SID" -H "E2b-Sandbox-Port: 18789" -H "X-Access-Token: $TOKEN" \
+  "$E2B_SANDBOX_URL/health"
+# 同一条命令再执行一次 → warm
+```
+
+判定：坏模板 cold ≈ 7-11s（warm 6ms~2.5s）；修复后模板 cold ≈ 0.1s。
+对照组：换无气球模板或修复后模板重复 ①②。
+
+③ 清理：
+
+```bash
+curl -s --cacert $SSL_CERT_FILE -X DELETE "$E2B_API_URL/sandboxes/$SID" \
+  -H "Authorization: Bearer $E2B_API_KEY"
+```
+
+④（可选佐证，需节点 host 权限）沙箱退出后看 runner.log 尾部：
+
+```
+[vhost-stats] backend=blk0 ...  read reqs=3533 bytes=68.6MiB   ← 坏（数千次远程读）
+[vhost-stats] backend=blk0 ...  read reqs=0                    ← 好
+```
+
+说明：复现只需要「一个坏模板 + 两条 curl」，不需要 bench/debug 脚本。坏模板的本质是
+"create 时带 256MiB 气球地板（或节点默认）运行数分钟后，以
+`X-Kuasar-Sandbox-Checkpoint: {"drop_caches":false,"merge_ref":false}` pause 导出的 W 快照"，
+任何途径产出的这种快照都会复现；用 `ws-bench/build_bw_coldboot.py` 制作最方便
+（脚本自包含，只依赖 python3 + curl + e2b SDK，可整体拷走）。
+
+### bench / 诊断脚本（在 ws-bench 仓库时）
+
+- 一键复现：`python3 bench.py --w "$(cat openclaw-e2b-ws-balloon-template.id)" --probe health -n 1`
+- 深入诊断：`python3 debug_cold7s.py <template.id>`（envd 采样 PSI/meminfo/gateway 态 + gw.log tail）。
   restore 后 gw.log 的 `[diagnostic] liveness warning` 行直接给出 eventLoopDelayMaxMs 与 recentPhases；
   注意 gw.log 大段日志空洞 = guest 被暂停导出的窗口（guest 时钟冻结），不是真实耗时。
