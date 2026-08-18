@@ -9,7 +9,7 @@ launch 本身仅 ~110ms，慢的全部发生在"launch 完成后 → gateway 首
 | 模板 | cold /health | warm | restore blk0(erofs) 读 |
 |---|---|---|---|
 | W + 气球（坏） | 7032–8371ms | 5.9ms–2523ms | 2100–3715 次 / 39–69MB |
-| B + 气球（同期） | 98–810ms（抽签） | ~6ms | 0 次 |
+| B + 气球（同期） | 98–810ms（抽签） | ~6ms | 0 次（bench 窗口内；活过窗口后 1167 次） |
 | W 无气球 | 252ms | ~7ms | 0 次 |
 | W + 气球（修复后） | **84.3ms** | 6.0ms | **0 次** |
 
@@ -25,10 +25,19 @@ launch 本身仅 ~110ms，慢的全部发生在"launch 完成后 → gateway 首
 2. 气球只能收 free 页 + **干净文件页缓存**，收不动 anon。guest 被过度订阅
    （anon ~1.2GB ≈ 预算），文件缓存被持续压到 ≈0（实测冻结时 MemAvailable 4MB / Cached 13MB）。
 3. W 快照（drop_caches=false）只能保存**驻留页** → 冻结晚于气球收敛的 W 只带走了 anon 堆，
-   **文件页不在快照里**（B 冻得早、气球没收完，所以文件页在 B 里——B 快只是抽签抽得好）。
-4. restore 时冻结期间错过的 timer 全部到期，gateway 的生命周期阶段必然重跑
-   （update-check / sidecars 哨兵 / maintenance / agent-runtime 插件预加载，
-   gw.log `[diagnostic] recentPhases=...`，实测 eventLoopDelayMaxMs=7252）。
+   **文件页不在快照里**。B 同样缺文件页——drop_caches=true 是 guest 内真清
+   （`sandbox-init/quiesce.go:37`：sync 后 `echo 3 > /proc/sys/vm/drop_caches`）；
+   B 不慢另有原因，见第 4 条。
+4. restore 后 gateway 的生命周期阶段必然重跑（update-check / sidecars 哨兵 /
+   maintenance / agent-runtime 插件预加载；gw.log `[diagnostic] recentPhases=...`，
+   实测 eventLoopDelayMaxMs=7252）。触发器是**恢复瞬间墙钟跳变**令已 armed 的墙钟任务
+   立即"逾期"——guest 单调钟暂停期间不走（gw.log 导出窗口的大段日志空洞即证）。
+   **B/W 差别在风暴时刻，不在有无**：W 冻结时 uptime 已几分钟、任务全 armed → 墙钟一跳
+   立即补跑，风暴在 t≈0，cold(+0.1s) 正中；B 冻结太早（uptime~7s）、update-check 链未
+   启动、任务未 arm → 恢复后按原始单调钟走（fetch 2.5s 超时 + 7s 退避 → 重载），风暴在
+   restore+8-10s，bench 的 cold 测在风暴前、沙箱 ~15s 删除即躲过。实测让 B-restore 活过
+   窗口：同样出现 recentPhases 重放 + 插件重载 + **1167 次 erofs 读**——"B 不慢"是测量
+   窗口躲过了晚到的风暴，不是没有风暴（规模也小：B 未经 warm exec arm，1167 vs 2100-3710）。
 5. 补跑要读 ~40–70MB 文件 → 全部 miss → 远程 erofs（manifest:// OBS，p50 3.1ms/次），
    node 单线程事件循环串行 → **读数 × 3.1ms ≈ 总停滞**：
    2100→7.0s / 2212→7.35s / 3533→8.37+2.52s，严格线性。
