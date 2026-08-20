@@ -47,7 +47,6 @@ SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "600"))  # 两段式流�
 READY_WAIT = int(os.environ.get("READY_WAIT", "120"))
 WARM_CURLS = int(os.environ.get("WARM_CURLS", "4"))
 WARM_HEALTH = os.environ.get("WARM_HEALTH", "1").lower() not in ("0", "false", "no")
-QUIESCE_SECONDS = float(os.environ.get("QUIESCE_SECONDS", "0"))
 READY_SETTLE = float(os.environ.get("READY_SETTLE", "2"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
 DATAPLANE_PORTS = ("49983", "49999")
 # 覆盖本次（及产出的快照所记录）的 allocatable.memory；=capacity（如 8GiB）时
@@ -71,17 +70,21 @@ LAUNCH = {"exec": "/bin/sh",
 
 
 def add_hosts(sid, domain):
-    lines = open("/etc/hosts").read().splitlines()
+    with open("/etc/hosts") as hosts:
+        lines = hosts.read().splitlines()
     add = [f"127.0.0.1 {p}-{sid}.{domain} #bwcb" for p in DATAPLANE_PORTS
            if not any(f"{p}-{sid}.{domain}" in l for l in lines)]
     if add:
-        open("/etc/hosts", "a").write("\n".join(add) + "\n")
+        with open("/etc/hosts", "a") as hosts:
+            hosts.write("\n".join(add) + "\n")
 
 
 def del_hosts(sid, domain):
-    kept = [l for l in open("/etc/hosts").read().splitlines()
-            if not any(f"{p}-{sid}.{domain}" in l for p in DATAPLANE_PORTS)]
-    open("/etc/hosts", "w").write("\n".join(kept) + "\n")
+    with open("/etc/hosts") as hosts:
+        kept = [l for l in hosts.read().splitlines()
+                if not any(f"{p}-{sid}.{domain}" in l for p in DATAPLANE_PORTS)]
+    with open("/etc/hosts", "w") as hosts:
+        hosts.write("\n".join(kept) + "\n")
 
 
 def export_sandbox(sid):
@@ -202,13 +205,15 @@ def main():
         for k in range(WARM_CURLS):
             rh = openclaw_net.curl_gateway_proxy(sid, fat, "/health") if WARM_HEALTH else {"http": 200}
             r = openclaw_net.curl_exec_proxy(sid, fat, "date")
-            print(f"  warm{k+1}: health={rh.get('http')} exec_ok={r.get('ok')}")
+            print(f"  warm{k+1}: health={rh.get('http')}({rh.get('total', 0):.3f}s) "
+                  f"exec={r.get('ok')}({r.get('total', 0):.3f}s)"
+                  f"{'  <<< 文件页缓存已空，这张 W 快照会是坏的' if (r.get('total') or 0) > 2 else ''}")
             if rh.get("http") != 200 or not r.get("ok"):
                 sys.exit(f"✗ warm 失败 health={rh} exec={r}")
             time.sleep(0.2)
-        if QUIESCE_SECONDS > 0:
-            print(f"  • quiesce {QUIESCE_SECONDS:g}s 后再 pause")
-        # time.sleep(2)
+        if READY_SETTLE > 0:
+            print(f"  • quiesce {READY_SETTLE:g}s 后再 pause")
+            time.sleep(READY_SETTLE)
 
         # ⑤ W：带 header pause（drop_caches=false, merge_ref=false）+ export
         print("[5/5] pause#2（drop_caches=false, merge_ref=false）→ export W …")
@@ -226,10 +231,18 @@ def main():
         print(f"W（工作集）: {OUT_W}")
         print(f"bench: python3 bench.py --b \"$(cat {OUT_B})\" --w \"$(cat {OUT_W})\" --probe health")
     finally:
-        if sid is not None:
-            e2b_env.api_request("DELETE", f"/sandboxes/{sid}")   # kill 就是它的封装
+        # Keep temporary local aliases independent from control-plane cleanup:
+        # a failed DELETE must not accumulate #bwci entries in /etc/hosts.
         if hosts_added:
-            del_hosts(sid, domain)
+            try:
+                del_hosts(sid, domain)
+            except Exception as e:
+                print(f"⚠ cleanup hosts for {sid}: {e}", file=sys.stderr)
+        if sid is not None:
+            try:
+                e2b_env.api_request("DELETE", f"/sandboxes/{sid}")   # kill 就是它的封装
+            except Exception as e:
+                print(f"⚠ cleanup sandbox {sid}: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

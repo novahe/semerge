@@ -9,7 +9,7 @@ drop_caches=false 并经过预热的工作集快照。
 |---|---|---|
 | openclaw + e2b（带 envd） | build_bw_coldboot.py PROFILE=e2b | node-proxy → health |
 | openclaw（不带 e2b） | build_bw_coldboot.py PROFILE=bare | node-proxy → health |
-| code-interpreter + e2b（带 envd） | build_bw_code_interpreter.py | node-proxy → commands.run("date") |
+| code-interpreter + e2b（带 envd） | build_bw_code_interpreter.py | CI SDK → 49999/execute → Jupyter |
 
 前置条件：conductor :4443、vswitch、cache-ctl、store-ctl 已启动，并确认
 e2b-env.sh 中的路径、TLS 证书和 API 配置正确。若使用 nova 部署环境：
@@ -74,14 +74,14 @@ B="$(cat openclaw-bare-snp-template.id)"
 W="$(cat openclaw-bare-ws-template.id)"
 python3 bench.py --b "$B" --w "$W" --probe health -n 50
 
-# 3. code-interpreter + e2b：node-proxy → envd commands.run
+# 3. code-interpreter + e2b：49999/execute → Jupyter
 python3 build_bw_code_interpreter.py
-B="$(cat code-interpreter-bare-snp-template.id)"
+B="$(cat code-interpreter-e2b-snp-template.id)"
 W="$(cat code-interpreter-e2b-ws-template.id)"
-python3 bench.py --b "$B" --w "$W" --probe run --command date -n 10
+python3 bench.py --b "$B" --w "$W" --probe code -n 10
 ~~~
 
-场景 3 每轮内部校验 `commands.run("date")` 成功并返回 stdout。bench.py 也保留 --probe exec，
+场景 3 每轮内部校验 `run_code` 成功并返回 stdout。bench.py 也保留 --probe exec，
 用于已启用 gateway HTTP exec 的 openclaw 镜像。
 
 `-c/--concurrency` 可接收一个或多个正整数，默认 `1`。旧模式下，`-n/--iterations` 表示每个
@@ -119,7 +119,8 @@ chunk 补充信息：
 - openclaw 平均 chunk 约 596 KiB；code-interpreter 平均 chunk 约 611.5 KiB。
 - code-interpreter 上传记录为 8060 个存储数据块、44 个去重块、0 个零块；8104
   是 manifest 的逻辑 chunk 总数。
-- code-interpreter 当前没有 code-interpreter bridge，因此 49999/execute 不在测试范围。
+- code-interpreter 通过 e2b profile 暴露 envd :49983 和 bridge :49999；构建脚本只启动
+  镜像自带 bridge，并在导出 B/W 前验证 `/health` 和一次有输出的 `run_code`。
 
 ## Template ID 命名
 
@@ -139,15 +140,15 @@ openclaw-e2b-bare-snp-template.id
 openclaw-e2b-ws-template.id
 openclaw-bare-snp-template.id
 openclaw-bare-ws-template.id
-code-interpreter-bare-snp-template.id
+code-interpreter-e2b-snp-template.id
 code-interpreter-e2b-ws-template.id
 ~~~
 
-其中 bare-snp 表示 B（冷、无 working set），e2b/bare 表示运行 profile；
+其中 snp 表示 B（冷、无 working set），e2b/bare 表示运行 profile；
 W 文件保留对应 profile 名。code-interpreter 场景按约定使用：
 
 ~~~bash
-B="$(cat code-interpreter-bare-snp-template.id)"
+B="$(cat code-interpreter-e2b-snp-template.id)"
 W="$(cat code-interpreter-e2b-ws-template.id)"
 ~~~
 
@@ -183,23 +184,23 @@ PROFILE=bare 时 gateway 通过 create metadata 的 launch spec 启动；PROFILE
 
 ~~~text
 create manifest template
-  → commands.run("date") 验证 envd
+  → envd commands.run(background) 以镜像原生 `E2B_LOCAL=true` 模式启动自带 start-up.sh
+  → 49999/health + run_code 有输出门禁
   → pause（drop_caches=true）→ export B
   → connect 恢复
-  → commands.run("date") ×4 预热命令执行工作集
+  → 49999/health + run_code ×4 预热 Python/Jupyter 工作集
   → pause（drop_caches=false, merge_ref=false）→ export W
 ~~~
 
-默认 date 只预热 envd 的命令执行路径（fork/exec/shell），不代表 Python 或
-49999/execute 的工作集。需要测试 Python 路径时，可重新生成 W：
+构建流程不修改 guest 文件。`BRIDGE_READY_TIMEOUT` 默认等待 120 秒；快照前如果
+49999 不 ready 或 `run_code` 没有 stdout/result，构建会失败，不会导出坏快照。
+`E2B_LOCAL=true` 是官方 bridge 的本地模式，代码执行正常，但不会从 EnvD 注入环境变量。
+需要改预热代码时：
 
 ~~~bash
-RUN_COMMAND="python3 -c 'print(1)'" WARM_RUNS=4 \
+RUN_CODE="print(1)" WARM_RUNS=4 \
 python3 build_bw_code_interpreter.py
 ~~~
-
-当前 manifest 的实际状态是 envd :49983 可用，但没有 code-interpreter bridge，
-因此 :49999/execute 和完整 run_code 不属于本基线。
 
 ## 计时口径
 
@@ -261,7 +262,27 @@ ready ack 的原始 wire 同时写入 sandbox-ctl 日志，node-ctl 的
 restore ack、runtime ready、envd init 和 launch terminal 的时间顺序；不能只看
 bench 的聚合结果。
 
-## code-interpreter + e2b 基线
+## code-interpreter + e2b 基线（2026-08-20）
+
+当前基线使用官方 CI guest image，构建过程不修改 guest 文件、不使用
+`patch_bridge`，而是通过官方 `/root/.jupyter/start-up.sh` 的 `E2B_LOCAL=true`
+模式启动 bridge。B/W 各执行 c=1、30、50 一波，共 81 个样本；B/W 均
+`81/81` 成功，无 discarded，首个 `run_code` 均返回正确 stdout。
+
+| 并发 | B code1 e2e avg / p50 | W code1 e2e avg / p50 |
+|---:|---:|---:|
+| 1 | 374.8 / 374.8 ms | 293.5 / 293.5 ms |
+| 30 | 710.0 / 714.5 ms | 631.9 / 628.4 ms |
+| 50 | 953.5 / 958.8 ms | 803.8 / 811.3 ms |
+
+完整的分阶段结果、模板校验值和复现命令见
+[`docs/envd-code-interpreter-baseline-2026-08-20.md`](docs/envd-code-interpreter-baseline-2026-08-20.md)。
+
+`c=1` 只有一个样本，仅作单发锚点；c=30/50 的结果包含并发下的 create、launch、
+EnvD init 和首次 Jupyter 执行排队，不能外推为通用性能结论。`E2B_LOCAL=true` 下
+本次代码执行路径正常，但 EnvD guest 环境变量注入不在该基线覆盖范围内。
+
+### 历史 commands.run 基线（2026-08-13）
 
 2026-08-13（Asia/Shanghai），nova 环境，当前 B/W template，
 commands.run("date")，B/W 各 30 轮；所有成功样本均返回 date stdout。
@@ -297,18 +318,17 @@ build_bw_code_interpreter.py：
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | MANIFEST_KEY | 上述 key | manifest rootfs 清单密钥 |
-| OUT_B / OUT_W | code-interpreter B/W ID 文件 | 可覆盖输出路径 |
-| RUN_COMMAND | date | 创建验证和 W 预热命令 |
+| OUT_B / OUT_W | code-interpreter-e2b B/W ID 文件 | 可覆盖输出路径 |
+| RUN_CODE | `print('hello kuasar-sandbox {index}')` | 创建验证和 W 预热 Python 代码；内置默认值每次以不同执行标识替换 `{index}` |
 | WARM_RUNS | 4 | W 预热次数 |
-| RUN_TIMEOUT | 60 | 单次命令超时秒数 |
-| RUN_USER | root | guest 用户 |
-| RUN_CWD | / | guest 工作目录 |
+| RUN_TIMEOUT | 60 | 单次代码执行超时秒数 |
+| BRIDGE_READY_TIMEOUT | 120 | 49999/health readiness 等待秒数 |
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
-| bench.py | 执行 B/W 基准，支持 health、exec、run 探针 |
+| bench.py | 执行 B/W 基准，支持 health、exec、run、code 探针 |
 | build_bw_coldboot.py | 生成 openclaw e2b/bare B/W 快照 |
 | build_bw_code_interpreter.py | 从 manifest 生成 code-interpreter e2b B/W 快照 |
 | openclaw_net.py | node-proxy 与 gateway 请求辅助 |

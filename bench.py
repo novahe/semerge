@@ -8,22 +8,24 @@ run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 
   X-Access-Token = POST /sandboxes 响应的 forwardAccessToken（kat1…，SDK 不暴露，故 create
   走原始 API 抓取）。比 floating-IP 直连多 ~18ms/次（TLS 握手 + proxy 一跳）。
 
-两种探针（--probe）：
+三种主要探针（--probe）：
   exec   ★ POST /tools/invoke {tool:exec} 在 gateway host 跑命令。首 curl 懒加载 bash-tools
          运行时（重模块）+ spawn，是 working-set 的理想负载——W（drop-caches=false + 预热）应明显快于 B。
          需 patched openclaw image（HTTP exec 已开，见 README「exec 补丁」）。
   health   GET /health（27B，轻）。只碰 gateway 核心，B/W 差异很小，作 baseline。
   run      e2b SDK Sandbox.commands.run()，命令在 guest 的 envd 中执行；适用于
            e2bdev/code-interpreter 一类镜像，W 会预热 envd 命令执行工作集。
+  code     e2b code-interpreter SDK Sandbox.run_code()，经 49999/execute → Jupyter；
+           W 会预热 Python/Jupyter 执行工作集。
 
 每轮：create → 立即第一次 probe → 读取 launchMs → 第二次 probe → kill。
-- B = `*-bare-snp-template.id`（drop-caches=true，无预热）
-- W = `*-e2b-ws-template.id` 或 `*-bare-ws-template.id`（drop-caches=false + 预热）
+- B = `*-snp-template.id`（drop-caches=true，无预热）
+- W = `*-ws-template.id`（drop-caches=false + 预热）
 
 计时：create(launchMs) 保留 conductor 的服务端启动耗时；e2e1 是从发起 create
 到 create 返回后立即执行的第一次 probe 完成的客户端端到端耗时，期间不插入
 launchMs 轮询；run1(cold) = e2e1 - create(launchMs)。run2(warm) 仍只统计第二次
-probe 本身。e2b `run` probe 的 SDK 目标由
+  probe 本身。e2b `run`/`code` probe 的 SDK 目标由
 E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
@@ -82,8 +84,10 @@ def cleanup_checkpoint_materialization(sid):
             pass
         time.sleep(0.3 * (attempt + 1))
 from e2b import Sandbox  # run 探针用 SDK sandbox 认证；exec/health 用 forwardAccessToken 走 node proxy
+from e2b_code_interpreter import Sandbox as CodeSandbox  # code 探针走 CI SDK /execute（49999）
 
 DEFAULT_RUN_COMMAND = "date"
+DEFAULT_RUN_CODE = "print('hello kuasar-sandbox {index}')"
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
 
@@ -239,13 +243,60 @@ def run_command_probe(sandbox, command, user="root", cwd="/", timeout=30):
     return ok, total_ms, text[:80].replace("\n", " ")
 
 
+def run_code_probe(sandbox, code, timeout=30):
+    """经 code-interpreter(/execute → FastAPI:49999 → Jupyter)执行代码。
+    严格单次执行，不重试——cold 样本必须是真正的第一次。"""
+    t0 = time.perf_counter()
+    result = sandbox.run_code(code, timeout=timeout)
+    total_ms = (time.perf_counter() - t0) * 1000
+    ok = result.error is None
+    text = ""
+    if not ok:
+        text = (result.error.value or "")[:80].replace("\n", " ")
+    else:
+        # print() 的输出走 logs.stdout（字符串列表），不是 results[].text
+        # （那是富文本返回值 repr）。优先 stdout，落空再取 results 文本。
+        stdout = getattr(result.logs, "stdout", None) or []
+        if stdout:
+            text = " ".join(str(s) for s in stdout)[:80].replace("\n", " ")
+        elif result.results:
+            text = (result.results[0].text or "")[:80].replace("\n", " ")
+        if not text.strip():
+            ok = False
+            text = "empty execution stream"
+    return ok, total_ms, text
+
+
+def code_with_index(code, index):
+    """Only the built-in smoke probe gets a changing payload.
+
+    A caller-supplied --command remains verbatim: its braces may be valid
+    Python and must not be interpreted as a formatter template.
+    """
+    if code == DEFAULT_RUN_CODE:
+        return code.format(index=index)
+    return code
+
+
+def connect_code_sandbox(sid):
+    """e2b 的 49999 经 ci.sock，必须使用 connect 返回的 envdAccessToken."""
+    sandbox = CodeSandbox.connect(sid, timeout=120)
+    if not sandbox._envd_access_token:
+        raise RuntimeError("e2b connect returned no envdAccessToken for 49999")
+    return sandbox
+
+
 def probe(sid, token, mode, sandbox, command=DEFAULT_RUN_COMMAND,
           user="root", cwd="/", timeout=30):
-    """返回 (ok, total_ms, text)。支持 node proxy 或 SDK/envd。"""
+    """返回 (ok, total_ms, text)。支持 node proxy 或 SDK/envd/CI。"""
     if mode == "run":
         if sandbox is None:
             raise RuntimeError("run probe 缺少已连接的 Sandbox")
         return run_command_probe(sandbox, command, user, cwd, timeout)
+    if mode == "code":
+        if sandbox is None:
+            raise RuntimeError("code probe 缺少已连接的 CodeSandbox")
+        return run_code_probe(sandbox, command, timeout)
     if mode == "exec":
         r = openclaw_net.curl_exec_proxy(sid, token, "date")
         return r.get("ok") is True, r.get("total", 0) * 1000, r.get("text", "")[:30]
@@ -293,7 +344,7 @@ def _merge_results(dst, src):
 
 def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
               run_user="root", run_cwd="/", run_timeout=30,
-              allocatable_memory=None):
+              allocatable_memory=None, sample_index=0):
     """Run one isolated sandbox lifecycle and return (results, failure)."""
     res = _new_results()
     sid = token = None
@@ -307,7 +358,12 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
         create_api_ms = (create_return - e2e_start) * 1000
         if mode == "run":
             sandbox = Sandbox.connect(sid, timeout=120)
-        ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # cold
+        elif mode == "code":
+            sandbox = connect_code_sandbox(sid)
+        cold_command = code_with_index(
+            command, f"{sample_index}-cold-{sid[-8:]}"
+        ) if mode == "code" else command
+        ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, cold_command, run_user, run_cwd, run_timeout)  # cold
         probe_return = time.perf_counter()           # 2.0 probe return
         e2e1 = (probe_return - e2e_start) * 1000     # 0.0 -> 2.0
         # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
@@ -317,7 +373,10 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
             raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
         run1 = e2e1 - tc if ok1 else None
         if ok1:
-            ok2, c2, t2 = probe(sid, token, mode, sandbox, command, run_user, run_cwd, run_timeout)  # warm
+            warm_command = code_with_index(
+                command, f"{sample_index}-warm-{sid[-8:]}"
+            ) if mode == "code" else command
+            ok2, c2, t2 = probe(sid, token, mode, sandbox, warm_command, run_user, run_cwd, run_timeout)  # warm
         else:
             ok2, c2, t2 = False, None, "probe1 failed"
         if not ok1:
@@ -347,6 +406,7 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
                 "cold": run1,
                 "warm": c2,
                 "phases": phase_values,
+                "output": (t1 or "")[:60],
             })
     except Exception as e:
         error = f"sid={sid or '<none>'} error={type(e).__name__}: {e}"
@@ -410,8 +470,8 @@ def _run_sample_batch(template, sample_count, label, mode, command,
     with ThreadPoolExecutor(max_workers=min(concurrency, sample_count)) as pool:
         futures = [pool.submit(run_round, template, mode, command,
                                run_user, run_cwd, run_timeout,
-                               allocatable_memory)
-                   for _ in range(sample_count)]
+                               allocatable_memory, progress_offset + index)
+                   for index in range(1, sample_count + 1)]
         for completed, future in enumerate(as_completed(futures), 1):
             batch_result, failure = future.result()
             _merge_results(result, batch_result)
@@ -493,19 +553,20 @@ def print_sample_details(label, concurrency, result, verbose=False):
     print(f"\n=== {label} 每个成功沙箱（concurrency={concurrency}）===")
     has_round = any("round" in sample for sample in result["samples"])
     if has_round:
-        print("  sandboxID                               round e2e(ms) create-api launch cold warm")
-        print("  ------------------------------------ ----- -------- ---------- ------ ---- ----")
+        print("  sandboxID                               round e2e(ms) create-api launch cold warm output")
+        print("  ------------------------------------ ----- -------- ---------- ------ ---- ---- ------")
     else:
-        print("  sandboxID                               e2e(ms) create-api launch cold warm")
-        print("  ------------------------------------ -------- ---------- ------ ---- ----")
+        print("  sandboxID                               e2e(ms) create-api launch cold warm output")
+        print("  ------------------------------------ -------- ---------- ------ ---- ---- ------")
     for sample in result["samples"]:
+        output = sample.get("output", "")
         if has_round:
             print(f"  {sample['sid']:<36} {sample['round']:>5} {sample['e2e']:>8.1f} "
                   f"{sample['create_api']:>10.1f} {sample['create']:>6.1f} "
-                  f"{sample['cold']:>4.1f} {sample['warm']:>4.1f}")
+                  f"{sample['cold']:>4.1f} {sample['warm']:>4.1f} {output}")
         else:
             print(f"  {sample['sid']:<36} {sample['e2e']:>8.1f} {sample['create_api']:>10.1f} "
-                  f"{sample['create']:>6.1f} {sample['cold']:>4.1f} {sample['warm']:>4.1f}")
+                  f"{sample['create']:>6.1f} {sample['cold']:>4.1f} {sample['warm']:>4.1f} {output}")
     print(f"  attempted={accepted + result['discarded']}  accepted={accepted}  "
           f"discarded={result['discarded']}")
 
@@ -720,16 +781,18 @@ def main():
                     help="B template（传入才跑 B；默认不跑）")
     ap.add_argument("--w", default=None,
                     help="W template（传入才跑 W；默认不跑）")
-    ap.add_argument("--probe", choices=("exec", "health", "run"), default="exec",
-                    help="探针：exec/health 走 node proxy；run 走 SDK Sandbox.commands.run/envd")
-    ap.add_argument("--command", default=DEFAULT_RUN_COMMAND,
-                    help="--probe run 时在 guest 中执行的命令（默认 date）")
+    ap.add_argument("--probe", choices=("exec", "health", "run", "code"), default="exec",
+                    help="探针：exec/health 走 node proxy；run 走 SDK commands.run/envd；"
+                         "code 走 CI SDK run_code（e2b 镜像 FastAPI:49999→Jupyter）")
+    ap.add_argument("--command", default=None,
+                    help="--probe run 的 guest 命令（默认 date）/ --probe code 的 Python 源码"
+                         "（默认 print('hello kuasar-sandbox {index}')，每次执行替换不同序号）")
     ap.add_argument("--run-user", default="root",
                     help="--probe run 的 guest 用户（code-interpreter manifest 默认 root）")
     ap.add_argument("--run-cwd", default="/",
                     help="--probe run 的 guest 工作目录（code-interpreter manifest 默认 /）")
     ap.add_argument("--run-timeout", type=int, default=30,
-                    help="--probe run 的单次 commands.run 超时秒数")
+                    help="--probe run/code 的单次执行超时秒数")
     ap.add_argument("--allocatable-memory", default=None,
                     help="覆盖本次 sandbox 的 allocatable.memory，例如 256MiB；默认不覆盖")
     ap.add_argument("--failure-log", default=os.path.join(PARENT, "logs", "bench-failures.jsonl"),
@@ -751,8 +814,10 @@ def main():
         ap.error("-c/--concurrency 的值必须大于 0")
     if not args.b and not args.w:
         sys.exit("✗ 至少传一个 --b 或 --w")
-    if args.docker and args.probe == "run":
+    if args.docker and args.probe in ("run", "code"):
         sys.exit("✗ --docker 仅支持 exec/health 探针")
+    if args.command is None:
+        args.command = DEFAULT_RUN_CODE if args.probe == "code" else DEFAULT_RUN_COMMAND
 
     if args.rounds is not None:
         count_header = (f"rounds={args.rounds}/档（每轮 concurrency 个样本，"
@@ -763,6 +828,10 @@ def main():
         hdr = [f"# working-set 对比（e2b envd，probe=commands.run）",
                f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
                f"command={args.command}  user={args.run_user} cwd={args.run_cwd}"]
+    elif args.probe == "code":
+        hdr = [f"# working-set 对比（e2b code-interpreter，probe=run_code /execute）",
+               f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
+               f"code={args.command!r}  timeout={args.run_timeout}s（严格首次执行，无重试）"]
     elif args.probe == "health":
         hdr = ["# working-set 对比（openclaw + e2b/envd，node-proxy curl /health）",
                f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
