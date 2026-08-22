@@ -11,6 +11,150 @@ import bench
 
 
 class BenchConcurrencyTest(unittest.TestCase):
+    def test_namespace_resolution_follows_temp_env_to_matching_conductor(self):
+        with tempfile.TemporaryDirectory() as root:
+            workdir = os.path.join(root, "nova-work")
+            env_file = os.path.join(workdir, "smoke-tmp", "ws-bench-env.sh")
+            conductor = os.path.join(
+                workdir, "etc", "node-ctl-nova", "conductor.yaml")
+            os.makedirs(os.path.dirname(env_file))
+            os.makedirs(os.path.dirname(conductor))
+            with open(conductor, "w", encoding="utf-8") as file:
+                file.write("paths: { run_root: /nova/run, base_root: /nova/lib }\n")
+
+            with mock.patch.dict(os.environ, {
+                    "E2B_NAMESPACE": "",
+                    "E2B_DOMAIN": "sandboxes.nova.local",
+                    "E2B_API_URL": "https://api.sandboxes.nova.local:443",
+            }, clear=False):
+                namespace = bench._resolve_namespace(env_file)
+                resolved_workdir = bench._resolve_workdir(env_file, namespace)
+                resolved_conductor = bench._resolve_conductor_file(
+                    env_file, namespace, resolved_workdir)
+
+            self.assertEqual(namespace, "nova")
+            self.assertEqual(resolved_workdir, workdir)
+            self.assertEqual(resolved_conductor, conductor)
+
+    def test_namespace_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            env_file = os.path.join(root, "nova-work", "tenant.env")
+            with mock.patch.dict(os.environ, {
+                    "E2B_NAMESPACE": "test",
+                    "E2B_DOMAIN": "sandboxes.nova.local",
+            }, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "namespace mismatch"):
+                    bench._resolve_namespace(env_file)
+
+    def test_cleanup_rejects_a_different_namespace(self):
+        sid = "sid-other-ns"
+        with tempfile.TemporaryDirectory() as root:
+            paths = {
+                "run": os.path.join(root, "run"),
+                "base": os.path.join(root, "base"),
+                "checkpoint": os.path.join(root, "checkpoint"),
+            }
+            for directory in paths.values():
+                os.makedirs(os.path.join(directory, sid))
+
+            with mock.patch.multiple(
+                    bench,
+                    RUNTIME_NAMESPACE="nova",
+                    RUN_DIR=paths["run"],
+                    BASE_DIR=paths["base"],
+                    CHECKPOINT_DIR=paths["checkpoint"]):
+                errors = bench.cleanup_sandbox_directories(sid, namespace="test")
+
+            self.assertTrue(any("namespace mismatch" in error for error in errors))
+            for directory in paths.values():
+                self.assertTrue(os.path.isdir(os.path.join(directory, sid)))
+
+    def test_cleanup_sandbox_directories_removes_only_sid_children(self):
+        sid = "sid-cleanup"
+        with tempfile.TemporaryDirectory() as root:
+            paths = {
+                "run": os.path.join(root, "run"),
+                "base": os.path.join(root, "base"),
+                "checkpoint": os.path.join(root, "checkpoint"),
+            }
+            for directory in paths.values():
+                os.makedirs(os.path.join(directory, sid, "nested"))
+                with open(os.path.join(directory, sid, "nested", "data"), "w") as file:
+                    file.write("sample")
+                os.makedirs(os.path.join(directory, "keep"))
+
+            with mock.patch.multiple(
+                    bench,
+                    RUN_DIR=paths["run"],
+                    BASE_DIR=paths["base"],
+                    CHECKPOINT_DIR=paths["checkpoint"]):
+                self.assertEqual(bench.cleanup_sandbox_directories(sid), [])
+
+            for directory in paths.values():
+                self.assertFalse(os.path.exists(os.path.join(directory, sid)))
+                self.assertTrue(os.path.isdir(os.path.join(directory, "keep")))
+
+    def test_run_round_cleans_directories_after_delete(self):
+        sid = "sid-round-cleanup"
+        response = SimpleNamespace(status_code=204)
+        with tempfile.TemporaryDirectory() as root:
+            paths = {
+                "run": os.path.join(root, "run"),
+                "base": os.path.join(root, "base"),
+                "checkpoint": os.path.join(root, "checkpoint"),
+            }
+            for directory in paths.values():
+                os.makedirs(os.path.join(directory, sid))
+
+            with mock.patch.multiple(
+                    bench,
+                    RUN_DIR=paths["run"],
+                    BASE_DIR=paths["base"],
+                    CHECKPOINT_DIR=paths["checkpoint"]), \
+                    mock.patch.object(bench, "create", return_value=(sid, "token")), \
+                    mock.patch.object(bench, "probe", side_effect=[
+                        (True, 1.0, "ok"), (True, 1.0, "ok")
+                    ]), \
+                    mock.patch.object(bench, "wait_launch_ms", return_value=(10.0, {})), \
+                    mock.patch.object(bench.e2b_env, "api_request", return_value=response):
+                result, failure = bench.run_round("template", "health")
+
+            self.assertIsNone(failure)
+            self.assertEqual(result["discarded"], 0)
+            for directory in paths.values():
+                self.assertFalse(os.path.exists(os.path.join(directory, sid)))
+
+    def test_run_round_keeps_directories_when_delete_fails(self):
+        sid = "sid-delete-failed"
+        response = SimpleNamespace(status_code=500)
+        with tempfile.TemporaryDirectory() as root:
+            paths = {
+                "run": os.path.join(root, "run"),
+                "base": os.path.join(root, "base"),
+                "checkpoint": os.path.join(root, "checkpoint"),
+            }
+            for directory in paths.values():
+                os.makedirs(os.path.join(directory, sid))
+
+            with mock.patch.multiple(
+                    bench,
+                    RUN_DIR=paths["run"],
+                    BASE_DIR=paths["base"],
+                    CHECKPOINT_DIR=paths["checkpoint"]), \
+                    mock.patch.object(bench, "create", return_value=(sid, "token")), \
+                    mock.patch.object(bench, "probe", side_effect=[
+                        (True, 1.0, "ok"), (True, 1.0, "ok")
+                    ]), \
+                    mock.patch.object(bench, "wait_launch_ms", return_value=(10.0, {})), \
+                    mock.patch.object(bench.e2b_env, "api_request", return_value=response):
+                result, failure = bench.run_round("template", "health")
+
+            self.assertEqual(result["discarded"], 1)
+            self.assertEqual(result["samples"], [])
+            self.assertIn("API delete HTTP 500", failure["error"])
+            for directory in paths.values():
+                self.assertTrue(os.path.isdir(os.path.join(directory, sid)))
+
     def test_wait_launch_does_not_accept_launch_ms_while_starting(self):
         responses = [
             SimpleNamespace(status_code=200, json=lambda: {"state": "starting", "launchMs": 286.0}),

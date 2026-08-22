@@ -33,63 +33,250 @@ import argparse, json, os, re, shutil, socket, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+PARENT = os.path.dirname(os.path.abspath(__file__))
+
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
 import openclaw_net
 
-# restore 会把快照物化到节点 checkpoint.local_dir/<sid>/（~1GiB/次）；DELETE 不清理，
-# 会把磁盘写满并让回写脉冲污染后续样本（dispatch/pre_ch 毛刺）。每样本 DELETE 后
-# 顺手清掉自己的物化目录。
-# 路径解析顺序：E2B_CHECKPOINT_DIR 显式覆盖 → E2B_ENV_FILE 同目录 conductor.yaml 的
-# checkpoint.local_dir（权威来源）→ 按 env 文件所在 workdir 派生 <workdir>/var/lib-saved。
-def _resolve_checkpoint_dir():
-    explicit = os.environ.get("E2B_CHECKPOINT_DIR")
+# restore 会把快照物化到节点 checkpoint.local_dir/<sid>/（~1GiB/次）；DELETE 不清理
+# sandbox 的本地目录，会把磁盘写满并让回写脉冲污染后续样本（dispatch/pre_ch 毛刺）。
+# 每样本删除 sandbox 后，顺手清掉当前 NS 的 run_root/<sid>、base_root/<sid> 和
+# checkpoint.local_dir/<sid>。不能只从 E2B_ENV_FILE 的目录找 conductor：deploy-ns.sh
+# 的冒烟流程会把 tenant.env 复制到 smoke-tmp；此时必须用 tenant 的 NS 回到对应
+# <ns>-work/etc/node-ctl-<ns>/conductor.yaml，避免误清理另一个 NS。
+def _namespace_from_path(path):
+    """Infer an NS from ``node-ctl-<ns>`` or ``<ns>-work`` path components."""
+    if not path:
+        return None
+    for component in reversed(os.path.abspath(path).split(os.sep)):
+        if component.startswith("node-ctl-") and len(component) > len("node-ctl-"):
+            return component[len("node-ctl-"):]
+        if component.endswith("-work") and len(component) > len("-work"):
+            return component[:-len("-work")]
+    return None
+
+
+def _namespace_from_endpoint(endpoint):
+    """Infer an NS from domains such as ``sandboxes.nova.local``."""
+    if not endpoint:
+        return None
+    match = re.search(
+        r"(?:^|[./])sandboxes\.([A-Za-z0-9_-]+)(?:[.:/]|$)", endpoint
+    )
+    return match.group(1) if match else None
+
+
+def _resolve_namespace(env_file):
+    values = [
+        ("E2B_NAMESPACE", os.environ.get("E2B_NAMESPACE")),
+        ("E2B_ENV_FILE", _namespace_from_path(env_file)),
+        ("E2B_DOMAIN", _namespace_from_endpoint(os.environ.get("E2B_DOMAIN"))),
+        ("E2B_API_URL", _namespace_from_endpoint(os.environ.get("E2B_API_URL"))),
+    ]
+    discovered = [(source, value) for source, value in values if value]
+    namespaces = {value for _source, value in discovered}
+    if len(namespaces) > 1:
+        detail = ", ".join(f"{source}={value}" for source, value in discovered)
+        raise RuntimeError(f"E2B namespace mismatch: {detail}")
+    return next(iter(namespaces), None)
+
+
+def _resolve_workdir(env_file, namespace):
+    explicit = os.environ.get("E2B_WORK_DIR")
     if explicit:
-        return explicit
-    env_file = os.environ.get("E2B_ENV_FILE") or os.path.join(PARENT, "e2b-env.sh")
-    cfg_dir = os.path.dirname(os.path.abspath(env_file))
-    conductor = os.path.join(cfg_dir, "conductor.yaml")
-    try:
-        with open(conductor, "r", encoding="utf-8") as f:
-            for line in f:
-                # flow 映射形态：checkpoint: { mode: local, local_dir: /path, ... }
-                m = re.search(r"local_dir:\s*([^,}]+)", line)
-                if m:
-                    return m.group(1).strip().strip(chr(39)).rstrip(chr(92))
-    except OSError:
-        pass
-    # 兜底：tenant.env 位于 <workdir>/etc/node-ctl-<ns>/ → <workdir>/var/lib-saved
-    workdir = os.path.dirname(os.path.dirname(cfg_dir))
-    return os.path.join(workdir, "var", "lib-saved")
+        return _namespace_checked_path(explicit, namespace, "E2B_WORK_DIR")
+    if not namespace:
+        return None
+    current = os.path.dirname(os.path.abspath(env_file))
+    target = f"{namespace}-work"
+    while current != os.path.dirname(current):
+        if os.path.basename(current) == target:
+            return current
+        current = os.path.dirname(current)
+    return os.path.join(os.path.dirname(PARENT), target)
 
-CHECKPOINT_DIR = _resolve_checkpoint_dir()
 
-def cleanup_checkpoint_materialization(sid):
-    """Best-effort 删除本样本的快照物化目录（DELETE 后 sandbox-ctl 已释放句柄）。
-    保留 paused 沙箱语义：这里只在 DELETE 成功后调用，paused 沙箱不会走到这。"""
-    if not sid:
-        return
-    d = os.path.join(CHECKPOINT_DIR, sid)
-    for attempt in range(3):
+def _resolve_conductor_file(env_file, namespace, workdir):
+    explicit = os.environ.get("E2B_CONDUCTOR_FILE")
+    candidates = [explicit] if explicit else []
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(env_file)), "conductor.yaml"))
+    if workdir and namespace:
+        candidates.append(os.path.join(
+            workdir, "etc", f"node-ctl-{namespace}", "conductor.yaml"
+        ))
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        config_namespace = _namespace_from_path(candidate)
+        if config_namespace and namespace and config_namespace != namespace:
+            raise RuntimeError(
+                f"conductor namespace mismatch: expected {namespace}, "
+                f"got {config_namespace} ({candidate})"
+            )
+        return _namespace_checked_path(candidate, namespace, "conductor")
+    return None
+
+
+def _namespace_checked_path(path, namespace, source):
+    resolved = os.path.abspath(path)
+    path_namespace = _namespace_from_path(resolved)
+    if path_namespace and namespace and path_namespace != namespace:
+        raise RuntimeError(
+            f"{source} namespace mismatch: expected {namespace}, "
+            f"got {path_namespace} ({resolved})"
+        )
+    return resolved
+
+
+ENV_FILE = os.path.abspath(
+    os.environ.get("E2B_ENV_FILE") or os.path.join(PARENT, "e2b-env.sh")
+)
+RUNTIME_NAMESPACE = _resolve_namespace(ENV_FILE)
+RUNTIME_WORKDIR = _resolve_workdir(ENV_FILE, RUNTIME_NAMESPACE)
+CONDUCTOR_FILE = _resolve_conductor_file(
+    ENV_FILE, RUNTIME_NAMESPACE, RUNTIME_WORKDIR
+)
+
+
+# 路径可用环境变量显式覆盖，否则从当前 NS 的 conductor.yaml 读取，再按当前
+# <ns>-work 兜底。没有可靠的 NS/workdir 时返回 None，清理逻辑会报错而不会猜
+# 到宿主机的共享目录。
+def _resolve_runtime_dir(env_name, config_key, fallback):
+    explicit = os.environ.get(env_name)
+    if explicit:
+        return _namespace_checked_path(explicit, RUNTIME_NAMESPACE, env_name)
+    if CONDUCTOR_FILE:
         try:
-            if os.path.islink(d) or (os.path.exists(d) and not os.path.isdir(d)):
-                os.remove(d); return
-            if os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
-                if not os.path.isdir(d):
-                    return
-            else:
-                return
+            with open(CONDUCTOR_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    # flow 映射形态：paths: { run_root: /path, base_root: /path, ... }
+                    # 或 checkpoint: { mode: local, local_dir: /path, ... }。
+                    m = re.search(rf"{re.escape(config_key)}\s*:\s*([^,}}]+)", line)
+                    if m:
+                        return _namespace_checked_path(
+                            m.group(1).strip().strip("'\"").rstrip("\\"),
+                            RUNTIME_NAMESPACE,
+                            config_key,
+                        )
         except OSError:
             pass
-        time.sleep(0.3 * (attempt + 1))
+    if RUNTIME_WORKDIR:
+        return _namespace_checked_path(
+            os.path.join(RUNTIME_WORKDIR, fallback),
+            RUNTIME_NAMESPACE,
+            fallback,
+        )
+    return None
+
+CHECKPOINT_DIR = _resolve_runtime_dir(
+    "E2B_CHECKPOINT_DIR", "local_dir", os.path.join("var", "lib-saved")
+)
+BASE_DIR = _resolve_runtime_dir(
+    "E2B_BASE_DIR", "base_root", os.path.join("var", "lib")
+)
+RUN_DIR = _resolve_runtime_dir("E2B_RUN_DIR", "run_root", "run")
+
+
+def _remove_sandbox_directory(root, sid):
+    """Remove exactly ``root/<sid>`` and return an error string on failure.
+
+    The SID is validated as a single path component so a malformed API response
+    can never turn this cleanup into a parent-directory deletion.
+    """
+    if not root or not sid:
+        return None
+    if not isinstance(sid, str) or sid in (".", "..") or os.path.basename(sid) != sid:
+        return f"unsafe sandbox id for {root!r}: {sid!r}"
+    directory = os.path.join(root, sid)
+    last_error = None
+    for attempt in range(3):
+        try:
+            if not os.path.lexists(directory):
+                return None
+            if os.path.islink(directory) or not os.path.isdir(directory):
+                os.remove(directory)
+            else:
+                shutil.rmtree(directory)
+            if not os.path.lexists(directory):
+                return None
+            last_error = "path still exists after removal"
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        if attempt < 2:
+            time.sleep(0.3 * (attempt + 1))
+    return f"{directory}: {last_error}"
+
+
+def cleanup_checkpoint_materialization(sid):
+    """Best-effort 删除本样本的快照物化目录，返回可记录的错误。"""
+    return _remove_sandbox_directory(CHECKPOINT_DIR, sid)
+
+
+def cleanup_sandbox_directories(sid, namespace=None):
+    """Remove all per-sandbox directories after the control-plane delete.
+
+    Only the SID child is removed; runner pool directories and shared logs are
+    intentionally left alone. The caller decides whether deletion of the
+    sandbox itself completed successfully before invoking this function.
+    """
+    namespace = RUNTIME_NAMESPACE if namespace is None else namespace
+    if namespace != RUNTIME_NAMESPACE:
+        return [
+            f"namespace mismatch: requested {namespace!r}, "
+            f"configured {RUNTIME_NAMESPACE!r}"
+        ]
+    if not RUNTIME_NAMESPACE:
+        return ["namespace unresolved; refusing local directory cleanup"]
+
+    errors = []
+    for name, root in (
+        ("run_root", RUN_DIR),
+        ("base_root", BASE_DIR),
+        ("checkpoint.local_dir", CHECKPOINT_DIR),
+    ):
+        if not root:
+            errors.append(f"ns={RUNTIME_NAMESPACE} {name}: path unresolved")
+            continue
+        error = _remove_sandbox_directory(root, sid)
+        if error:
+            errors.append(f"ns={RUNTIME_NAMESPACE} {name}: {error}")
+    return errors
+
+
+def _delete_sandbox(sid, sandbox):
+    """Delete the sandbox and report whether its local files are safe to remove."""
+    if not sid:
+        return True, []
+
+    errors = []
+    if sandbox is not None:
+        try:
+            response = sandbox.kill()
+            status = getattr(response, "status_code", None)
+            if isinstance(status, int) and status != 404 and not 200 <= status < 300:
+                raise RuntimeError(f"SDK kill HTTP {status}")
+            return True, []
+        except Exception as exc:
+            errors.append(f"SDK kill failed: {type(exc).__name__}: {exc}")
+
+    try:
+        response = e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and status != 404 and not 200 <= status < 300:
+            errors.append(f"API delete HTTP {status}")
+            return False, errors
+        return True, []
+    except Exception as exc:
+        errors.append(f"API delete failed: {type(exc).__name__}: {exc}")
+        return False, errors
 from e2b import Sandbox  # run 探针用 SDK sandbox 认证；exec/health 用 forwardAccessToken 走 node proxy
 from e2b_code_interpreter import Sandbox as CodeSandbox  # code 探针走 CI SDK /execute（49999）
 
 DEFAULT_RUN_COMMAND = "date"
 DEFAULT_RUN_CODE = "print('hello kuasar-sandbox {index}')"
-
-PARENT = os.path.dirname(os.path.abspath(__file__))
 
 
 
@@ -333,6 +520,14 @@ def _new_results():
     return res
 
 
+def _discard_result(res):
+    """Remove a just-built sample when its post-probe cleanup did not finish."""
+    for key in ('create', 'create_api', 'e2e', 'cold', 'warm', 'accounted', 'unaccounted'):
+        res[key].clear()
+    res["phases"].clear()
+    res["samples"].clear()
+
+
 def _merge_results(dst, src):
     for key in ('create', 'create_api', 'e2e', 'cold', 'warm', 'accounted', 'unaccounted'):
         dst[key].extend(src[key])
@@ -350,6 +545,7 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
     sid = token = None
     sandbox = None
     error = None
+    cleanup_errors = []
     create_api_ms = e2e1 = tc = None
     try:
         e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
@@ -411,24 +607,31 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
     except Exception as e:
         error = f"sid={sid or '<none>'} error={type(e).__name__}: {e}"
     finally:
-        if sandbox is not None:
-            # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口，
-            # 同时避免只 DELETE sid 而遗留本轮 Sandbox 对象的连接状态。
-            try:
-                sandbox.kill()
-            except Exception:
-                try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
-                except Exception: pass
+        # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口。
+        # 只有控制面确认删除完成（或已是 404）后才删本地目录，避免仍在运行的
+        # sandbox 继续使用 base_root/<sid>。目录清理失败必须进入 failure，不能静默。
+        deleted, delete_errors = _delete_sandbox(sid, sandbox)
+        cleanup_errors.extend(delete_errors)
+        if sid and deleted:
+            cleanup_errors.extend(
+                cleanup_sandbox_directories(sid, namespace=RUNTIME_NAMESPACE)
+            )
         elif sid:
-            try: e2b_env.api_request("DELETE", f"/sandboxes/{sid}")
-            except Exception: pass
-        if sid:
-            cleanup_checkpoint_materialization(sid)
+            cleanup_errors.append(
+                f"sid={sid}: local sandbox directories retained because delete failed"
+            )
+        if cleanup_errors:
+            _discard_result(res)
+            cleanup_error = "cleanup failed: " + "; ".join(cleanup_errors)
+            error = f"{error}; {cleanup_error}" if error else (
+                f"sid={sid} error={cleanup_error}"
+            )
     failure = None
     if error:
         res["discarded"] = 1
         failure = {
             "sid": sid,
+            "namespace": RUNTIME_NAMESPACE,
             "error": error,
             "create_api_ms": create_api_ms,
             "e2e_ms": e2e1,
@@ -840,6 +1043,7 @@ def main():
         hdr = [f"# working-set 对比（原生 openclaw，probe={args.probe}，经 node proxy 按 sid 转发）",
                f"{count_header}  concurrency={','.join(map(str, args.concurrency))}  "
                f"proxy={openclaw_net.proxy_url()}"]
+    hdr.append(f"namespace={RUNTIME_NAMESPACE or '<unresolved>'}")
     if args.allocatable_memory:
         hdr.append(f"resource: allocatable.memory={args.allocatable_memory}")
     if args.b:
