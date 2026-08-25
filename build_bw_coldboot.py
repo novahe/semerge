@@ -31,7 +31,7 @@ from e2b import Sandbox
 import openclaw_net
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
-KEY = os.environ.get("MANIFEST_KEY", "65c3599e5f52264c63549b5069cf313065a6255fad1c9190d5b55a3c809bfa3f")
+KEY = os.environ.get("MANIFEST_KEY", "085b6760c6f3309ab0acf2b2ad2cf173a3ec272c73a26e8da69c60dfecc468d3")
 PROFILE = os.environ.get("PROFILE", "e2b").strip().lower()  # e2b | bare
 IMAGE_NAME = os.environ.get("IMAGE_NAME", "openclaw").strip()
 if PROFILE == "bare":
@@ -47,7 +47,7 @@ SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "600"))  # 两段式流�
 READY_WAIT = int(os.environ.get("READY_WAIT", "120"))
 WARM_CURLS = int(os.environ.get("WARM_CURLS", "4"))
 WARM_HEALTH = os.environ.get("WARM_HEALTH", "1").lower() not in ("0", "false", "no")
-READY_SETTLE = float(os.environ.get("READY_SETTLE", "2"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
+READY_SETTLE = float(os.environ.get("READY_SETTLE", "10"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
 DATAPLANE_PORTS = ("49983", "49999")
 # 覆盖本次（及产出的快照所记录）的 allocatable.memory；=capacity（如 8GiB）时
 # alloc==cap → CH 不加气球设备，用于产"无气球"对照快照。

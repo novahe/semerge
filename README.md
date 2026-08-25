@@ -68,6 +68,9 @@ python3 bench.py --b "$B" --w "$W" --probe health -n 50 -c 1 10 30 50
 # 分轮并发：每档 5 轮；每轮同时启动该档位数量，轮间等待全部完成
 python3 bench.py --b "$B" --w "$W" --probe health -r 5 -c 1 10 30 50
 
+# create + 首次 /health=200 业务吞吐：每档运行 60 秒，输出完成事务 QPS
+python3 bench.py --b "$B" --w "$W" --probe health --duration 60 -c 1 10 30 50
+
 # 2. openclaw bare：node-proxy → health
 PROFILE=bare IMAGE_NAME=openclaw python3 build_bw_coldboot.py
 B="$(cat openclaw-bare-snp-template.id)"
@@ -93,11 +96,22 @@ python3 bench.py --b "$B" --w "$W" --probe code -n 10
 `5 × (1 + 10 + 30 + 50) = 455` 个样本；`c=1` 的 5 轮就是 5 次串行测试。失败样本仍会丢弃，
 并计入 `discarded` 和失败 JSONL 日志，不会补偿重试。
 
+`--duration` 是独立的 health 吞吐模式，不能与 `-n/-r` 同时使用。每个 worker 持续执行
+`POST /sandboxes` → 首次 node-proxy `/health` 返回 200；首次 health 返回即完成一个业务事务，
+计入 `accepted` 和 `business_qps`。到达 duration 后不再启动新事务，但已在途的事务会等待完成。
+`business_qps` 的分母包含请求窗口和超出窗口的在途尾部；warm `/health`、launch timing 和
+DELETE 不属于事务完成条件。清理失败单独计入 `cleanup_failed`，并停止发生清理失败的 worker。
+
 每档默认只打印 attempted/accepted/discarded 计数；加 `-v/--verbose` 后才打印每个成功 sandbox 的
 SID 与 e2e/create-api/launch/cold/warm 耗时。失败样本无论是否加 `-v` 都会立即打印 SID 和错误；最后的并发趋势
 表对比各档的总耗时和启动阶段耗时相对基线的变化。任一 create、cold probe、launch timing 或
 warm probe 失败时，整条样本从所有统计中丢弃；关键信息默认追加保存到
 `logs/bench-failures.jsonl`，可用 `--failure-log PATH` 修改路径。
+
+吞吐模式下默认输出每档的 attempted/accepted/discarded、cleanup_failed、measured_s、
+business_qps 和 success_rate；`-v` 额外输出每个成功事务的 create+/health e2e、create-api
+和 health 耗时。吞吐模式只接受 `--probe health`，因为这里的业务事务边界就是 create 加首次
+`/health`。
 
 只有选择两个或以上并发档位时才打印并发趋势表；默认的 `-c 1` 或显式单档 `-c 1` 只输出该档
 汇总，不做无意义的自身基线比较。B/W 的 cold 和 create 原始指标保留在汇总表中。

@@ -18,7 +18,9 @@ run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 
   code     e2b code-interpreter SDK Sandbox.run_code()，经 49999/execute → Jupyter；
            W 会预热 Python/Jupyter 执行工作集。
 
-每轮：create → 立即第一次 probe → 读取 launchMs → 第二次 probe → kill。
+普通模式每轮：create → 立即第一次 probe → 读取 launchMs → 第二次 probe → kill。
+吞吐模式（--duration，仅支持 health）：持续执行 create → 首次 /health=200，
+首次 health 返回即完成一个业务事务；warm probe、launch timing 和 kill 不计入事务成功条件。
 - B = `*-snp-template.id`（drop-caches=true，无预热）
 - W = `*-ws-template.id`（drop-caches=false + 预热）
 
@@ -29,7 +31,7 @@ launchMs 轮询；run1(cold) = e2e1 - create(launchMs)。run2(warm) 仍只统计
 E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
-import argparse, json, os, re, shutil, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -510,6 +512,54 @@ def _show_progress(label, completed, total):
     sys.stdout.flush()
 
 
+def _show_time_progress(label, deadline, accepted, attempted, started=None,
+                        refresh=0.25):
+    """按时间窗口渲染 duration 模式进度条，返回停止函数。
+
+    ``accepted``/``attempted`` 是每次渲染前重新求值的回调，这样即使当前
+    事务很慢（create+health 数秒），进度线仍按已流逝时间持续刷新。
+    ``started`` 必须传入定义 deadline 的那个时间戳：进度条若在 worker
+    启动后才取当前时钟，线程池 + 首笔 create 的 TLS 握手会推迟这里
+    ~100ms，total 被截短，终帧永远到不了 20.0/20s。
+    停止函数渲染最终状态并停止后台 ticker；worker 全部结束后调用。
+    """
+    if started is None:
+        started = time.perf_counter()
+    total = max(deadline - started, 1e-9)
+
+    def render(final=False):
+        now = time.perf_counter()
+        elapsed = min(now - started, total)
+        filled = min(PROGRESS_WIDTH, int(PROGRESS_WIDTH * elapsed / total))
+        bar = "#" * filled + "." * (PROGRESS_WIDTH - filled)
+        # deadline 后的尾巴显示为 +N.Ns；在途事务仍会拖高 measured_s。
+        overtime = max(now - deadline, 0.0)
+        tail = f" +{overtime:.1f}s" if overtime > 0.05 else ""
+        line = (f"  {label} wall [{bar}] {elapsed:>5.1f}/{total:.0f}s"
+                f" acc={accepted()} att={attempted()}{tail}")
+        sys.stdout.write("\r" + line.ljust(100))
+        if final:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    render()
+    done = threading.Event()
+
+    def tick():
+        while not done.wait(refresh):
+            render()
+
+    ticker = threading.Thread(target=tick, daemon=True)
+    ticker.start()
+
+    def stop():
+        done.set()
+        ticker.join()
+        render(final=True)
+
+    return stop
+
+
 def _new_results():
     res = {k: [] for k in ('create', 'create_api', 'e2e', 'cold', 'warm')}
     res["phases"] = {}
@@ -517,6 +567,13 @@ def _new_results():
     res["unaccounted"] = []
     res["samples"] = []
     res["discarded"] = 0
+    # 吞吐模式使用单调时钟记录业务事务的开始和完成。普通模式保持这些
+    # 字段为空，避免把两种统计口径混在同一个汇总里。
+    res["qps_starts"] = []
+    res["qps_completions"] = []
+    res["qps_ends"] = []
+    res["cleanup_failed"] = 0
+    res["stop_worker"] = False
     return res
 
 
@@ -526,6 +583,9 @@ def _discard_result(res):
         res[key].clear()
     res["phases"].clear()
     res["samples"].clear()
+    res["qps_starts"].clear()
+    res["qps_completions"].clear()
+    res["qps_ends"].clear()
 
 
 def _merge_results(dst, src):
@@ -534,13 +594,21 @@ def _merge_results(dst, src):
     for name, values in src["phases"].items():
         dst["phases"].setdefault(name, []).extend(values)
     dst["samples"].extend(src["samples"])
+    dst["qps_starts"].extend(src["qps_starts"])
+    dst["qps_completions"].extend(src["qps_completions"])
+    dst["qps_ends"].extend(src["qps_ends"])
+    dst["cleanup_failed"] += src["cleanup_failed"]
+    dst["stop_worker"] = dst["stop_worker"] or src["stop_worker"]
     dst["discarded"] += src["discarded"]
 
 
 def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
               run_user="root", run_cwd="/", run_timeout=30,
-              allocatable_memory=None, sample_index=0):
+              allocatable_memory=None, sample_index=0,
+              transaction_only=False):
     """Run one isolated sandbox lifecycle and return (results, failure)."""
+    if transaction_only and mode != "health":
+        raise ValueError("transaction_only mode requires --probe health")
     res = _new_results()
     sid = token = None
     sandbox = None
@@ -549,6 +617,8 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
     create_api_ms = e2e1 = tc = None
     try:
         e2e_start = time.perf_counter()             # 0.0 SDK/raw create start
+        if transaction_only:
+            res["qps_starts"].append(e2e_start)
         sid, token = create(template, allocatable_memory=allocatable_memory)
         create_return = time.perf_counter()         # 1.0 create interface return
         create_api_ms = (create_return - e2e_start) * 1000
@@ -562,51 +632,77 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
         ok1, _probe1_ms, t1 = probe(sid, token, mode, sandbox, cold_command, run_user, run_cwd, run_timeout)  # cold
         probe_return = time.perf_counter()           # 2.0 probe return
         e2e1 = (probe_return - e2e_start) * 1000     # 0.0 -> 2.0
-        # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
-        # 避免轮询 wait_launch_ms 污染端到端耗时。
-        tc, timing = wait_launch_ms(sid)
-        if tc is None:
-            raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-        run1 = e2e1 - tc if ok1 else None
-        if ok1:
-            warm_command = code_with_index(
-                command, f"{sample_index}-warm-{sid[-8:]}"
-            ) if mode == "code" else command
-            ok2, c2, t2 = probe(sid, token, mode, sandbox, warm_command, run_user, run_cwd, run_timeout)  # warm
+        if transaction_only:
+            if not ok1:
+                error = f"sid={sid} error={t1 or 'health probe failed'}"
+            else:
+                # 业务事务的完成边界就是首次 /health 返回 200；后续清理失败
+                # 不能抹掉已经完成的 create+/health 事务，但会停止该 worker，
+                # 防止清理失败时继续制造无法回收的 sandbox。
+                res["qps_completions"].append(probe_return)
+                res["create_api"].append(create_api_ms)
+                res["e2e"].append(e2e1)
+                res["samples"].append({
+                    "sid": sid,
+                    "create_api": create_api_ms,
+                    "e2e": e2e1,
+                    "health": _probe1_ms,
+                    "output": (t1 or "")[:60],
+                })
+            # 吞吐模式不等待 launch timing，也不执行第二次 warm probe：
+            # 首次 health 已经是用户定义的事务完成点。
+            tc = None
         else:
-            ok2, c2, t2 = False, None, "probe1 failed"
-        if not ok1:
-            error = f"sid={sid} error={t1}"
-        elif not ok2:
-            error = f"sid={sid} error={t2 or 'warm probe failed'}"
-        else:
-            # A sample is atomic: only publish it after create, cold probe,
-            # launch timing and warm probe have all succeeded.
-            phase_values = dict(launch_timing_rows(timing, minimum_ms=0.0)) if timing else {}
-            res['create_api'].append(create_api_ms)
-            res['create'].append(tc)
-            res['e2e'].append(e2e1)
-            res['cold'].append(run1)
-            res['warm'].append(c2)
-            for name, value in phase_values.items():
-                res["phases"].setdefault(name, []).append(value)
-            if timing and timing.get("accountedMs") is not None:
-                res["accounted"].append(float(timing["accountedMs"]))
-            if timing and timing.get("unaccountedMs") is not None:
-                res["unaccounted"].append(float(timing["unaccountedMs"]))
-            res["samples"].append({
-                "sid": sid,
-                "create_api": create_api_ms,
-                "create": tc,
-                "e2e": e2e1,
-                "cold": run1,
-                "warm": c2,
-                "phases": phase_values,
-                "output": (t1 or "")[:60],
-            })
+            # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
+            # 避免轮询 wait_launch_ms 污染端到端耗时。
+            tc, timing = wait_launch_ms(sid)
+            if tc is None:
+                raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
+            run1 = e2e1 - tc if ok1 else None
+            if ok1:
+                warm_command = code_with_index(
+                    command, f"{sample_index}-warm-{sid[-8:]}"
+                ) if mode == "code" else command
+                ok2, c2, t2 = probe(sid, token, mode, sandbox, warm_command, run_user, run_cwd, run_timeout)  # warm
+            else:
+                ok2, c2, t2 = False, None, "probe1 failed"
+            if not ok1:
+                error = f"sid={sid} error={t1}"
+            elif not ok2:
+                error = f"sid={sid} error={t2 or 'warm probe failed'}"
+            else:
+                # A sample is atomic: only publish it after create, cold probe,
+                # launch timing and warm probe have all succeeded.
+                phase_values = dict(launch_timing_rows(timing, minimum_ms=0.0)) if timing else {}
+                res['create_api'].append(create_api_ms)
+                res['create'].append(tc)
+                res['e2e'].append(e2e1)
+                res['cold'].append(run1)
+                res['warm'].append(c2)
+                for name, value in phase_values.items():
+                    res["phases"].setdefault(name, []).append(value)
+                if timing and timing.get("accountedMs") is not None:
+                    res["accounted"].append(float(timing["accountedMs"]))
+                if timing and timing.get("unaccountedMs") is not None:
+                    res["unaccounted"].append(float(timing["unaccountedMs"]))
+                res["samples"].append({
+                    "sid": sid,
+                    "create_api": create_api_ms,
+                    "create": tc,
+                    "e2e": e2e1,
+                    "cold": run1,
+                    "warm": c2,
+                    "phases": phase_values,
+                    "output": (t1 or "")[:60],
+                })
     except Exception as e:
         error = f"sid={sid or '<none>'} error={type(e).__name__}: {e}"
     finally:
+        if transaction_only:
+            # This is before DELETE: successful transactions end at first
+            # health, while failed in-flight attempts still contribute their
+            # real tail to measured_s without counting as accepted.
+            res["qps_ends"].append(time.perf_counter())
         # SDK 没有公开 close()；kill() 是其 Sandbox 生命周期清理接口。
         # 只有控制面确认删除完成（或已是 404）后才删本地目录，避免仍在运行的
         # sandbox 继续使用 base_root/<sid>。目录清理失败必须进入 failure，不能静默。
@@ -621,7 +717,16 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
                 f"sid={sid}: local sandbox directories retained because delete failed"
             )
         if cleanup_errors:
-            _discard_result(res)
+            if transaction_only:
+                # Keep qps_starts even when the health transaction failed, so
+                # attempted/accepted/discarded accounting remains truthful.
+                # A cleanup failure always stops this worker to avoid creating
+                # more sandboxes while a previous SID may still be live.
+                res["stop_worker"] = True
+                if res["qps_completions"]:
+                    res["cleanup_failed"] += 1
+            else:
+                _discard_result(res)
             cleanup_error = "cleanup failed: " + "; ".join(cleanup_errors)
             error = f"{error}; {cleanup_error}" if error else (
                 f"sid={sid} error={cleanup_error}"
@@ -638,6 +743,178 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
             "launch_ms": tc,
         }
     return res, failure
+
+
+def _run_throughput_worker(template, deadline, label, mode, command,
+                           run_user, run_cwd, run_timeout, concurrency,
+                           allocatable_memory, worker_index):
+    """Run create+/health transactions until ``deadline``.
+
+    A worker only starts a new transaction while inside the requested load
+    window. An in-flight transaction may finish after the deadline and is
+    counted using its actual first-health completion timestamp.
+    """
+    result = _new_results()
+    failures = []
+    sample_index = worker_index
+    while time.perf_counter() < deadline:
+        sample_index += 1
+        batch, failure = run_round(
+            template, mode, command, run_user, run_cwd, run_timeout,
+            allocatable_memory, sample_index, transaction_only=True)
+        _merge_results(result, batch)
+        if failure:
+            failures.append(failure)
+        if batch["stop_worker"]:
+            break
+    return result, failures
+
+
+def run_throughput(template, duration, label, mode,
+                   command=DEFAULT_RUN_COMMAND, run_user="root", run_cwd="/",
+                   run_timeout=30, concurrency=1, failure_log=None,
+                   allocatable_memory=None):
+    """Measure completed create + first /health business transactions.
+
+    ``duration`` controls the open window for starting new transactions;
+    ``concurrency`` is the maximum number of lifecycle workers. The returned
+    result contains monotonic start/completion timestamps so the caller can
+    report business QPS without counting the optional warm probe.
+    """
+    if mode != "health":
+        raise ValueError("throughput mode requires --probe health")
+    if duration <= 0:
+        raise ValueError("duration must be greater than zero")
+    if concurrency < 1:
+        raise ValueError("concurrency must be greater than zero")
+
+    started_at = time.perf_counter()
+    deadline = started_at + duration
+    result = _new_results()
+    failures = []
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(
+            _run_throughput_worker, template, deadline, label, mode, command,
+            run_user, run_cwd, run_timeout, concurrency, allocatable_memory,
+            worker_index)
+            for worker_index in range(concurrency)]
+        # 与普通模式不同，样本总数事先未知，进度条走时间维度：elapsed/duration。
+        # 计数回调读 result 的实时长度；在途事务尚未合并，acc 会滞后于真实
+        # 完成数，worker 收尾后由 stop() 渲染最终值。
+        progress_stop = _show_time_progress(
+            label, deadline,
+            accepted=lambda: len(result["qps_completions"]),
+            attempted=lambda: len(result["qps_starts"]),
+            started=started_at)
+        try:
+            for future in as_completed(futures):
+                worker_result, worker_failures = future.result()
+                _merge_results(result, worker_result)
+                failures.extend(worker_failures)
+        finally:
+            progress_stop()
+
+    result["qps_started_at"] = started_at
+    result["qps_deadline"] = deadline
+    result["qps_finished_at"] = max(
+        result["qps_ends"] or [deadline])
+    for failure in failures:
+        _clear_progress()
+        print(f"  {failure['error']}")
+        if failure_log:
+            try:
+                append_failure_log(
+                    failure_log, label, concurrency, mode, template, failure)
+            except OSError as e:
+                print(f"  failure log 写入失败: {e}")
+    return result
+
+
+def throughput_metrics(result):
+    """Return business-QPS counters for a duration-mode result.
+
+    The requested duration is the offered-load window. The measurement window
+    also includes an in-flight transaction that finishes after the deadline,
+    so a short run cannot report an artificially high QPS from its tail.
+    """
+    starts = result.get("qps_starts", [])
+    completions = result.get("qps_completions", [])
+    attempted = len(starts)
+    accepted = len(completions)
+    discarded = max(0, attempted - accepted)
+    started_at = result.get("qps_started_at")
+    deadline = result.get("qps_deadline")
+    finished_at = result.get("qps_finished_at")
+    if started_at is None or deadline is None:
+        return {
+            "attempted": attempted,
+            "accepted": accepted,
+            "discarded": discarded,
+            "measured_s": 0.0,
+            "business_qps": 0.0,
+            "success_rate": (accepted / attempted if attempted else 0.0),
+            "cleanup_failed": result.get("cleanup_failed", 0),
+        }
+    measurement_end = max(deadline, finished_at or deadline)
+    measured_s = max(measurement_end - started_at, 1e-9)
+    return {
+        "attempted": attempted,
+        "accepted": accepted,
+        "discarded": discarded,
+        "measured_s": measured_s,
+        "business_qps": accepted / measured_s,
+        "success_rate": (accepted / attempted if attempted else 0.0),
+        "cleanup_failed": result.get("cleanup_failed", 0),
+    }
+
+
+def print_throughput_summary(concurrency, B, W):
+    """Print counters and completed create+/health QPS for one concurrency."""
+    b = throughput_metrics(B) if B else None
+    w = throughput_metrics(W) if W else None
+    print(f"\n=== create + /health 业务吞吐（concurrency={concurrency}）===")
+    print(f"  {'指标':<20} {'B':>12} | {'W':>12}")
+    print(f"  {'-' * 20} {'-' * 12} | {'-' * 12}")
+    for name, key, formatter in (
+        ("attempted", "attempted", lambda value: str(value)),
+        ("accepted", "accepted", lambda value: str(value)),
+        ("discarded", "discarded", lambda value: str(value)),
+        ("cleanup_failed", "cleanup_failed", lambda value: str(value)),
+        ("measured_s", "measured_s", lambda value: f"{value:.2f}"),
+        ("business_qps", "business_qps", lambda value: f"{value:.3f}"),
+        ("success_rate", "success_rate", lambda value: f"{value * 100:.1f}%"),
+    ):
+        b_cell = formatter(b[key]) if b else "-"
+        w_cell = formatter(w[key]) if w else "-"
+        print(f"  {name:<20} {b_cell:>12} | {w_cell:>12}")
+
+
+def print_throughput_details(label, result):
+    """Print per-transaction rows for duration mode when --verbose is set."""
+    print(f"\n=== {label} create + /health 成功事务 ===")
+    print("  sandboxID                               e2e(ms) create-api health output")
+    print("  ------------------------------------ -------- ---------- ------ ------")
+    for sample in result.get("samples", []):
+        print(f"  {sample['sid']:<36} {sample['e2e']:>8.1f} "
+              f"{sample['create_api']:>10.1f} {sample['health']:>6.1f} "
+              f"{sample.get('output', '')}")
+
+
+def print_throughput_trend(label, runs):
+    """Compare business QPS and latency across duration-mode concurrency."""
+    available = [(concurrency, result) for concurrency, result in runs if result]
+    if len(available) < 2:
+        return
+    print(f"\n=== {label} 业务 QPS 并发趋势 ===")
+    print("  concurrency attempted accepted discarded business-qps e2e p50")
+    print("  ----------- --------- -------- --------- ------------ -------")
+    for concurrency, result in available:
+        metrics = throughput_metrics(result)
+        p50 = _p50(result.get("e2e", []))
+        p50_cell = f"{p50:.1f}" if p50 is not None else "-"
+        print(f"  {concurrency:>11} {metrics['attempted']:>9} "
+              f"{metrics['accepted']:>8} {metrics['discarded']:>9} "
+              f"{metrics['business_qps']:>12.3f} {p50_cell:>7}")
 
 
 def append_failure_log(path, label, concurrency, mode, template, failure,
@@ -976,6 +1253,9 @@ def main():
                     help="旧模式：每个并发档位的总样本数（与 --rounds 互斥，默认 10）")
     ap.add_argument("-r", "--rounds", type=int, default=None,
                     help="分轮模式：每个并发档位的轮数；每轮启动 concurrency 个样本，轮间等待全部结束")
+    ap.add_argument("-d", "--duration", type=float, default=None,
+                    help="吞吐模式：每个并发档位持续该秒数（如 -d 20）；仅支持 --probe health，"
+                         "统计 create+/health 业务 QPS")
     ap.add_argument("-c", "--concurrency", type=int, nargs="+", default=[1],
                     metavar="N", help="并发档位，可传多个值，例如 -c 1 10 30 50（默认 1）")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -1005,14 +1285,26 @@ def main():
     ap.add_argument("--docker", action="store_true",
                     help="额外重启 ws-docker-debug 并执行 Docker cold/warm 对照")
     args = ap.parse_args()
-    if args.iterations is not None and args.rounds is not None:
-        ap.error("-n/--iterations 与 -r/--rounds 不能同时使用")
-    if args.iterations is None and args.rounds is None:
-        args.iterations = 10
-    if args.iterations is not None and args.iterations < 1:
-        ap.error("-n/--iterations 必须大于 0")
-    if args.rounds is not None and args.rounds < 1:
-        ap.error("-r/--rounds 必须大于 0")
+    if args.duration is not None:
+        if args.iterations is not None or args.rounds is not None:
+            ap.error("--duration 与 -n/--iterations、-r/--rounds 不能同时使用")
+        if args.duration <= 0:
+            ap.error("--duration 必须大于 0")
+        if args.probe != "health":
+            ap.error("--duration 吞吐模式仅支持 --probe health")
+        if args.docker:
+            ap.error("--duration 不能与 --docker 同时使用")
+        if args.round_interval is not None:
+            ap.error("--duration 不能与 --round-interval 同时使用")
+    else:
+        if args.iterations is not None and args.rounds is not None:
+            ap.error("-n/--iterations 与 -r/--rounds 不能同时使用")
+        if args.iterations is None and args.rounds is None:
+            args.iterations = 10
+        if args.iterations is not None and args.iterations < 1:
+            ap.error("-n/--iterations 必须大于 0")
+        if args.rounds is not None and args.rounds < 1:
+            ap.error("-r/--rounds 必须大于 0")
     if any(value < 1 for value in args.concurrency):
         ap.error("-c/--concurrency 的值必须大于 0")
     if not args.b and not args.w:
@@ -1022,7 +1314,10 @@ def main():
     if args.command is None:
         args.command = DEFAULT_RUN_CODE if args.probe == "code" else DEFAULT_RUN_COMMAND
 
-    if args.rounds is not None:
+    if args.duration is not None:
+        count_header = (f"duration={args.duration:g}s/档（持续发起 create+/health，"
+                        "到时不再启动新事务）")
+    elif args.rounds is not None:
         count_header = (f"rounds={args.rounds}/档（每轮 concurrency 个样本，"
                         "轮间等待完成）")
     else:
@@ -1054,7 +1349,9 @@ def main():
 
     runs = []
     for concurrency in args.concurrency:
-        if args.rounds is not None:
+        if args.duration is not None:
+            run_header = f"duration={args.duration:g}s，create+/health 吞吐"
+        elif args.rounds is not None:
             run_header = f"rounds={args.rounds}，attempted={args.rounds * concurrency}"
         else:
             run_header = f"n={args.iterations}"
@@ -1062,37 +1359,67 @@ def main():
         B = W = None
         if args.b:
             print("\n=== B（无工作集，drop-caches=true）===")
-            B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
-                           args.run_user, args.run_cwd, args.run_timeout, concurrency,
-                           args.failure_log, rounds=args.rounds,
-                           allocatable_memory=args.allocatable_memory,
-                           round_interval=args.round_interval)
+            if args.duration is not None:
+                B = run_throughput(
+                    args.b, args.duration, "B", args.probe, args.command,
+                    args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                    args.failure_log, args.allocatable_memory)
+            else:
+                B = run_rounds(args.b, args.iterations, "B", args.probe, args.command,
+                               args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                               args.failure_log, rounds=args.rounds,
+                               allocatable_memory=args.allocatable_memory,
+                               round_interval=args.round_interval)
         if args.w:
             print("\n=== W（工作集，drop-caches=false）===")
-            W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
-                           args.run_user, args.run_cwd, args.run_timeout, concurrency,
-                           args.failure_log, rounds=args.rounds,
-                           allocatable_memory=args.allocatable_memory,
-                           round_interval=args.round_interval)
+            if args.duration is not None:
+                W = run_throughput(
+                    args.w, args.duration, "W", args.probe, args.command,
+                    args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                    args.failure_log, args.allocatable_memory)
+            else:
+                W = run_rounds(args.w, args.iterations, "W", args.probe, args.command,
+                               args.run_user, args.run_cwd, args.run_timeout, concurrency,
+                               args.failure_log, rounds=args.rounds,
+                               allocatable_memory=args.allocatable_memory,
+                               round_interval=args.round_interval)
 
         runs.append((concurrency, B, W))
 
-        print_stat_table(f"汇总（concurrency={concurrency}）", [
-            (f"{args.probe}1 e2e", B.get("e2e", []) if B else [], W.get("e2e", []) if W else []),
-            ("create-api", B.get("create_api", []) if B else [], W.get("create_api", []) if W else []),
-            ("create(launchMs)", B.get("create", []) if B else [], W.get("create", []) if W else []),
-            (f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""),
-             B.get("cold", []) if B else [], W.get("cold", []) if W else []),
-            (f"{args.probe}2 (warm)", B.get("warm", []) if B else [], W.get("warm", []) if W else []),
-        ])
-        print_phase_summary(B, W)
-        if B:
-            print_sample_details("B", concurrency, B, verbose=args.verbose)
-        if W:
-            print_sample_details("W", concurrency, W, verbose=args.verbose)
+        if args.duration is not None:
+            print_throughput_summary(concurrency, B, W)
+            print_stat_table(f"create + /health 延迟（concurrency={concurrency}）", [
+                ("transaction e2e", B.get("e2e", []) if B else [],
+                 W.get("e2e", []) if W else []),
+                ("create-api", B.get("create_api", []) if B else [],
+                 W.get("create_api", []) if W else []),
+            ])
+            if args.verbose:
+                if B:
+                    print_throughput_details("B", B)
+                if W:
+                    print_throughput_details("W", W)
+        else:
+            print_stat_table(f"汇总（concurrency={concurrency}）", [
+                (f"{args.probe}1 e2e", B.get("e2e", []) if B else [], W.get("e2e", []) if W else []),
+                ("create-api", B.get("create_api", []) if B else [], W.get("create_api", []) if W else []),
+                ("create(launchMs)", B.get("create", []) if B else [], W.get("create", []) if W else []),
+                (f"{args.probe}1 (cold)" + (" ★" if (B and W) else ""),
+                 B.get("cold", []) if B else [], W.get("cold", []) if W else []),
+                (f"{args.probe}2 (warm)", B.get("warm", []) if B else [], W.get("warm", []) if W else []),
+            ])
+            print_phase_summary(B, W)
+            if B:
+                print_sample_details("B", concurrency, B, verbose=args.verbose)
+            if W:
+                print_sample_details("W", concurrency, W, verbose=args.verbose)
 
-    print_concurrency_trend("B", [(concurrency, B) for concurrency, B, _W in runs])
-    print_concurrency_trend("W", [(concurrency, W) for concurrency, _B, W in runs])
+    if args.duration is not None:
+        print_throughput_trend("B", [(concurrency, B) for concurrency, B, _W in runs])
+        print_throughput_trend("W", [(concurrency, W) for concurrency, _B, W in runs])
+    else:
+        print_concurrency_trend("B", [(concurrency, B) for concurrency, B, _W in runs])
+        print_concurrency_trend("W", [(concurrency, W) for concurrency, _B, W in runs])
     if args.docker:
         print("\n=== Docker 对照 ===")
         run_docker_probe(args.probe)

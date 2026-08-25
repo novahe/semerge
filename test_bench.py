@@ -190,6 +190,68 @@ class BenchConcurrencyTest(unittest.TestCase):
         self.assertEqual(result["phases"], {})
         self.assertEqual(failure["sid"], "sid-failed")
 
+    def test_transaction_only_completes_on_first_health_without_warm_probe(self):
+        response = SimpleNamespace(status_code=204)
+        with mock.patch.object(bench, "create", return_value=("sid-qps", "token")), \
+                mock.patch.object(bench, "probe", return_value=(True, 4.0, "ok")) as probe, \
+                mock.patch.object(bench, "wait_launch_ms") as launch_timing, \
+                mock.patch.object(bench.e2b_env, "api_request", return_value=response):
+            result, failure = bench.run_round(
+                "template", "health", transaction_only=True)
+
+        self.assertIsNone(failure)
+        self.assertEqual(result["discarded"], 0)
+        self.assertEqual(len(result["qps_starts"]), 1)
+        self.assertEqual(len(result["qps_completions"]), 1)
+        self.assertEqual(len(result["samples"]), 1)
+        self.assertEqual(result["warm"], [])
+        probe.assert_called_once()
+        launch_timing.assert_not_called()
+
+    def test_throughput_metrics_use_completion_window(self):
+        result = bench._new_results()
+        result["qps_starts"] = [10.0, 11.0, 13.0]
+        result["qps_completions"] = [12.0, 15.0]
+        result["qps_started_at"] = 10.0
+        result["qps_deadline"] = 20.0
+        result["qps_finished_at"] = 20.0
+        result["cleanup_failed"] = 1
+
+        metrics = bench.throughput_metrics(result)
+
+        self.assertEqual(metrics["attempted"], 3)
+        self.assertEqual(metrics["accepted"], 2)
+        self.assertEqual(metrics["discarded"], 1)
+        self.assertEqual(metrics["measured_s"], 10.0)
+        self.assertEqual(metrics["business_qps"], 0.2)
+        self.assertAlmostEqual(metrics["success_rate"], 2 / 3)
+        self.assertEqual(metrics["cleanup_failed"], 1)
+
+    def test_run_throughput_aggregates_worker_results(self):
+        def fake_worker(*_args):
+            now = time.perf_counter()
+            result = bench._new_results()
+            result["qps_starts"].append(now)
+            result["qps_completions"].append(now)
+            result["qps_ends"].append(now)
+            result["e2e"].append(10.0)
+            result["samples"].append({
+                "sid": "sid-throughput",
+                "e2e": 10.0,
+                "create_api": 1.0,
+                "health": 2.0,
+            })
+            return result, []
+
+        with mock.patch.object(bench, "_run_throughput_worker", side_effect=fake_worker):
+            result = bench.run_throughput(
+                "template", 0.01, "B", "health", concurrency=2)
+
+        metrics = bench.throughput_metrics(result)
+        self.assertEqual(metrics["attempted"], 2)
+        self.assertEqual(metrics["accepted"], 2)
+        self.assertEqual(metrics["discarded"], 0)
+
     def test_run_rounds_respects_worker_limit(self):
         lock = threading.Lock()
         active = 0
