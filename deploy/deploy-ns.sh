@@ -789,12 +789,13 @@ sandbox:
     kernel: $BINS/vmlinux
     runtime: $RUNTIME
     overlay_diff_template: $OVERLAY_DIFF_TEMPLATE
-builder: { max_concurrent: 2, diff_template: $BUILDER_DIFF_TEMPLATE, insecure_registry: true, pull_timeout_sec: 600, total_timeout_sec: 1800 }
+builder: { diff_template: $BUILDER_DIFF_TEMPLATE, insecure_registry: true, pull_timeout_sec: 600, total_timeout_sec: 1800 }
 resource_listen:
   enabled: true
   socket: $RES_SOCKET
   audit_path: $RUNROOT/audit.log
-  cgroup_unit_prefix: sandbox-runner-${NS}@
+  # cgroup_unit_prefix 已被 release-v0.1.0-preview.20260825 起的 node-ctl 移除
+  # （改为内置 cgroup_scan_paths 推导，见 docs/node-resource.md），旧二进制下缺省也合法
   resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 2GiB, cpu: 1.5 } }
   watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
   rate_limits: { memory_grant_per_sec_factor: 0.05 }
@@ -929,9 +930,8 @@ UNIT
 Environment="CLOUD_HYPERVISOR_CPUS_MODEL=$CLOUD_HYPERVISOR_CPUS_MODEL"
 # Select the Cloud Hypervisor binary for runner-launched sandboxes.
 Environment="SANDBOX_CH_PATH=$SANDBOX_CH_PATH"
-# Keep sandbox-ctl/Cloud Hypervisor runtime logs under this NS work directory.
-StandardOutput=append:$LOGDIR/runner.log
-StandardError=append:$LOGDIR/runner.log
+# 不设 StandardOutput/StandardError：runner 日志走 journald，
+# 用 journalctl -u 'sandbox-runner-nova@sr-<runid>' 或 -u 'sandbox-runner-nova@*' | grep <sid> 检索。
 UNIT
   cat > "$BUILDER_DROPIN_DIR/10-cloud-hypervisor.conf" <<UNIT
 [Service]

@@ -155,6 +155,32 @@ class BenchConcurrencyTest(unittest.TestCase):
             for directory in paths.values():
                 self.assertTrue(os.path.isdir(os.path.join(directory, sid)))
 
+    def test_create_injects_restore_prefetch_without_dropping_resource(self):
+        response = SimpleNamespace(
+            status_code=201,
+            json=lambda: {
+                "sandboxID": "sid-prefetch",
+                "forwardAccessToken": "token-prefetch",
+            },
+        )
+        with mock.patch.object(bench.e2b_env, "api_request", return_value=response) as request:
+            sid, token = bench.create(
+                "template",
+                allocatable_memory="8GiB",
+                restore_prefetch="memory",
+            )
+
+        self.assertEqual((sid, token), ("sid-prefetch", "token-prefetch"))
+        body = request.call_args.kwargs["json"]
+        self.assertEqual(
+            json.loads(body["metadata"]["kuasar-sandbox.resource"]),
+            {"allocatable": {"memory": "8GiB"}},
+        )
+        self.assertEqual(
+            json.loads(body["metadata"]["kuasar-sandbox.restore"]),
+            {"prefetch": "memory"},
+        )
+
     def test_wait_launch_does_not_accept_launch_ms_while_starting(self):
         responses = [
             SimpleNamespace(status_code=200, json=lambda: {"state": "starting", "launchMs": 286.0}),
@@ -172,6 +198,31 @@ class BenchConcurrencyTest(unittest.TestCase):
         )
         with mock.patch.object(bench.e2b_env, "api_request", return_value=response):
             self.assertEqual(bench.wait_launch_ms("sid-ok", timeout=1), (123.5, {"x": 1}))
+
+    def test_wait_launch_accepts_running_without_timing_patch(self):
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"state": "running"},
+        )
+        with mock.patch.object(bench.e2b_env, "api_request", return_value=response):
+            self.assertEqual(bench.wait_launch_ms("sid-no-launch-ms"), (None, None))
+
+    def test_run_round_accepts_running_without_launch_ms(self):
+        response = SimpleNamespace(status_code=204)
+        with mock.patch.object(bench, "create", return_value=("sid-no-patch", "token")), \
+                mock.patch.object(bench, "probe", side_effect=[
+                    (True, 12.0, "cold"), (True, 5.0, "warm")
+                ]), \
+                mock.patch.object(bench, "wait_launch_ms", return_value=(None, None)), \
+                mock.patch.object(bench.e2b_env, "api_request", return_value=response):
+            result, failure = bench.run_round("template", "health")
+
+        self.assertIsNone(failure)
+        self.assertEqual(result["discarded"], 0)
+        self.assertEqual(len(result["e2e"]), 1)
+        self.assertEqual(result["create"], [])
+        self.assertEqual(result["cold"], [])
+        self.assertEqual(result["warm"], [5.0])
 
     def test_failed_warm_probe_discards_entire_sample(self):
         timing = {"phasesMs": {"runner_wait": 8.0}, "points": {}}
@@ -324,7 +375,8 @@ class BenchConcurrencyTest(unittest.TestCase):
             worker = threading.Thread(
                 target=bench.run_rounds,
                 args=("template", None, "B", "health"),
-                kwargs={"concurrency": concurrency, "rounds": 2},
+                kwargs={"concurrency": concurrency, "rounds": 2,
+                        "round_interval": 0},
             )
             worker.start()
             deadline = time.time() + 1

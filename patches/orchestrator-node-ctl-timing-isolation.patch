@@ -1,20 +1,8 @@
-diff --git a/cmd/node-ctl/resource_daemon.go b/cmd/node-ctl/resource_daemon.go
-index 77097c7..9de3999 100755
---- a/cmd/node-ctl/resource_daemon.go
-+++ b/cmd/node-ctl/resource_daemon.go
-@@ -92,6 +92,7 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
- 		Allocator: allocator,
- 		Inventory: &nodectl.Inventory{
- 			ControllerSocket: resolved.SocketIdentity, CgroupScanPaths: resolved.CgroupScanPaths,
-+			CgroupUnitPrefix: resolved.CgroupUnitPrefix,
- 			ManagedRunRoot: managedRunRoot, Pool: state.AllocatablePool,
- 			Logf: func(f string, a ...any) { log.Printf("[node-ctl resource inventory] "+f, a...) },
- 		},
 diff --git a/internal/api/api.go b/internal/api/api.go
-index bc725bf..79766c1 100644
+index 2f37fc9e65a9e2c5c661b49ebc41bd5ca2a0a401..57c2e9591c3a34a0d80b04b1ff1a19fdd72e885f 100644
 --- a/internal/api/api.go
 +++ b/internal/api/api.go
-@@ -1121,6 +1121,12 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
+@@ -1202,6 +1202,12 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
  	d["startedAt"] = isoUnix(sb.CreatedUnix)
  	d["endAt"] = isoUnix(sandboxEndUnix(sb))
  	d["metadata"] = sb.Metadata
@@ -27,41 +15,8 @@ index bc725bf..79766c1 100644
  	return d
  }
  
-diff --git a/internal/config/config.go b/internal/config/config.go
-index 66b5656..65b05a7 100644
---- a/internal/config/config.go
-+++ b/internal/config/config.go
-@@ -87,17 +87,18 @@ type Config struct {
- // sandboxes use static cgroup. The controller's tuning is inlined here — there is
- // no second config file; nodectl.Resolve consumes this struct directly.
- type ResourceListenConfig struct {
--	Enabled         bool                     `yaml:"enabled"`
--	Socket          string                   `yaml:"socket"`            // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
--	StatePath       string                   `yaml:"state_path"`        // deprecated and ignored; retained only so older YAML still parses
--	AuditPath       string                   `yaml:"audit_path"`        // audit log (tmpfs); default /run/node-ctl/audit.log
--	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // restart recovery roots for populated sandbox cgroups
--	Resources       ResourceHostConfig       `yaml:"resources"`         // node physical capacity + host reservation
--	Watermarks      ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
--	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
--	Admission       ResourceAdmissionConfig  `yaml:"admission"`         // admit token bucket + queue
-+	Enabled          bool                     `yaml:"enabled"`
-+	Socket           string                   `yaml:"socket"`            // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
-+	StatePath        string                   `yaml:"state_path"`        // deprecated and ignored; retained only so older YAML still parses
-+	AuditPath        string                   `yaml:"audit_path"`        // audit log (tmpfs); default /run/node-ctl/audit.log
-+	CgroupScanPaths  []string                 `yaml:"cgroup_scan_paths"` // restart recovery roots for populated sandbox cgroups
-+	CgroupUnitPrefix string                   `yaml:"cgroup_unit_prefix"` // optional top-level systemd unit prefix within scan roots
-+	Resources        ResourceHostConfig       `yaml:"resources"`         // node physical capacity + host reservation
-+	Watermarks       ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
-+	RateLimits       ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
-+	Admission        ResourceAdmissionConfig  `yaml:"admission"`         // admit token bucket + queue
- 	Dampening       ResourceDampeningConfig  `yaml:"dampening"`         // oscillation damping
--	LogLevel        string                   `yaml:"log_level"`         // info (default)
-+	LogLevel         string                   `yaml:"log_level"`         // info (default)
- }
- 
- // ResourceHostConfig is the node's physical capacity and the host's own reservation.
 diff --git a/internal/configsock/readiness.go b/internal/configsock/readiness.go
-index d9c03a7..71b8c8a 100644
+index d9c03a7118d22646ad1ef6b5cf5f2bda4ad33cbb..71b8c8aa522810f64092fb63141e0ac2747702ec 100644
 --- a/internal/configsock/readiness.go
 +++ b/internal/configsock/readiness.go
 @@ -2,10 +2,12 @@ package configsock
@@ -154,7 +109,7 @@ index d9c03a7..71b8c8a 100644
  	switch {
  	case errors.Is(err, io.EOF):
 diff --git a/internal/configsock/readiness_test.go b/internal/configsock/readiness_test.go
-index 419f7eb..301622f 100644
+index 419f7ebdcb167c9f08b656478137796978cef334..301622ff9aa60ee6a367be3acc0f46e3a8f4735a 100644
 --- a/internal/configsock/readiness_test.go
 +++ b/internal/configsock/readiness_test.go
 @@ -12,6 +12,21 @@ func TestReadinessSocketPath(t *testing.T) {
@@ -179,138 +134,11 @@ index 419f7eb..301622f 100644
  func TestReadReadiness(t *testing.T) {
  	tests := []struct {
  		name    string
-diff --git a/internal/nodectl/config.go b/internal/nodectl/config.go
-index bf1e806..7675c53 100755
---- a/internal/nodectl/config.go
-+++ b/internal/nodectl/config.go
-@@ -22,6 +22,7 @@ type Resolved struct {
- 	Listen          string // absolute bind/dial path; may retain a short parent alias
- 	SocketIdentity  string // canonical owner/lease inventory identity
- 	CgroupScanPaths []string
-+	CgroupUnitPrefix string
- 
- 	PhysicalMemory uint64
- 	PhysicalCPU    uint64 // milli-cpu
-@@ -65,6 +66,7 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
- 		Listen:          listen,
- 		SocketIdentity:  identity,
- 		CgroupScanPaths: c.CgroupScanPaths,
-+		CgroupUnitPrefix: c.CgroupUnitPrefix,
- 		LogLevel:        c.LogLevel,
- 		AuditPath:       c.AuditPath,
- 		CooldownPeriods: c.Dampening.CooldownPeriods,
-diff --git a/internal/nodectl/config_resolve_test.go b/internal/nodectl/config_resolve_test.go
-index 30e7c5f..9430772 100644
---- a/internal/nodectl/config_resolve_test.go
-+++ b/internal/nodectl/config_resolve_test.go
-@@ -12,7 +12,7 @@ import (
- func TestResolveCanonicalizesControllerSocket(t *testing.T) {
- 	dir := t.TempDir()
- 	t.Chdir(dir)
--	cfg := &config.ResourceListenConfig{Socket: "./controller.sock"}
-+	cfg := &config.ResourceListenConfig{Socket: "./controller.sock", CgroupUnitPrefix: "sandbox-runner-nova@"}
- 	cfg.Resources.PhysicalMemory = "32GiB"
- 	cfg.Resources.PhysicalCPU = "8"
- 	cfg.Resources.HostReserved.Memory = "1GiB"
-@@ -24,6 +24,9 @@ func TestResolveCanonicalizesControllerSocket(t *testing.T) {
- 	if want := filepath.Join(dir, "controller.sock"); resolved.Listen != want {
- 		t.Fatalf("resolved controller socket = %q, want %q", resolved.Listen, want)
- 	}
-+	if resolved.CgroupUnitPrefix != "sandbox-runner-nova@" {
-+		t.Fatalf("resolved cgroup unit prefix = %q", resolved.CgroupUnitPrefix)
-+	}
- 	if resolved.SocketIdentity != resolved.Listen {
- 		t.Fatalf("socket identity = %q, want %q", resolved.SocketIdentity, resolved.Listen)
- 	}
-diff --git a/internal/nodectl/inventory.go b/internal/nodectl/inventory.go
-index e18412f..b5b0d61 100644
---- a/internal/nodectl/inventory.go
-+++ b/internal/nodectl/inventory.go
-@@ -20,6 +20,7 @@ import (
- type Inventory struct {
- 	ControllerSocket string
- 	CgroupScanPaths  []string
-+	CgroupUnitPrefix string
- 	ManagedRunRoot   string
- 	Pool             Resources
- 	Logf             func(string, ...any)
-@@ -308,6 +309,14 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
- 			if !entry.IsDir() {
- 				return nil
- 			}
-+			if i.CgroupUnitPrefix != "" {
-+				if path == root {
-+					return nil
-+				}
-+				if !cgroupPathHasUnitPrefix(root, path, i.CgroupUnitPrefix) {
-+					return filepath.SkipDir
-+				}
-+			}
- 			populated, err := readCgroupPopulated(path)
- 			if err != nil {
- 				if os.IsNotExist(err) {
-@@ -358,6 +367,23 @@ func (i *Inventory) scanCgroups(state *State, controlPIDs map[int]bool) error {
- 	return nil
- }
- 
-+// cgroupPathHasUnitPrefix limits orphan recovery to the top-level systemd
-+// service directories owned by this node-ctl instance. Runner units from
-+// multiple deployments intentionally share sandbox-runner.slice because the
-+// runner cgroup contract requires that parent slice; the deployment-specific
-+// unit prefix is therefore the isolation boundary for inventory scanning.
-+func cgroupPathHasUnitPrefix(root, path, prefix string) bool {
-+	rel, err := filepath.Rel(root, path)
-+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-+		return false
-+	}
-+	first := rel
-+	if idx := strings.IndexRune(first, filepath.Separator); idx >= 0 {
-+		first = first[:idx]
-+	}
-+	return strings.HasPrefix(first, prefix)
-+}
-+
- func (i *Inventory) LookupLiveLease(sid string) (LiveLease, error) {
- 	path := i.LeasePath(sid)
- 	lease, owner, locked, err := resource.InspectLease(path)
-diff --git a/internal/nodectl/inventory_test.go b/internal/nodectl/inventory_test.go
-index 369f091..a731b9a 100644
---- a/internal/nodectl/inventory_test.go
-+++ b/internal/nodectl/inventory_test.go
-@@ -459,6 +459,28 @@ func TestInventoryOrphanCgroupSafeUpperBound(t *testing.T) {
- 	}
- }
- 
-+func TestInventoryCgroupUnitPrefixFiltersOtherDeployments(t *testing.T) {
-+	root := filepath.Join(t.TempDir(), "cgroups")
-+	writeFakeCgroupRoot(t, root)
-+	writeFakeCgroup(t, filepath.Join(root, "sandbox-runner-nova@sr-nova.service"), strconv.FormatUint(300<<20, 10), 101)
-+	writeFakeCgroup(t, filepath.Join(root, "sandbox-runner-other@sr-other.service"), strconv.FormatUint(300<<20, 10), 102)
-+
-+	state := NewState(2<<30, 2000, 0, 0, Watermarks{StartupFactor: .5})
-+	inventory := &Inventory{
-+		ControllerSocket: filepath.Join(t.TempDir(), "controller.sock"),
-+		CgroupScanPaths:  []string{root},
-+		CgroupUnitPrefix: "sandbox-runner-nova@",
-+		Pool:             state.AllocatablePool,
-+	}
-+	if err := inventory.Recover(state); err != nil {
-+		t.Fatal(err)
-+	}
-+	snapshot := state.ResourceSnapshot()
-+	if snapshot.ReservationCount != 1 || snapshot.Allocated.MemoryBytes != 300<<20 {
-+		t.Fatalf("filtered orphan snapshot = %+v", snapshot)
-+	}
-+}
-+
- func TestInventoryOldManagedBeforeCgroupUsesFullPoolUpperBound(t *testing.T) {
- 	dir := t.TempDir()
- 	socket, root, runRoot, sid := filepath.Join(dir, "controller.sock"), filepath.Join(dir, "cgroups"), filepath.Join(dir, "run"), "legacy-starting"
 diff --git a/internal/orch/orch.go b/internal/orch/orch.go
-index e7d2b8d..7288434 100644
+index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c48a61e90 100644
 --- a/internal/orch/orch.go
 +++ b/internal/orch/orch.go
-@@ -58,6 +58,9 @@ type Orchestrator struct {
+@@ -65,6 +65,9 @@ type Orchestrator struct {
  	mu  sync.Mutex
  	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
  
@@ -319,8 +147,8 @@ index e7d2b8d..7288434 100644
 +
  	launches    launchGroup            // sole process-local owner of create and resume attempts
  	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
- 	exports     exportAttemptGroup     // publish/finalize owners that Resume may preempt or detach
-@@ -464,8 +467,77 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
+ 	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
+@@ -517,8 +520,87 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
  		"duration", duration)
  }
  
@@ -356,33 +184,43 @@ index e7d2b8d..7288434 100644
 +	for name, at := range t.points {
 +		out.Points[name] = at.UTC().Format(time.RFC3339Nano)
 +	}
-+	add := func(name, from, to string) {
++	add := func(name, from, to string, accounted bool) {
 +		a, aok := t.points[from]
 +		b, bok := t.points[to]
 +		if !aok || !bok || b.Before(a) {
 +			return
 +		}
 +		out.PhasesMs[name] = float64(b.Sub(a).Microseconds()) / 1000.0
-+		out.AccountedMs += out.PhasesMs[name]
++		if accounted {
++			out.AccountedMs += out.PhasesMs[name]
++		}
 +	}
-+	add("admission_to_node_prepare", "accepted", "node_prepare_done")
-+	add("runner_wait", "runner_assign_start", "runner_commit_start")
-+	add("runner_commit", "runner_commit_start", "runner_commit_done")
-+	add("runner_handoff", "runner_commit_done", "runner_handoff_done")
-+	add("sandbox_ctl_dispatch", "runner_handoff_done", "sandbox_ctl_start")
-+	add("sandbox_ctl_pre_ch", "sandbox_ctl_start", "ch_start")
++	add("admission_to_node_prepare", "accepted", "node_prepare_done", true)
++	add("runner_wait", "runner_assign_start", "runner_commit_start", true)
++	add("runner_commit", "runner_commit_start", "runner_commit_done", true)
++	add("runner_handoff", "runner_commit_done", "runner_handoff_done", true)
++	add("sandbox_ctl_dispatch", "runner_handoff_done", "sandbox_ctl_start", true)
++	add("sandbox_ctl_pre_ch", "sandbox_ctl_start", "ch_start", true)
 +	if _, ok := t.points["ch_resume_done"]; ok {
-+		add("ch_start_to_resume", "ch_start", "ch_resume_done")
-+		add("resume_to_sandbox_init_ack", "ch_resume_done", "sandbox_init_ack")
-+		add("sandbox_init_ack_to_runtime_ready", "sandbox_init_ack", "runtime_ready_received")
++		add("ch_start_to_resume", "ch_start", "ch_resume_done", true)
++		add("resume_to_sandbox_init_ack", "ch_resume_done", "sandbox_init_ack", true)
++		add("sandbox_init_ack_to_runtime_ready", "sandbox_init_ack", "runtime_ready_received", true)
 +	} else {
-+		add("ch_start_to_runtime_ready", "ch_start", "runtime_ready_received")
++		add("ch_start_to_runtime_ready", "ch_start", "runtime_ready_received", true)
 +	}
 +	if _, ok := t.points["envd_init_done"]; ok {
-+		add("runtime_ready_to_envd_init_done", "runtime_ready_received", "envd_init_done")
-+		add("envd_init_to_launch_done", "envd_init_done", "launch_done")
++		// Keep the historical gate phase as the accounted envd interval. The
++		// attempt phases below are nested diagnostics and are not accounted a
++		// second time.
++		add("runtime_ready_to_envd_init_done", "runtime_ready_received", "envd_init_done", true)
++		add("envd_init_to_launch_done", "envd_init_done", "launch_done", true)
++		if _, ok := t.points["envd_init_attempt1_done"]; ok {
++			// 首试（拨号+握手+guest 处理）与重试尾巴分开；无重试时尾巴≈0
++			add("envd_attempt1", "runtime_ready_received", "envd_init_attempt1_done", false)
++			add("envd_retry_tail", "envd_init_attempt1_done", "envd_init_done", false)
++		}
 +	} else {
-+		add("runtime_ready_to_launch_done", "runtime_ready_received", "launch_done")
++		add("runtime_ready_to_launch_done", "runtime_ready_received", "launch_done", true)
 +	}
 +	out.UnaccountedMs = launchMs - out.AccountedMs
 +	return out
@@ -399,7 +237,7 @@ index e7d2b8d..7288434 100644
  	result := "success"
  	failureStage := ""
  	if err != nil {
-@@ -475,10 +547,13 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+@@ -528,10 +610,13 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  			err = errors.Join(err, rollbackErr)
  		}
  	}
@@ -417,7 +255,7 @@ index e7d2b8d..7288434 100644
  	o.log.Info("sandbox launch terminal",
  		"sid", sb.ID,
  		"run_id", attempt.RunID(),
-@@ -486,7 +561,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+@@ -539,7 +624,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  		"profile", sb.Profile,
  		"result", result,
  		"failure_stage", failureStage,
@@ -428,7 +266,7 @@ index e7d2b8d..7288434 100644
  		"err", err)
  	return err
  }
-@@ -494,7 +571,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+@@ -547,7 +634,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  // launchSandbox prepares all runner handoff inputs, then spends separate runner
  // assignment and runtime readiness budgets. The durable starting row already
  // exists and is never replaced by a stale whole-row Put.
@@ -437,7 +275,16 @@ index e7d2b8d..7288434 100644
  	if sb == nil || attempt == nil || sb.State != types.StateStarting || sb.ID != attempt.SID() {
  		return launchFailed("prepare", fmt.Errorf("orch: launch requires its claimed starting sandbox"))
  	}
-@@ -578,14 +655,17 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -555,7 +642,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+ 		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
+ 	}
+ 	if preparation.RestoreRef != "" {
+-		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation)
++		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation, timeline)
+ 	}
+ 	prepareStarted := time.Now()
+ 	prepareLogged := false
+@@ -634,14 +721,17 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  	}
  	o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
  	prepareLogged = true
@@ -455,7 +302,7 @@ index e7d2b8d..7288434 100644
  		// Serialize the runner-binding linearization point with Kill/Delete and
  		// other lifecycle mutations. If deletion wins, the exact CAS below misses
  		// and the pool never hands the task to this runner; if binding wins, the
-@@ -615,6 +695,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -671,6 +761,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  		// worker can mint tokens during mandatory envd initialization.
  		o.publishUpsert(bound)
  		commitFinished = time.Now()
@@ -463,7 +310,7 @@ index e7d2b8d..7288434 100644
  		return nil
  	})
  	cancelAssignment()
-@@ -640,6 +721,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -696,6 +787,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  		commitFinished = assignStarted
  	}
  	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
@@ -471,7 +318,7 @@ index e7d2b8d..7288434 100644
  	launchTimeout := o.sandboxReadyTimeout
  	if launchTimeout <= 0 {
  		launchTimeout = 60 * time.Second
-@@ -650,7 +732,23 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -706,18 +798,35 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  	launchCtx, cancelLaunch := context.WithTimeout(ctx, launchTimeout)
  	defer cancelLaunch()
  	runtimeStarted := time.Now()
@@ -496,7 +343,12 @@ index e7d2b8d..7288434 100644
  	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
  	if err != nil {
  		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
-@@ -662,6 +760,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+ 	}
+ 	if tmpl.Profile == types.ProfileE2B {
+ 		envdStarted := time.Now()
+-		err = o.envdInit(launchCtx, sb)
++		err = o.envdInit(launchCtx, sb, timeline)
+ 		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
  		if err != nil {
  			return launchFailed("envd", err)
  		}
@@ -504,7 +356,7 @@ index e7d2b8d..7288434 100644
  	}
  	unlock = o.lifecycle.Lock(sb.ID)
  	defer unlock()
-@@ -914,6 +1013,13 @@ func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandb
+@@ -970,6 +1079,13 @@ func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandb
  	if !ownsSandbox(sb, apiKey) {
  		return nil, api.ErrNotFound
  	}
@@ -518,31 +370,41 @@ index e7d2b8d..7288434 100644
  	return sb, nil
  }
  
-@@ -1570,15 +1676,18 @@ func (o *Orchestrator) inspectSnapshotConfig(ctx context.Context, manifestKey, r
- 	if err := o.addRefLocation(locations, ref); err != nil {
- 		return cfg, err
- 	}
--	args := []string{"info", "--json"}
--	if strings.HasPrefix(ref, "manifest://") {
--		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
--	}
-+	// file:// refs with HMAC digests need the manifest config's crypto policy
-+	// (crypto.local=auto) or sandbox-ctl rejects the ref before opening it.
-+	args := []string{"info", "--json", "--manifest-config", o.cfg.ManifestConfig}
- 	args = appendRefLocationArgs(args, locations)
- 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), append(args, ref)...)
- 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+manifestKey)
- 	out, err := cmd.Output()
- 	if err != nil {
-+		var ee *exec.ExitError
-+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-+			return cfg, fmt.Errorf("snapshot config probe %q: %w: %s", ref, err, bytes.TrimSpace(ee.Stderr))
+@@ -2309,7 +2425,7 @@ func envdInitRetryDelay(failures int) time.Duration {
+ // and the proxy already enforces X-Access-Token as the sole gate. With MMDS enabled
+ // (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
+ // to it — giving forks fresh per-identity tokens with envd-side enforcement too.
+-func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
++func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox, timeline *launchTimeline) error {
+ 	cl := udsClient(sb.EnvdUDS)
+ 	defer cl.CloseIdleConnections()
+ 
+@@ -2332,7 +2448,23 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
+ 			return fmt.Errorf("orch: create envd /init for %s: %w", sb.ID, err)
+ 		}
+ 		req.Header.Set("Content-Type", "application/json")
++		attemptStart := time.Now()
+ 		resp, err := cl.Do(req)
++		if failures == 0 {
++			// 首试含 UDS 拨号 + vsock 首连握手 + guest envd 处理，是相位主体；
++			// 单独落点用于把 runtime_ready→envd_init_done 拆成首试与重试尾巴。
++			timeline.point("envd_init_attempt1_done", time.Now())
++			if o.log != nil {
++				o.log.Info("envd init attempt1",
++					"sid", sb.ID, "dur_ms", float64(time.Since(attemptStart).Microseconds())/1000.0, "err", err)
++			}
++		} else {
++			if o.log != nil {
++				o.log.Info("envd init retry",
++					"sid", sb.ID, "attempt", failures+1,
++					"dur_ms", float64(time.Since(attemptStart).Microseconds())/1000.0, "err", err)
++			}
 +		}
- 		return cfg, fmt.Errorf("snapshot config probe %q: %w", ref, err)
- 	}
- 	if err := json.Unmarshal(out, &cfg); err != nil {
+ 		if err == nil {
+ 			resp.Body.Close()
+ 			if resp.StatusCode == http.StatusNoContent {
 diff --git a/internal/orch/readiness.go b/internal/orch/readiness.go
-index a21cd71..025bdec 100644
+index a21cd7161ffd63ee2fa4f12f7d05fecdac9efcf5..025bdec32bcadd6cb48c6b11aefbe9d20be15ee9 100644
 --- a/internal/orch/readiness.go
 +++ b/internal/orch/readiness.go
 @@ -50,14 +50,19 @@ func (l *runtimeReadinessListener) Close() {
@@ -586,7 +448,7 @@ index a21cd71..025bdec 100644
 +	return timing, nil
  }
 diff --git a/internal/orch/readiness_test.go b/internal/orch/readiness_test.go
-index 2f8a9de..6c2a1ab 100644
+index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77f4d6375a 100644
 --- a/internal/orch/readiness_test.go
 +++ b/internal/orch/readiness_test.go
 @@ -30,6 +30,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
@@ -597,12 +459,138 @@ index 2f8a9de..6c2a1ab 100644
  		{name: "EOF before control", wire: "", wantErr: true},
  		{name: "EOF before ready", wire: "control_ready\n", wantErr: true},
  		{name: "unknown", wire: "unknown\nready\n", wantErr: true},
+@@ -346,7 +347,7 @@ func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+ 			defer cancel()
+-			if err := o.envdInit(ctx, sb); err != nil {
++			if err := o.envdInit(ctx, sb, nil); err != nil {
+ 				t.Fatal(err)
+ 			}
+ 			got := <-observed
+@@ -406,7 +407,7 @@ func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+ 	defer cancel()
+-	if err := o.envdInit(ctx, sb); err != nil {
++	if err := o.envdInit(ctx, sb, nil); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	select {
+@@ -432,7 +433,7 @@ func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+ 	defer cancel()
+-	err := o.envdInit(ctx, sb)
++	err := o.envdInit(ctx, sb, nil)
+ 	if err == nil || !strings.Contains(err.Error(), "status 503") || strings.Contains(err.Error(), "temporary init failure") {
+ 		t.Fatalf("envd /init error = %v", err)
+ 	}
+diff --git a/internal/orch/sandbox_task_prepare.go b/internal/orch/sandbox_task_prepare.go
+index aa92900c643eb008774ad72bd6561ccf1b70ed44..1483d69324a9af2dede57d7d0bea2d94fe24862c 100644
+--- a/internal/orch/sandbox_task_prepare.go
++++ b/internal/orch/sandbox_task_prepare.go
+@@ -31,7 +31,7 @@ type prepareWaitResult struct {
+ // launchRestoreSandbox owns the host half of the exact-run two-stage protocol.
+ // The conductor consumes only the task's non-secret summary; it never opens or
+ // parses a snapshot artifact.
+-func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
++func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation, timeline *launchTimeline) (retErr error) {
+ 	prepareStarted := time.Now()
+ 	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
+ 		if err := os.MkdirAll(dir, 0o700); err != nil {
+@@ -41,6 +41,9 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
+ 		return launchFailed("snapshot_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
+ 	}
++	// restore 路径 host 侧入口准备极短，先落 node_prepare_done 锚点；
++	// 两段式 snapshot prepare 归入后续 dispatch/pre_ch 相位。
++	timeline.point("node_prepare_done", time.Now())
+ 
+ 	// The listener exists before assignment becomes visible. node-ctl connects
+ 	// immediately after WaitAssignment, making a task exit during root reading an
+@@ -52,10 +55,12 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 	defer readyListener.Close()
+ 
+ 	assignStarted := time.Now()
++	timeline.point("runner_assign_start", assignStarted)
+ 	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
+ 	var commitStarted, commitFinished time.Time
+ 	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+ 		commitStarted = time.Now()
++		timeline.point("runner_commit_start", commitStarted)
+ 		unlock := o.lifecycle.Lock(sb.ID)
+ 		defer unlock()
+ 		changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
+@@ -79,6 +84,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 		}
+ 		o.publishUpsert(bound)
+ 		commitFinished = time.Now()
++		timeline.point("runner_commit_done", commitFinished)
+ 		return nil
+ 	})
+ 	cancelAssignment()
+@@ -101,6 +107,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 		attempt.SetRunID(runID)
+ 	}
+ 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
++	timeline.point("runner_handoff_done", time.Now())
+ 
+ 	deadline := attempt.Deadline()
+ 	if deadline.IsZero() {
+@@ -116,8 +123,10 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 	}()
+ 
+ 	readinessResult := make(chan error, 1)
++	var runtimeTiming *configsock.ReadinessTiming // 与 readinessResult 的通道收发构成 happens-before，读侧安全
+ 	go func() {
+-		readyErr := waitRuntimeReadiness(launchCtx, readyListener)
++		t, readyErr := waitRuntimeReadinessTiming(launchCtx, readyListener)
++		runtimeTiming = t
+ 		readinessResult <- readyErr
+ 		if readyErr != nil {
+ 			cancelLaunch()
+@@ -224,17 +233,33 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 	case <-launchCtx.Done():
+ 		err = launchCtx.Err()
+ 	}
++	timeline.point("runtime_ready_received", time.Now())
++	if runtimeTiming != nil {
++		if runtimeTiming.SandboxCtlStartUnixNs != 0 {
++			timeline.point("sandbox_ctl_start", time.Unix(0, runtimeTiming.SandboxCtlStartUnixNs))
++		}
++		if runtimeTiming.CHStartUnixNs != 0 {
++			timeline.point("ch_start", time.Unix(0, runtimeTiming.CHStartUnixNs))
++		}
++		if runtimeTiming.CHResumeDoneUnixNs != 0 {
++			timeline.point("ch_resume_done", time.Unix(0, runtimeTiming.CHResumeDoneUnixNs))
++		}
++		if runtimeTiming.SandboxInitAckUnixNs != 0 {
++			timeline.point("sandbox_init_ack", time.Unix(0, runtimeTiming.SandboxInitAckUnixNs))
++		}
++	}
+ 	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
+ 	if err != nil {
+ 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
+ 	}
+ 	if tmpl.Profile == types.ProfileE2B {
+ 		envdStarted := time.Now()
+-		err = o.envdInit(launchCtx, sb)
++		err = o.envdInit(launchCtx, sb, timeline)
+ 		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))
+ 		if err != nil {
+ 			return launchFailed("init", err)
+ 		}
++		timeline.point("envd_init_done", time.Now())
+ 	}
+ 
+ 	unlock = o.lifecycle.Lock(sb.ID)
 diff --git a/internal/orch/timing_test.go b/internal/orch/timing_test.go
 new file mode 100644
-index 0000000..ea942e9
+index 0000000000000000000000000000000000000000..351aea587179dfedf5b76159cb6702a29c22da21
 --- /dev/null
 +++ b/internal/orch/timing_test.go
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,54 @@
 +package orch
 +
 +import (
@@ -615,19 +603,20 @@ index 0000000..ea942e9
 +func TestLaunchTimelineExportDoesNotDoubleCountProfileTail(t *testing.T) {
 +	base := time.Unix(0, 0)
 +	points := map[string]time.Time{
-+		"accepted":               base,
-+		"node_prepare_done":      base.Add(100 * time.Millisecond),
-+		"runner_assign_start":    base.Add(100 * time.Millisecond),
-+		"runner_commit_start":    base.Add(150 * time.Millisecond),
-+		"runner_commit_done":     base.Add(200 * time.Millisecond),
-+		"runner_handoff_done":    base.Add(250 * time.Millisecond),
-+		"sandbox_ctl_start":      base.Add(300 * time.Millisecond),
-+		"ch_start":               base.Add(400 * time.Millisecond),
-+		"ch_resume_done":         base.Add(500 * time.Millisecond),
-+		"sandbox_init_ack":       base.Add(600 * time.Millisecond),
-+		"runtime_ready_received": base.Add(700 * time.Millisecond),
-+		"envd_init_done":         base.Add(800 * time.Millisecond),
-+		"launch_done":            base.Add(1000 * time.Millisecond),
++		"accepted":                base,
++		"node_prepare_done":       base.Add(100 * time.Millisecond),
++		"runner_assign_start":     base.Add(100 * time.Millisecond),
++		"runner_commit_start":     base.Add(150 * time.Millisecond),
++		"runner_commit_done":      base.Add(200 * time.Millisecond),
++		"runner_handoff_done":     base.Add(250 * time.Millisecond),
++		"sandbox_ctl_start":       base.Add(300 * time.Millisecond),
++		"ch_start":                base.Add(400 * time.Millisecond),
++		"ch_resume_done":          base.Add(500 * time.Millisecond),
++		"sandbox_init_ack":        base.Add(600 * time.Millisecond),
++		"runtime_ready_received":  base.Add(700 * time.Millisecond),
++		"envd_init_attempt1_done": base.Add(750 * time.Millisecond),
++		"envd_init_done":          base.Add(800 * time.Millisecond),
++		"launch_done":             base.Add(1000 * time.Millisecond),
 +	}
 +	timing := (&launchTimeline{profile: types.ProfileE2B, points: points}).export(1000)
 +	if _, ok := timing.PhasesMs["runtime_ready_to_launch_done"]; ok {
@@ -639,7 +628,12 @@ index 0000000..ea942e9
 +	if timing.UnaccountedMs != 0 {
 +		t.Fatalf("unaccountedMs = %v, want 0", timing.UnaccountedMs)
 +	}
-+
++	if got := timing.PhasesMs["envd_attempt1"]; got != 50 {
++		t.Fatalf("envd_attempt1 = %v, want 50", got)
++	}
++	if got := timing.PhasesMs["envd_retry_tail"]; got != 50 {
++		t.Fatalf("envd_retry_tail = %v, want 50", got)
++	}
 +	delete(points, "ch_resume_done")
 +	delete(points, "sandbox_init_ack")
 +	delete(points, "envd_init_done")
@@ -652,7 +646,7 @@ index 0000000..ea942e9
 +	}
 +}
 diff --git a/internal/types/types.go b/internal/types/types.go
-index 90e7603..24314ef 100644
+index 242ae89e4cb9c4874d88c8415753f499c10c535d..768dde7a5e5b6ef151d551aafff8c8ef9d7112a1 100644
 --- a/internal/types/types.go
 +++ b/internal/types/types.go
 @@ -46,6 +46,18 @@ const (

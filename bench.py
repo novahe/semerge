@@ -18,13 +18,14 @@ run 阶段经 node proxy 按 sandbox id 转发到 gateway（template --bind lan 
   code     e2b code-interpreter SDK Sandbox.run_code()，经 49999/execute → Jupyter；
            W 会预热 Python/Jupyter 执行工作集。
 
-普通模式每轮：create → 立即第一次 probe → 读取 launchMs → 第二次 probe → kill。
+普通模式每轮：create → 立即第一次 probe → 等待 state=running → 第二次 probe → kill。
 吞吐模式（--duration，仅支持 health）：持续执行 create → 首次 /health=200，
 首次 health 返回即完成一个业务事务；warm probe、launch timing 和 kill 不计入事务成功条件。
 - B = `*-snp-template.id`（drop-caches=true，无预热）
 - W = `*-ws-template.id`（drop-caches=false + 预热）
 
-计时：create(launchMs) 保留 conductor 的服务端启动耗时；e2e1 是从发起 create
+计时：create(launchMs) 保留 conductor 的服务端启动耗时；没有 timing patch 时，
+接口只提供 state=running，因此 create/cold/phase 指标不计入汇总；e2e1 是从发起 create
 到 create 返回后立即执行的第一次 probe 完成的客户端端到端耗时，期间不插入
 launchMs 轮询；run1(cold) = e2e1 - create(launchMs)。run2(warm) 仍只统计第二次
   probe 本身。e2b `run`/`code` probe 的 SDK 目标由
@@ -282,24 +283,30 @@ DEFAULT_RUN_CODE = "print('hello kuasar-sandbox {index}')"
 
 
 
-def create(template, tries=4, allocatable_memory=None):
+def create(template, tries=4, allocatable_memory=None, restore_prefetch=None):
     """POST /sandboxes 带重试，返回 (sid, forwardAccessToken)。
     走原始 API 而非 SDK：SDK 不暴露 forwardAccessToken（node proxy 鉴权必需），且能避开
     SDK 把 orchestrator 偶发 500 吞成 KeyError('code')。
 
     ``allocatable_memory`` 为空时保持旧行为；指定时与快照制作脚本一致，
     通过 kuasar-sandbox.resource 覆盖本次 sandbox 的 allocatable.memory。
+    ``restore_prefetch`` 指定时通过 kuasar-sandbox.restore 注入 restore 预取策略。
     """
     last = None
     for _ in range(tries):
         try:
             body = {"templateID": template, "timeout": 120}
+            metadata = {}
             if allocatable_memory:
-                body["metadata"] = {
-                    "kuasar-sandbox.resource": json.dumps({
-                        "allocatable": {"memory": allocatable_memory},
-                    })
-                }
+                metadata["kuasar-sandbox.resource"] = json.dumps({
+                    "allocatable": {"memory": allocatable_memory},
+                })
+            if restore_prefetch:
+                metadata["kuasar-sandbox.restore"] = json.dumps({
+                    "prefetch": restore_prefetch,
+                })
+            if metadata:
+                body["metadata"] = metadata
             r = e2b_env.api_request("POST", "/sandboxes",
                                     json=body)
             if r.status_code == 201:
@@ -322,8 +329,10 @@ def wait_launch_ms(sid, timeout=60):
     写入的【服务端精确】boot 耗时（acceptedAt→terminal，含 restore/runtime-ready/
     envd-init，ms，亚毫秒精度）。失败样本也可能带 launchMs，因此不能只检查
     该字段；否则真正的 readiness EOF 会被下一次数据面 probe 伪装成 HTTP 404。
-    轮询只为同步检测（值与日志 starting_total_duration 完全一致），不引入客户端计时偏差。
-    成功返回 (float ms, launchTiming)；失败/删除直接抛出 LaunchFailure。"""
+    轮询只为同步检测（值与日志 starting_total_duration 完全一致）。没有 timing patch
+    时服务端不会公开 launchMs/launchTiming；此时 state=running 仍是成功信号，返回
+    (None, None)，由调用方跳过依赖服务端计时的指标。成功返回 (float ms, launchTiming)
+    或 (None, None)；失败/删除直接抛出 LaunchFailure。"""
     end = time.time() + timeout
     while time.time() < end:
         r = e2b_env.api_request("GET", f"/sandboxes/{sid}")
@@ -348,12 +357,14 @@ def wait_launch_ms(sid, timeout=60):
             # row. Accept it only once the authoritative state is running.
             if ms is not None and body.get("state") == "running":
                 return float(ms), body.get("launchTiming")
+            if ms is None and body.get("state") == "running":
+                return None, None
         except LaunchFailure:
             raise
         except (ValueError, TypeError, KeyError):
             pass
         time.sleep(0.01)
-    raise LaunchFailure(f"launch failure/timeout: sandbox {sid} did not reach state=running with launchMs")
+    raise LaunchFailure(f"launch failure/timeout: sandbox {sid} did not reach state=running")
 
 
 TIMING_PHASES = (
@@ -653,12 +664,11 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
             # 首次 health 已经是用户定义的事务完成点。
             tc = None
         else:
-            # 首次 probe 的 e2e 计时已经结束；这里才轮询 conductor 的精确 launchMs，
-            # 避免轮询 wait_launch_ms 污染端到端耗时。
+            # 首次 probe 的 e2e 计时已经结束；这里才轮询 launch 状态，避免轮询
+            # wait_launch_ms 污染端到端耗时。未打 timing patch 时 tc/timing 均为 None，
+            # 仍继续 warm probe，但不伪造服务端 create/cold/phase 指标。
             tc, timing = wait_launch_ms(sid)
-            if tc is None:
-                raise RuntimeError(f"no launchMs for {sid}（launch 失败/超时）")
-            run1 = e2e1 - tc if ok1 else None
+            run1 = e2e1 - tc if ok1 and tc is not None else None
             if ok1:
                 warm_command = code_with_index(
                     command, f"{sample_index}-warm-{sid[-8:]}"
@@ -671,14 +681,17 @@ def run_round(template, mode, command=DEFAULT_RUN_COMMAND,
             elif not ok2:
                 error = f"sid={sid} error={t2 or 'warm probe failed'}"
             else:
-                # A sample is atomic: only publish it after create, cold probe,
-                # launch timing and warm probe have all succeeded.
+                # A sample is atomic: only publish it after create, cold probe and
+                # warm probe have succeeded. Server launch metrics are optional
+                # because an unpatched control plane does not expose them.
                 phase_values = dict(launch_timing_rows(timing, minimum_ms=0.0)) if timing else {}
                 res['create_api'].append(create_api_ms)
-                res['create'].append(tc)
                 res['e2e'].append(e2e1)
-                res['cold'].append(run1)
                 res['warm'].append(c2)
+                if tc is not None:
+                    res['create'].append(tc)
+                if run1 is not None:
+                    res['cold'].append(run1)
                 for name, value in phase_values.items():
                     res["phases"].setdefault(name, []).append(value)
                 if timing and timing.get("accountedMs") is not None:
@@ -1040,13 +1053,16 @@ def print_sample_details(label, concurrency, result, verbose=False):
         print("  ------------------------------------ -------- ---------- ------ ---- ---- ------")
     for sample in result["samples"]:
         output = sample.get("output", "")
+        create_ms = "-" if sample.get("create") is None else f"{sample['create']:.1f}"
+        cold_ms = "-" if sample.get("cold") is None else f"{sample['cold']:.1f}"
+        warm_ms = "-" if sample.get("warm") is None else f"{sample['warm']:.1f}"
         if has_round:
             print(f"  {sample['sid']:<36} {sample['round']:>5} {sample['e2e']:>8.1f} "
-                  f"{sample['create_api']:>10.1f} {sample['create']:>6.1f} "
-                  f"{sample['cold']:>4.1f} {sample['warm']:>4.1f} {output}")
+                  f"{sample['create_api']:>10.1f} {create_ms:>6} "
+                  f"{cold_ms:>4} {warm_ms:>4} {output}")
         else:
             print(f"  {sample['sid']:<36} {sample['e2e']:>8.1f} {sample['create_api']:>10.1f} "
-                  f"{sample['create']:>6.1f} {sample['cold']:>4.1f} {sample['warm']:>4.1f} {output}")
+                  f"{create_ms:>6} {cold_ms:>4} {warm_ms:>4} {output}")
     print(f"  attempted={accepted + result['discarded']}  accepted={accepted}  "
           f"discarded={result['discarded']}")
 
