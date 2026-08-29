@@ -349,6 +349,14 @@ class BenchConcurrencyTest(unittest.TestCase):
             bench.print_concurrency_trend("B", [(1, result)])
         printed.assert_not_called()
 
+    def test_percentiles_are_interpolated_and_single_sample_is_exact(self):
+        self.assertEqual(bench._p50([100.0]), 100.0)
+        self.assertEqual(bench._p99([100.0]), 100.0)
+        self.assertEqual(bench._p50([1.0, 3.0, 5.0, 7.0]), 4.0)
+        self.assertAlmostEqual(bench._p99([1.0, 3.0, 5.0, 7.0]), 6.94)
+        self.assertEqual(bench.stat_cells([]), ("-", "-", "-", "-", "-", "-"))
+        self.assertEqual(len(bench.stat_cells([1.0, 2.0, 3.0])), 6)
+
     def test_multiple_concurrency_values_print_trend(self):
         first = bench._new_results()
         first["e2e"] = [100.0]
