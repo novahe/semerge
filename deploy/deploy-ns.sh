@@ -793,7 +793,6 @@ builder: { diff_template: $BUILDER_DIFF_TEMPLATE, insecure_registry: true, pull_
 resource_listen:
   enabled: true
   socket: $RES_SOCKET
-  audit_path: $RUNROOT/audit.log
   # cgroup_unit_prefix 已被 release-v0.1.0-preview.20260825 起的 node-ctl 移除
   # （改为内置 cgroup_scan_paths 推导，见 docs/node-resource.md），旧二进制下缺省也合法
   resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 2GiB, cpu: 1.5 } }

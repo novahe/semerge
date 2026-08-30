@@ -32,7 +32,7 @@ launchMs 轮询；run1(cold) = e2e1 - create(launchMs)。run2(warm) 仍只统计
 E2B_SANDBOX_URL 指向 node proxy，并携带 sandbox id/port/token。
 """
 import e2b_env
-import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -1155,6 +1155,16 @@ SUMMARY_VALUE_WIDTH = 9
 SUMMARY_N_WIDTH = 4
 
 
+def _summary_label(value):
+    """Pad a label to the terminal width used by the summary tables."""
+    text = str(value)
+    display_width = sum(
+        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        for char in text
+    )
+    return text + " " * max(0, SUMMARY_LABEL_WIDTH - display_width)
+
+
 def stat_cells(xs):
     """Return fixed cells for avg/p50/p99/min/max/n without labels."""
     if not xs:
@@ -1182,13 +1192,13 @@ def print_stat_table(title, rows):
     w_header = b_header
     separator = f"  {'-' * SUMMARY_LABEL_WIDTH} {'-' * len(b_header)} | {'-' * len(w_header)}"
     print(f"\n=== {title} ===")
-    print(f"  {'指标':<{SUMMARY_LABEL_WIDTH}} {'B':^{len(b_header)}} | {'W':^{len(w_header)}}")
-    print(f"  {'':<{SUMMARY_LABEL_WIDTH}} {b_header} | {w_header}")
+    print(f"  {_summary_label('指标')} {'B':^{len(b_header)}} | {'W':^{len(w_header)}}")
+    print(f"  {_summary_label('')} {b_header} | {w_header}")
     print(separator)
     for label, b_values, w_values in rows:
         b = _stat_group(stat_cells(b_values))
         w = _stat_group(stat_cells(w_values))
-        print(f"  {label:<{SUMMARY_LABEL_WIDTH}} {b} | {w}")
+        print(f"  {_summary_label(label)} {b} | {w}")
 
 
 def print_phase_summary(B, W):
