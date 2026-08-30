@@ -1390,7 +1390,7 @@ def main():
         print(f"\n######## concurrency={concurrency}，{run_header} ########")
         B = W = None
         if args.b:
-            print("\n=== B（无工作集，drop-caches=true）===")
+            print("\n=== B（无工作集）===")
             if args.duration is not None:
                 B = run_throughput(
                     args.b, args.duration, "B", args.probe, args.command,
@@ -1403,7 +1403,7 @@ def main():
                                allocatable_memory=args.allocatable_memory,
                                round_interval=args.round_interval)
         if args.w:
-            print("\n=== W（工作集，drop-caches=false）===")
+            print("\n=== W（工作集）===")
             if args.duration is not None:
                 W = run_throughput(
                     args.w, args.duration, "W", args.probe, args.command,
