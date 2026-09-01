@@ -1092,6 +1092,14 @@ def _p50(values):
     return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
 
 
+def _p90(values):
+    return _percentile(values, 90)
+
+
+def _p95(values):
+    return _percentile(values, 95)
+
+
 def _p99(values):
     return _percentile(values, 99)
 
@@ -1166,29 +1174,29 @@ def _summary_label(value):
 
 
 def stat_cells(xs):
-    """Return fixed cells for avg/p50/p99/min/max/n without labels."""
+    """Return min/avg/percentile/max/n cells without labels."""
     if not xs:
-        return ("-", "-", "-", "-", "-", "-")
+        return ("-", "-", "-", "-", "-", "-", "-", "-")
     xs = sorted(xs)
     n = len(xs)
-    return (f"{sum(xs) / n:.1f}", f"{_p50(xs):.1f}", f"{_p99(xs):.1f}",
-            f"{min(xs):.1f}", f"{max(xs):.1f}", str(n))
+    return (f"{min(xs):.1f}", f"{sum(xs) / n:.1f}", f"{_p50(xs):.1f}",
+            f"{_p90(xs):.1f}", f"{_p95(xs):.1f}", f"{_p99(xs):.1f}",
+            f"{max(xs):.1f}", str(n))
 
 
 def _stat_group(cells):
-    return " ".join([
-        f"{cells[0]:>{SUMMARY_VALUE_WIDTH}}",
-        f"{cells[1]:>{SUMMARY_VALUE_WIDTH}}",
-        f"{cells[2]:>{SUMMARY_VALUE_WIDTH}}",
-        f"{cells[3]:>{SUMMARY_VALUE_WIDTH}}",
-        f"{cells[4]:>{SUMMARY_VALUE_WIDTH}}",
-        f"{cells[5]:>{SUMMARY_N_WIDTH}}",
-    ])
+    return " ".join(
+        f"{cell:>{SUMMARY_N_WIDTH if index == len(cells) - 1 else SUMMARY_VALUE_WIDTH}}"
+        for index, cell in enumerate(cells)
+    )
 
 
 def print_stat_table(title, rows):
     """Print a fixed-width B/W table with statistics in the column headers."""
-    b_header = _stat_group(("avg(ms)", "p50(ms)", "p99(ms)", "min(ms)", "max(ms)", "n"))
+    b_header = _stat_group((
+        "min(ms)", "avg(ms)", "p50(ms)", "p90(ms)", "p95(ms)",
+        "p99(ms)", "max(ms)", "n",
+    ))
     w_header = b_header
     separator = f"  {'-' * SUMMARY_LABEL_WIDTH} {'-' * len(b_header)} | {'-' * len(w_header)}"
     print(f"\n=== {title} ===")
@@ -1227,7 +1235,7 @@ def print_phase_summary(B, W):
             rows.append((name, b_values, w_values))
 
     print_stat_table("启动阶段汇总（平均 >= 3ms）", rows)
-    print("  阶段说明（单位：ms；列为 avg / p50 / p99 / min / max / n）：")
+    print("  阶段说明（单位：ms；列为 min / avg / p50 / p90 / p95 / p99 / max / n）：")
     for name, _b_values, _w_values in rows:
         description = PHASE_DESCRIPTIONS.get(name)
         if description:

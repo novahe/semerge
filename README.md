@@ -231,7 +231,8 @@ create → 立即第一次 probe → 读取 launchMs → 第二次 probe → del
   中间不插入 `wait_launch_ms` 轮询。
 - run1/cold = e2e1 - create(launchMs)。
 - run2/warm：只统计第二次 probe 本身。
-- p50：严格中位数；偶数样本取两个中间值的平均，输出保留 1 位小数。
+- min/avg/p50/p90/p95/p99/max：统计 accepted 样本；百分位按排序后的线性插值计算，
+  p50 在偶数样本时等价于两个中间值的平均，输出保留 1 位小数。
 
 ### launchTiming 与原始日志校对
 
@@ -249,7 +250,8 @@ create → 立即第一次 probe → 读取 launchMs → 第二次 probe → del
   阶段按 `points` 的实际时间顺序统计，B/W 两侧平均都小于 3ms 的阶段不显示，
   但不会从 `accountedMs` 中删除；`unaccountedMs` 仅用于内部完整性校对，不放入阶段表。
 - B/W 运行期间只显示单行原地更新的进度条，不输出成功轮次的明细。
-- 汇总表的列头统一为 `avg(ms)`、`p50(ms)`、`min(ms)`、`max(ms)`、`n`，B/W 分组下只显示数值。
+- 汇总表的列头统一按 `min(ms)`、`avg(ms)`、`p50(ms)`、`p90(ms)`、`p95(ms)`、
+  `p99(ms)`、`max(ms)`、`n` 排列，B/W 分组下只显示数值。
 - 客户端汇总顺序为 `health1 e2e`、`create-api`、`create(launchMs)`、首 probe cold 和第二次 warm；
   `create-api` 是客户端 POST create 到收到 201 的墙钟耗时。
 

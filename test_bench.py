@@ -403,11 +403,19 @@ class BenchConcurrencyTest(unittest.TestCase):
 
     def test_percentiles_are_interpolated_and_single_sample_is_exact(self):
         self.assertEqual(bench._p50([100.0]), 100.0)
+        self.assertEqual(bench._p90([100.0]), 100.0)
+        self.assertEqual(bench._p95([100.0]), 100.0)
         self.assertEqual(bench._p99([100.0]), 100.0)
         self.assertEqual(bench._p50([1.0, 3.0, 5.0, 7.0]), 4.0)
+        self.assertAlmostEqual(bench._p90([1.0, 3.0, 5.0, 7.0]), 6.4)
+        self.assertAlmostEqual(bench._p95([1.0, 3.0, 5.0, 7.0]), 6.7)
         self.assertAlmostEqual(bench._p99([1.0, 3.0, 5.0, 7.0]), 6.94)
-        self.assertEqual(bench.stat_cells([]), ("-", "-", "-", "-", "-", "-"))
-        self.assertEqual(len(bench.stat_cells([1.0, 2.0, 3.0])), 6)
+        self.assertEqual(
+            bench.stat_cells([1.0, 3.0, 5.0, 7.0]),
+            ("1.0", "4.0", "4.0", "6.4", "6.7", "6.9", "7.0", "4"),
+        )
+        self.assertEqual(bench.stat_cells([]), ("-", "-", "-", "-", "-", "-", "-", "-"))
+        self.assertEqual(len(bench.stat_cells([1.0, 2.0, 3.0])), 8)
 
     def test_multiple_concurrency_values_print_trend(self):
         first = bench._new_results()
