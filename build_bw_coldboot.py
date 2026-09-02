@@ -47,7 +47,8 @@ SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "600"))  # 两段式流�
 READY_WAIT = int(os.environ.get("READY_WAIT", "120"))
 WARM_CURLS = int(os.environ.get("WARM_CURLS", "4"))
 WARM_HEALTH = os.environ.get("WARM_HEALTH", "1").lower() not in ("0", "false", "no")
-READY_SETTLE = float(os.environ.get("READY_SETTLE", "10"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
+EXEC_PROBE_TRIES = int(os.environ.get("EXEC_PROBE_TRIES", "2"))  # exec 支持探测次数：首调懒加载 bash-tools 偶发超时给一次重试；404/405 直接判不支持
+READY_SETTLE = float(os.environ.get("READY_SETTLE", "20"))  # gateway ready 后、pause#1 前的 settle（让热页弄脏，避免 drop_caches 踢出快照；e2b-B 异位的根因）
 DATAPLANE_PORTS = ("49983", "49999")
 # 覆盖本次（及产出的快照所记录）的 allocatable.memory；=capacity（如 8GiB）时
 # alloc==cap → CH 不加气球设备，用于产"无气球"对照快照。
@@ -125,6 +126,26 @@ def wait_ready(sid, fat):
     return False
 
 
+def probe_exec_support(sid, fat):
+    """探测 gateway 是否启用 HTTP exec（exec 补丁镜像才有 /tools/invoke exec）。
+
+    返回 (supported, note)。404/405 = 镜像没打 exec 补丁，属预期降级而非失败；
+    其余失败（含首调懒加载 bash-tools 偶发超时）重试 EXEC_PROBE_TRIES 次，
+    全部失败也只降级（W 少预热 exec 工作集），不让 build 失败。
+    """
+    last = "no attempt"
+    for attempt in range(1, EXEC_PROBE_TRIES + 1):
+        r = openclaw_net.curl_exec_proxy(sid, fat, "date")
+        if r.get("ok") is True:
+            return True, f"exec ok ({r.get('total', 0):.3f}s, attempt {attempt})"
+        if r.get("http") in (404, 405):
+            return False, f"HTTP {r.get('http')}：镜像未启用 HTTP exec，跳过 exec 预热"
+        last = f"attempt {attempt}: http={r.get('http', 0)} err={r.get('err', '') or (r.get('text') or '')[:60]}"
+        if attempt < EXEC_PROBE_TRIES:
+            time.sleep(1)
+    return False, f"exec 探测未通过（{last}），按不支持降级，跳过 exec 预热"
+
+
 def main():
     if PROFILE not in ("e2b", "bare"):
         sys.exit(f"✗ PROFILE={PROFILE!r}（仅支持 e2b | bare）")
@@ -199,17 +220,28 @@ def main():
             sys.exit("✗ resume 后 gateway 未 ready")
         print("  ✓ gateway ready (post-resume)")
 
-        # ④ 预热工作集
-        profile = "health+exec" if WARM_HEALTH else "exec-only"
-        print(f"[4/5] 预热 {profile} ×{WARM_CURLS}（聚焦 bash-tools 工作集）")
+        # ④ 预热工作集。exec 先探测支持（openclaw 镜像可能没打 HTTP exec 补丁），
+        # 不支持则降级为 health-only 预热并继续 build，不失败。
+        exec_supported, note = probe_exec_support(sid, fat)
+        print(f"  • exec 探测: {note}")
+        if not exec_supported:
+            print("  ⚠ 未启用 HTTP exec：W 只预热 health 工作集（bash-tools 页不会进快照）")
+        profile = ("health+exec" if WARM_HEALTH else "exec-only") if exec_supported else "health-only"
+        print(f"[4/5] 预热 {profile} ×{WARM_CURLS}")
         for k in range(WARM_CURLS):
-            rh = openclaw_net.curl_gateway_proxy(sid, fat, "/health") if WARM_HEALTH else {"http": 200}
-            r = openclaw_net.curl_exec_proxy(sid, fat, "date")
-            print(f"  warm{k+1}: health={rh.get('http')}({rh.get('total', 0):.3f}s) "
-                  f"exec={r.get('ok')}({r.get('total', 0):.3f}s)"
-                  f"{'  <<< 文件页缓存已空，这张 W 快照会是坏的' if (r.get('total') or 0) > 2 else ''}")
-            if rh.get("http") != 200 or not r.get("ok"):
-                sys.exit(f"✗ warm 失败 health={rh} exec={r}")
+            # exec 不支持时强制 health 预热（原 WARM_HEALTH=0 的 exec-only 组合随之失效）
+            rh = openclaw_net.curl_gateway_proxy(sid, fat, "/health") if (WARM_HEALTH or not exec_supported) else {"http": 200}
+            if not exec_supported:
+                print(f"  warm{k+1}: health={rh.get('http')}({rh.get('total', 0):.3f}s) exec=skipped")
+            else:
+                r = openclaw_net.curl_exec_proxy(sid, fat, "date")
+                print(f"  warm{k+1}: health={rh.get('http')}({rh.get('total', 0):.3f}s) "
+                      f"exec={r.get('ok')}({r.get('total', 0):.3f}s)"
+                      f"{'  <<< 文件页缓存已空，这张 W 快照会是坏的' if (r.get('total') or 0) > 2 else ''}")
+                if rh.get("http") != 200 or not r.get("ok"):
+                    sys.exit(f"✗ warm 失败 health={rh} exec={r}")
+            if rh.get("http") != 200:
+                sys.exit(f"✗ warm 失败 health={rh}")
             time.sleep(0.2)
         if READY_SETTLE > 0:
             print(f"  • quiesce {READY_SETTLE:g}s 后再 pause")

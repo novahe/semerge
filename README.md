@@ -177,7 +177,8 @@ build_bw_coldboot.py 的流程：
   → gateway /health ready
   → pause 默认策略（drop_caches=true）→ export B
   → connect 恢复
-  → node-proxy health + exec 预热 ×4
+  → exec 探测（未启用 HTTP exec 的镜像降级为 health-only，build 不失败）
+  → node-proxy health [+ exec] 预热 ×4
   → pause（drop_caches=false, merge_ref=false）→ export W
 ~~~
 
@@ -325,8 +326,9 @@ build_bw_coldboot.py：
 | PROFILE | e2b | e2b 或 bare |
 | IMAGE_NAME | openclaw | 影响 B/W ID 文件名 |
 | OUT_B / OUT_W | 按 profile 生成 | 可覆盖输出文件路径 |
-| READY_SETTLE | 2 | B 导出前的 gateway 稳定等待秒数 |
+| READY_SETTLE | 20 | B 导出前 / W 预热后的 gateway 稳定等待秒数（让热页弄脏） |
 | WARM_CURLS | 4 | W 的 health + exec 预热次数 |
+| EXEC_PROBE_TRIES | 2 | 预热前对 HTTP exec 的探测次数；404/405 或全部失败即降级为 health-only 预热，build 不失败 |
 | SANDBOX_TIMEOUT | 600 | 沙箱超时秒数 |
 
 build_bw_code_interpreter.py：
