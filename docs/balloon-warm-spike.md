@@ -90,7 +90,7 @@
 
 ## 7. 更正与补全（2026-08-15 深夜，压力注入实验后）
 
-强制复现（`--probe run --command 'dd … /dev/shm 1.6G'`，3 沙箱全卡 7.7-11.6s）暴露了更完整的三层结构，**§2 的"Hint 挤牙膏"只是次要路径**：
+强制复现（`--probe command --run-command 'dd … /dev/shm 1.6G'`，3 沙箱全卡 7.7-11.6s）暴露了更完整的三层结构，**§2 的"Hint 挤牙膏"只是次要路径**：
 
 ```
 20:52:44.09  heartbeat: controller adjusted alloc 1.2GiB → 256MiB   ← 元凶①

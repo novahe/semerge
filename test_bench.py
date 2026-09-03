@@ -259,6 +259,28 @@ class BenchConcurrencyTest(unittest.TestCase):
         probe.assert_called_once()
         launch_timing.assert_not_called()
 
+    def test_transaction_only_completes_on_first_command_without_warm_probe(self):
+        response = SimpleNamespace(status_code=204)
+        sandbox = SimpleNamespace(
+            kill=mock.Mock(return_value=SimpleNamespace(status_code=204)))
+        with mock.patch.object(bench, "create", return_value=("sid-command-qps", "token")), \
+                mock.patch.object(bench.Sandbox, "connect", return_value=sandbox) as connect, \
+                mock.patch.object(bench, "probe", return_value=(True, 8.0, "Thu ...")) as probe, \
+                mock.patch.object(bench, "wait_launch_ms") as launch_timing, \
+                mock.patch.object(bench, "cleanup_sandbox_directories", return_value=[]):
+            result, failure = bench.run_round(
+                "template", "command", "date", transaction_only=True)
+
+        self.assertIsNone(failure)
+        self.assertEqual(result["discarded"], 0)
+        self.assertEqual(len(result["qps_starts"]), 1)
+        self.assertEqual(len(result["qps_completions"]), 1)
+        self.assertEqual(result["samples"][0]["probe_ms"], 8.0)
+        self.assertEqual(result["warm"], [])
+        connect.assert_called_once_with("sid-command-qps", timeout=120)
+        probe.assert_called_once()
+        launch_timing.assert_not_called()
+
     def test_throughput_metrics_use_completion_window(self):
         result = bench._new_results()
         result["qps_starts"] = [10.0, 11.0, 13.0]
@@ -290,18 +312,20 @@ class BenchConcurrencyTest(unittest.TestCase):
                 "sid": "sid-throughput",
                 "e2e": 10.0,
                 "create_api": 1.0,
-                "health": 2.0,
+                "probe_ms": 2.0,
             })
             return result, []
 
-        with mock.patch.object(bench, "_run_throughput_worker", side_effect=fake_worker):
-            result = bench.run_throughput(
-                "template", 0.01, "B", "health", concurrency=2)
+        for mode in ("health", "command"):
+            with self.subTest(mode=mode), \
+                    mock.patch.object(bench, "_run_throughput_worker", side_effect=fake_worker):
+                result = bench.run_throughput(
+                    "template", 0.01, "B", mode, concurrency=2)
 
-        metrics = bench.throughput_metrics(result)
-        self.assertEqual(metrics["attempted"], 2)
-        self.assertEqual(metrics["accepted"], 2)
-        self.assertEqual(metrics["discarded"], 0)
+                metrics = bench.throughput_metrics(result)
+                self.assertEqual(metrics["attempted"], 2)
+                self.assertEqual(metrics["accepted"], 2)
+                self.assertEqual(metrics["discarded"], 0)
 
     def test_run_rounds_respects_worker_limit(self):
         lock = threading.Lock()
@@ -454,6 +478,44 @@ class BenchConcurrencyTest(unittest.TestCase):
                 self.assertIn("accepted=1", output)
                 self.assertIn("discarded=1", output)
                 self.assertEqual("sid-1" in output, show_details)
+
+    def test_success_detail_header_columns_align_with_rows(self):
+        result = bench._new_results()
+        result["samples"] = [{
+            "sid": "sid-1",
+            "e2e": 100.0,
+            "create_api": 10.0,
+            "create": 70.0,
+            "cold": 30.0,
+            "warm": 5.0,
+            "output": "Thu Sep  3 03:34:42 UTC 2026",
+        }]
+
+        with mock.patch("builtins.print") as printed:
+            bench.print_sample_details("B", 1, result, verbose=True)
+
+        lines = [str(call.args[0]) for call in printed.call_args_list]
+        header = next(line for line in lines if "sandboxID" in line)
+        row = next(line for line in lines if "sid-1" in line)
+        self.assertEqual(header.index("sandboxID"), row.index("sid-1"))
+        self.assertNotIn("|", header)
+        self.assertNotIn("|", row)
+        for heading, value in (
+                ("e2e(ms)", "100.0"),
+                ("create-api", "10.0"),
+                ("launch", "70.0"),
+                ("cold", "30.0"),
+                ("warm", "5.0"),
+        ):
+            with self.subTest(column=heading):
+                self.assertEqual(
+                    header.index(heading),
+                    row.index(value),
+                )
+        self.assertEqual(
+            header.index("output"),
+            row.index("Thu Sep  3 03:34:42 UTC 2026"),
+        )
 
     def test_failure_is_printed_without_verbose(self):
         failure = {

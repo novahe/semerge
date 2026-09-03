@@ -2,23 +2,25 @@
 """从 e2bdev/code-interpreter manifest 镜像一次产出 B/W 快照。
 
 流程：
-  create → run_code（确认 code-interpreter 可执行代码）→ pause 默认策略 → export B
-  → connect → run_code 预热代码执行工作集 → pause 保留缓存 → export W
+  create → run_code + commands.run("date")（确认两条执行路径可用）
+  → pause 默认策略 → export B
+  → connect → run_code + commands.run("date") 预热两类执行工作集
+  → pause 保留缓存 → export W
 
 这里的 B/W 来自同一个 guest。B 使用节点默认的 ``drop_caches=true``，W 使用
-``drop_caches=false, merge_ref=false``，因此 bench.py 的 ``--probe code`` 可以直接
-比较 e2b CI SDK → node-proxy → FastAPI(49999) → Jupyter 这条路径。
+``drop_caches=false, merge_ref=false``。W 同时记录 ``run_code`` 和
+``commands.run("date")`` 两类新增工作集；bench.py 再通过 ``--probe command`` 或
+``--probe code`` 选择其中一条路径进行基准测试，不会在同一轮 bench 中同时执行。
 
-code-interpreter 依赖 envd 的 ``/envs`` 接口，不能使用 ``bare`` profile。模板使用
-带 envd 的 ``e2b-img-`` 前缀；启动时通过 envd 后台拉起镜像内的
-``/root/.jupyter/start-up.sh``。构建流程不修改 guest 文件，只验证镜像自带
-bridge 的本地模式能工作；启动命令使用镜像原生支持的 ``E2B_LOCAL=true``，因此
-不请求旧 bridge 的 EnvD ``/envs``。快照前用 ``49999/health`` 和一次有输出的
-``run_code`` 做门禁。
+code-interpreter manifest 依赖 envd，不能使用 ``bare`` profile。模板使用带 envd
+的 ``e2b-img-`` 前缀；构建流程不修改 guest 文件，只验证一次有输出的
+``run_code`` 和一次成功的 ``commands.run``。命令默认是 ``date``，可用
+``RUN_COMMAND`` 覆盖。
 """
 import base64
 import json
 import os
+import shlex
 import sys
 import time
 
@@ -33,7 +35,7 @@ from e2b_code_interpreter import Sandbox as CodeSandbox
 PARENT = os.path.dirname(os.path.abspath(__file__))
 MANIFEST_KEY = os.environ.get(
     "MANIFEST_KEY",
-    "8aeffe688f1061d0826a9ec3d79b911a230bf0968c3648c8a403198fd7b3270a",
+    "4410ffb653b2eb4a67d421531a4852c7f2ddacddbf7cccebe664a85c571a3990",
 )
 OUT_B = os.environ.get(
     "OUT_B", os.path.join(PARENT, "code-interpreter-e2b-snp-template.id")
@@ -45,12 +47,13 @@ SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "600"))
 RUN_TIMEOUT = int(os.environ.get("RUN_TIMEOUT", "60"))
 BRIDGE_READY_TIMEOUT = int(os.environ.get("BRIDGE_READY_TIMEOUT", "120"))
 WARM_RUNS = int(os.environ.get("WARM_RUNS", "4"))
-READY_SETTLE = float(os.environ.get("READY_SETTLE", "2"))
+READY_SETTLE = float(os.environ.get("READY_SETTLE", "20"))
+RUN_USER = os.environ.get("RUN_USER", "root")
+RUN_CWD = os.environ.get("RUN_CWD", "/")
+RUN_COMMAND = os.environ.get("RUN_COMMAND", "date")
 DEFAULT_RUN_CODE = "print('hello kuasar-sandbox {index}')"
 RUN_CODE = os.environ.get("RUN_CODE", DEFAULT_RUN_CODE)
 STARTUP_COMMAND = (
-    # The official bridge supports E2B_LOCAL itself. This avoids its legacy
-    # unauthenticated /envs call without modifying any guest files.
     "cd /root/.jupyter && E2B_LOCAL=true "
     "setsid sh -c 'exec ./start-up.sh' "
     "</dev/null >/tmp/code-interpreter-start.log 2>&1 & echo started"
@@ -124,7 +127,7 @@ def start_bridge(envd_sandbox):
 
 
 def wait_for_bridge(sandbox):
-    """Wait for the guest FastAPI bridge, not just CH/envd launch readiness."""
+    """Wait for the guest FastAPI bridge, not just envd launch readiness."""
     token = sandbox._envd_access_token
     headers = {
         "E2b-Sandbox-Id": sandbox.sandbox_id,
@@ -213,11 +216,6 @@ def run_code(sandbox, code):
     text = " ".join(str(s) for s in stdout) if stdout else (
         result.results[0].text if result.results else "")
     output = (text or "").strip().replace("\n", " ")[:120]
-    # The SDK treats an HTTP 200 response with an empty body as a successful
-    # Execution(error=None).  The pre-snapshot cold check must prove that the
-    # code-interpreter bridge returned an actual execution output; otherwise
-    # we would export B/W snapshots that only contain a live but unusable
-    # 49999 endpoint.
     if not output:
         raise RuntimeError(
             "run_code returned no stdout/result; code-interpreter /execute "
@@ -226,8 +224,27 @@ def run_code(sandbox, code):
     return elapsed_ms, output
 
 
+def run_command(sandbox, command):
+    """通过 e2b/envd 执行 guest 命令，返回耗时和 stdout/stderr。"""
+    t0 = time.time()
+    result = sandbox.commands.run(
+        command, user=RUN_USER, cwd=RUN_CWD, timeout=RUN_TIMEOUT
+    )
+    elapsed_ms = (time.time() - t0) * 1000
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    output = (stdout or stderr).strip().replace("\n", " ")[:120]
+    exit_code = getattr(result, "exit_code", 1)
+    if exit_code != 0:
+        raise RuntimeError(
+            f"commands.run exit_code={exit_code} "
+            f"stdout={stdout[:200]!r} stderr={stderr[:200]!r}"
+        )
+    return elapsed_ms, output
+
+
 def code_with_index(code, index):
-    """Keep a caller-provided RUN_CODE verbatim; vary only the default probe."""
+    """Vary only the built-in smoke code; preserve caller-supplied Python."""
     if code == DEFAULT_RUN_CODE:
         return code.format(index=index)
     return code
@@ -242,7 +259,7 @@ def main():
     tid = template_id(MANIFEST_KEY)
     print(f"• code-interpreter B/W from manifest://{MANIFEST_KEY[:12]}…")
     print(f"  templateID={tid}")
-    print(f"  code={RUN_CODE!r}")
+    print(f"  command={RUN_COMMAND!r}  user={RUN_USER}  cwd={RUN_CWD}")
     domain = os.environ["E2B_DOMAIN"]
     sid = None
     hosts_added = False
@@ -258,11 +275,15 @@ def main():
         print("[1/5] 启动镜像自带 start-up.sh / Jupyter/49999 + readiness …")
         pid = start_bridge(envd_sandbox)
         print(f"  ✓ start-up.sh started pid={pid}")
-        sandbox = connect_code_sandbox(sid)
-        ready_ms = wait_for_bridge(sandbox)
+        code_sandbox = connect_code_sandbox(sid)
+        ready_ms = wait_for_bridge(code_sandbox)
         print(f"  ✓ 49999/health ready {ready_ms:.0f}ms")
-        elapsed, output = run_code(sandbox, code_with_index(RUN_CODE, "create-check"))
+        elapsed, output = run_code(
+            code_sandbox, code_with_index(RUN_CODE, "create-check")
+        )
         print(f"  ✓ run_code {elapsed:.0f}ms output={output!r}")
+        elapsed, output = run_command(envd_sandbox, RUN_COMMAND)
+        print(f"  ✓ commands.run {elapsed:.0f}ms output={output!r}")
         if READY_SETTLE > 0:
             time.sleep(READY_SETTLE)
 
@@ -276,15 +297,21 @@ def main():
         print("[3/5] connect 恢复 …")
         t0 = time.time()
         connect_sandbox(sid)
-        sandbox = connect_code_sandbox(sid)
-        ready_ms = wait_for_bridge(sandbox)
+        envd_sandbox = EnvdSandbox.connect(sid, timeout=SANDBOX_TIMEOUT)
+        code_sandbox = connect_code_sandbox(sid)
+        ready_ms = wait_for_bridge(code_sandbox)
         print(f"  ✓ resumed ({(time.time() - t0) * 1000:.0f}ms), "
               f"49999/health ready {ready_ms:.0f}ms")
 
-        print(f"[4/5] run_code 预热 ×{WARM_RUNS} …")
+        print(f"[4/5] run_code + commands.run 双预热 ×{WARM_RUNS} …")
         for i in range(WARM_RUNS):
-            elapsed, output = run_code(sandbox, code_with_index(RUN_CODE, f"warm-{i + 1}"))
-            print(f"  warm{i + 1}: {elapsed:.0f}ms output={output!r}")
+            code_elapsed, code_output = run_code(
+                code_sandbox, code_with_index(RUN_CODE, f"warm-{i + 1}")
+            )
+            command_elapsed, command_output = run_command(envd_sandbox, RUN_COMMAND)
+            print(f"  warm{i + 1}: run_code={code_elapsed:.0f}ms "
+                  f"{code_output!r}; commands.run={command_elapsed:.0f}ms "
+                  f"{command_output!r}")
 
         print("[5/5] pause#2（drop_caches=false, merge_ref=false）→ export W …")
         t0 = time.time()
@@ -294,9 +321,14 @@ def main():
         print(f"  ✓ W={OUT_W} ({(time.time() - t0) * 1000:.0f}ms)")
 
         print("\n=== done ===")
-        print(f"B（e2b/no working set）: {OUT_B}")
+        print(f"B（e2b/cold baseline）:      {OUT_B}")
         print(f"W（working set）:        {OUT_W}")
-        print(f"bench: python3 bench.py --b \"$(cat {OUT_B})\" --w \"$(cat {OUT_W})\" --probe code")
+        command = shlex.quote(RUN_COMMAND)
+        print(f"bench (commands.run): python3 bench.py --b \"$(cat {OUT_B})\" "
+              f"--w \"$(cat {OUT_W})\" --probe command --run-command {command}")
+        print(f"bench (run_code):     python3 bench.py --b \"$(cat {OUT_B})\" "
+              f"--w \"$(cat {OUT_W})\" --probe code --run-code "
+              f"{shlex.quote(RUN_CODE)}")
     finally:
         # Host aliases are only needed while this process is talking to the
         # data plane. Clean them independently: a control-plane DELETE timeout

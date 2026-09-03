@@ -68,7 +68,7 @@ python3 bench.py --b "$B" --w "$W" --probe health -n 50 -c 1 10 30 50
 # 分轮并发：每档 5 轮；每轮同时启动该档位数量，轮间等待全部完成
 python3 bench.py --b "$B" --w "$W" --probe health -r 5 -c 1 10 30 50
 
-# create + 首次 /health=200 业务吞吐：每档运行 60 秒，输出完成事务 QPS
+# create + 首次成功 probe 业务吞吐：每档运行 60 秒，输出完成事务 QPS
 python3 bench.py --b "$B" --w "$W" --probe health --duration 60 -c 1 10 30 50
 
 # 2. openclaw bare：node-proxy → health
@@ -77,15 +77,20 @@ B="$(cat openclaw-bare-snp-template.id)"
 W="$(cat openclaw-bare-ws-template.id)"
 python3 bench.py --b "$B" --w "$W" --probe health -n 50
 
-# 3. code-interpreter + e2b：49999/execute → Jupyter
+# 3. code-interpreter + e2b：commands.run / run_code
 python3 build_bw_code_interpreter.py
 B="$(cat code-interpreter-e2b-snp-template.id)"
 W="$(cat code-interpreter-e2b-ws-template.id)"
-python3 bench.py --b "$B" --w "$W" --probe code -n 10
+python3 bench.py --b "$B" --w "$W" --probe command --run-command date -n 10
+
+# commands.run 业务吞吐：首次 commands.run 成功即完成事务
+python3 bench.py --b "$B" --w "$W" --probe command --run-command date --duration 60 -c 1 10 30 50
 ~~~
 
-场景 3 每轮内部校验 `run_code` 成功并返回 stdout。bench.py 也保留 --probe exec，
-用于已启用 gateway HTTP exec 的 openclaw 镜像。
+场景 3 的构建阶段会校验 `commands.run` 和 `run_code`，W 快照同时录制
+`commands.run("date")` 与 `run_code` 两类工作集。`--probe command` 使用 `--run-command`，
+`--probe code` 使用 `--run-code`；bench.py 也保留 `--probe exec`，用于已启用
+gateway HTTP exec 的 openclaw 镜像。
 
 `-c/--concurrency` 可接收一个或多个正整数，默认 `1`。旧模式下，`-n/--iterations` 表示每个
 并发档位、每个已选择模板的总样本数，而不是每个 worker 的样本数；例如 `-n 50 -c 1 10 30 50`
@@ -96,10 +101,11 @@ python3 bench.py --b "$B" --w "$W" --probe code -n 10
 `5 × (1 + 10 + 30 + 50) = 455` 个样本；`c=1` 的 5 轮就是 5 次串行测试。失败样本仍会丢弃，
 并计入 `discarded` 和失败 JSONL 日志，不会补偿重试。
 
-`--duration` 是独立的 health 吞吐模式，不能与 `-n/-r` 同时使用。每个 worker 持续执行
-`POST /sandboxes` → 首次 node-proxy `/health` 返回 200；首次 health 返回即完成一个业务事务，
-计入 `accepted` 和 `business_qps`。到达 duration 后不再启动新事务，但已在途的事务会等待完成。
-`business_qps` 的分母包含请求窗口和超出窗口的在途尾部；warm `/health`、launch timing 和
+`--duration` 是独立的 health/command 吞吐模式，不能与 `-n/-r` 同时使用。每个 worker 持续执行
+`POST /sandboxes` → 首次 probe 成功；health 要求 node-proxy `/health` 返回 200，command 要求
+`commands.run` 返回 exit code 0。首次 probe 成功即完成一个业务事务，计入 `accepted` 和
+`business_qps`。到达 duration 后不再启动新事务，但已在途的事务会等待完成。
+`business_qps` 的分母包含请求窗口和超出窗口的在途尾部；warm probe、launch timing 和
 DELETE 不属于事务完成条件。清理失败单独计入 `cleanup_failed`，并停止发生清理失败的 worker。
 
 每档默认只打印 attempted/accepted/discarded 计数；加 `-v/--verbose` 后才打印每个成功 sandbox 的
@@ -109,9 +115,9 @@ warm probe 失败时，整条样本从所有统计中丢弃；关键信息默认
 `logs/bench-failures.jsonl`，可用 `--failure-log PATH` 修改路径。
 
 吞吐模式下默认输出每档的 attempted/accepted/discarded、cleanup_failed、measured_s、
-business_qps 和 success_rate；`-v` 额外输出每个成功事务的 create+/health e2e、create-api
-和 health 耗时。吞吐模式只接受 `--probe health`，因为这里的业务事务边界就是 create 加首次
-`/health`。
+business_qps 和 success_rate；`-v` 额外输出每个成功事务的 create+probe e2e、create-api
+和对应 probe 耗时。吞吐模式接受 `--probe health` 或 `--probe command`，业务事务边界分别是
+create 加首次成功的 `/health` 或 `commands.run`。
 
 只有选择两个或以上并发档位时才打印并发趋势表；默认的 `-c 1` 或显式单档 `-c 1` 只输出该档
 汇总，不做无意义的自身基线比较。B/W 的 cold 和 create 原始指标保留在汇总表中。
@@ -199,23 +205,25 @@ PROFILE=bare 时 gateway 通过 create metadata 的 launch spec 启动；PROFILE
 
 ~~~text
 create manifest template
-  → envd commands.run(background) 以镜像原生 `E2B_LOCAL=true` 模式启动自带 start-up.sh
-  → 49999/health + run_code 有输出门禁
+  → 启动 bridge，run_code + commands.run("date") 成功门禁
   → pause（drop_caches=true）→ export B
   → connect 恢复
-  → 49999/health + run_code ×4 预热 Python/Jupyter 工作集
+  → run_code + commands.run("date") ×4 预热两类执行工作集
   → pause（drop_caches=false, merge_ref=false）→ export W
 ~~~
 
-构建流程不修改 guest 文件。`BRIDGE_READY_TIMEOUT` 默认等待 120 秒；快照前如果
-49999 不 ready 或 `run_code` 没有 stdout/result，构建会失败，不会导出坏快照。
-`E2B_LOCAL=true` 是官方 bridge 的本地模式，代码执行正常，但不会从 EnvD 注入环境变量。
-需要改预热代码时：
+构建流程不修改 guest 文件；快照前如果 49999 未 ready、`run_code` 无输出或
+`commands.run` 返回非零退出码，构建会失败，不会导出坏快照。需要改预热命令或代码时：
 
 ~~~bash
-RUN_CODE="print(1)" WARM_RUNS=4 \
+RUN_COMMAND="date" RUN_CODE="print(1)" WARM_RUNS=4 \
 python3 build_bw_code_interpreter.py
 ~~~
+
+bench 的 `--probe command` 和 `--probe code` 分别通过 `--run-command` 与
+`--run-code` 指定负载，默认值为 `date` 和
+`print('hello kuasar-sandbox {index}')`。一次 bench 只能选择其中一种负载，
+两个参数互斥，且需分别配合对应的 `--probe`。
 
 ## 计时口径
 
@@ -337,16 +345,18 @@ build_bw_code_interpreter.py：
 |---|---|---|
 | MANIFEST_KEY | 上述 key | manifest rootfs 清单密钥 |
 | OUT_B / OUT_W | code-interpreter-e2b B/W ID 文件 | 可覆盖输出路径 |
-| RUN_CODE | `print('hello kuasar-sandbox {index}')` | 创建验证和 W 预热 Python 代码；内置默认值每次以不同执行标识替换 `{index}` |
+| RUN_COMMAND | `date` | 创建验证和 W 预热的 `commands.run` 命令 |
+| RUN_USER / RUN_CWD | `root` / `/` | `commands.run` 的 guest 用户和工作目录 |
+| RUN_CODE | `print('hello kuasar-sandbox {index}')` | 创建验证和 W 预热的 `run_code` Python 代码；默认值以不同执行标识替换 `{index}` |
 | WARM_RUNS | 4 | W 预热次数 |
-| RUN_TIMEOUT | 60 | 单次代码执行超时秒数 |
+| RUN_TIMEOUT | 60 | 单次 `commands.run` 或 `run_code` 执行超时秒数 |
 | BRIDGE_READY_TIMEOUT | 120 | 49999/health readiness 等待秒数 |
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
-| bench.py | 执行 B/W 基准，支持 health、exec、run、code 探针 |
+| bench.py | 执行 B/W 基准，支持 health、exec、command、code 探针 |
 | build_bw_coldboot.py | 生成 openclaw e2b/bare B/W 快照 |
 | build_bw_code_interpreter.py | 从 manifest 生成 code-interpreter e2b B/W 快照 |
 | openclaw_net.py | node-proxy 与 gateway 请求辅助 |
