@@ -73,7 +73,22 @@ REMOTE_SNAPSHOT_PARENT_USER_SET=0
 [ -n "${REMOTE_SNAPSHOT_PARENT+x}" ] && REMOTE_SNAPSHOT_PARENT_USER_SET=1
 MANIFEST_CONFIG_USER_SET=0
 [ -n "${MANIFEST_CONFIG+x}" ] && MANIFEST_CONFIG_USER_SET=1
+OVERLAY_DIFF_TEMPLATE_USER_SET=0
+[ -n "${OVERLAY_DIFF_TEMPLATE+x}" ] && OVERLAY_DIFF_TEMPLATE_USER_SET=1
+BUILDER_DIFF_TEMPLATE_USER_SET=0
+[ -n "${BUILDER_DIFF_TEMPLATE+x}" ] && BUILDER_DIFF_TEMPLATE_USER_SET=1
 
+WORKDIR_USER_SET=0
+[ -n "${WORKDIR+x}" ] && WORKDIR_USER_SET=1
+# A replace without WORKDIR must stay on the workdir that created this NS.
+# Otherwise a release deployed in an isolated workdir can silently fall back
+# to the legacy ${NS}-work database and fail schema validation before the
+# config socket is created.  An explicit WORKDIR still takes precedence.
+if [ "$CMD" = replace ] && [ "$WORKDIR_USER_SET" -eq 0 ]; then
+  previous_workdir="$(awk -F= '$1 == "workdir" { sub(/^[^=]*=/, ""); v=$0 } END { if (v != "") print v }' \
+    "/run/sandbox-${NS}/deploy.state" 2>/dev/null || true)"
+  [ -z "$previous_workdir" ] || WORKDIR="$previous_workdir"
+fi
 WORKDIR="${WORKDIR:-$REPO_ROOT/${NS}-work}"
 if [ -n "$WORKDIR" ]; then
   WORKDIR="$(readlink -m -- "$WORKDIR")"
@@ -87,7 +102,11 @@ PROXY_NETNS="${PROXY_NETNS:-e2b${NS}_mgmt}"
 MGMT="e2b${NS}m0"
 case "$PROXY_NETNS" in ''|*[!A-Za-z0-9_.-]*) [ -z "$PROXY_NETNS" ] || die "PROXY_NETNS 含有不安全字符：$PROXY_NETNS" ;; esac
 if [ -n "$WORKDIR" ]; then
-  RUNROOT="$WORKDIR/run"
+  # Keep volatile node sockets/state under a short absolute path.  The
+  # orchestrator validates the longest sandbox socket path against Linux's
+  # 108-byte UNIX-socket limit; a WORKDIR such as /root/sandbox/nova-work
+  # makes that path too long.  Persistent data/configuration stay in WORKDIR.
+  RUNROOT="/run/sandbox-${NS}"
   BASEROOT="$WORKDIR/var/lib"
   SAVED="$WORKDIR/var/lib-saved"
   CFGDIR="$WORKDIR/etc/node-ctl-${NS}"
@@ -104,7 +123,7 @@ if [ -n "$WORKDIR" ]; then TAPFD_DIR="$WORKDIR/run/connector/${SWITCH}"; else TA
 TAPFD_SOCK="${TAPFD_DIR}/tapfd.sock"
 CFG_SOCKET="${RUNROOT}/node-ctl.socket"
 RES_SOCKET="${RUNROOT}/resource.sock"
-PROXY_SOCK="${RUNROOT}/proxy.sock"
+PROXY_STATS_SOCK="${RUNROOT}/proxy-stats.sock"
 PROXY_SHM="${RUNROOT}/proxy-routes.shm"
 PIDFILE="${RUNROOT}/env.pids"            # 兼容旧版后台脚本
 STATEFILE="${RUNROOT}/deploy.state"
@@ -287,7 +306,11 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
     [ -n "$(read_state cloud_hypervisor_cpus_model)" ] && \
       CLOUD_HYPERVISOR_CPUS_MODEL="$(read_state cloud_hypervisor_cpus_model)"
   fi
-  if [ "$CH_PATH_USER_SET" -eq 0 ]; then
+  # replace explicitly selects a new bins directory; do not silently retain
+  # the previous release's Cloud Hypervisor from deploy.state.  An explicit
+  # SANDBOX_CH_PATH remains authoritative, and non-replace lifecycle commands
+  # keep the existing state-reuse behavior.
+  if [ "$CH_PATH_USER_SET" -eq 0 ] && [ "$CMD" != replace ]; then
     [ -n "$(read_state sandbox_ch_path)" ] && \
       SANDBOX_CH_PATH="$(read_state sandbox_ch_path)"
   fi
@@ -309,6 +332,12 @@ if [ "$CMD" != prepare ] && [ -f "$STATEFILE" ]; then
   fi
   if [ "$MANIFEST_CONFIG_USER_SET" -eq 0 ]; then
     [ -n "$(read_state manifest_config)" ] && MANIFEST_CONFIG="$(read_state manifest_config)"
+  fi
+  if [ "$OVERLAY_DIFF_TEMPLATE_USER_SET" -eq 0 ]; then
+    [ -n "$(read_state overlay_diff_template)" ] && OVERLAY_DIFF_TEMPLATE="$(read_state overlay_diff_template)"
+  fi
+  if [ "$BUILDER_DIFF_TEMPLATE_USER_SET" -eq 0 ]; then
+    [ -n "$(read_state builder_diff_template)" ] && BUILDER_DIFF_TEMPLATE="$(read_state builder_diff_template)"
   fi
   if [ "$PORT_AUTO" -eq 1 ] && [ -n "$(read_state api_port)" ] && [ -n "$(read_state proxy_port)" ] && \
      [ -n "$(read_state mmds_port)" ] && [ -n "$(read_state metrics_port)" ]; then
@@ -759,7 +788,7 @@ write_configs() {
 
   cat > "$CFGDIR/conductor.yaml" <<YAML
 api: { domain: $DOMAIN, listen: ":$API_PORT", tls: { cert: $cert, key: $key } }
-proxy: { mode: external, auth: enforce, park_timeout: 30s, metrics_listen: 127.0.0.1:$METRICS }
+proxy: { auth: enforce, park_timeout: 30s, metrics_listen: 127.0.0.1:$METRICS }
 mmds:
   enabled: true
   listen: 127.0.0.1:$MMDS_PORT
@@ -799,7 +828,7 @@ resource_listen:
   watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
   rate_limits: { memory_grant_per_sec_factor: 0.05 }
   admission: { rate: 128, burst: 128, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
-checkpoint: { mode: local, local_dir: $SAVED, remote: { ref_location_parent: $REMOTE_SNAPSHOT_PARENT } }
+checkpoint: { mode: local, remote: { ref_location_parent: $REMOTE_SNAPSHOT_PARENT } }
 YAML
 
   cat > "$CFGDIR/proxy.yaml" <<YAML
@@ -807,7 +836,7 @@ config_socket: $CFG_SOCKET
 paths: { run_root: $RUNROOT }
 proxy_netns: $PROXY_NETNS
 data_listen: "$PROXY_LISTEN"
-proxy_socket: $PROXY_SOCK
+stats_socket: $PROXY_STATS_SOCK
 shm_path: $PROXY_SHM
 route_capacity: $proxy_route_capacity
 workers: 4
@@ -1363,6 +1392,7 @@ do_up() {
   : > "$STATEFILE"
   state_set phase up
   state_set namespace "$NS"
+  state_set workdir "$WORKDIR"
   state_set connector_path "$CONNECTOR"
   state_set node_path "$NODE_CTL"
   state_set bins "$BINS"
@@ -1373,6 +1403,8 @@ do_up() {
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
+  state_set overlay_diff_template "$OVERLAY_DIFF_TEMPLATE"
+  state_set builder_diff_template "$BUILDER_DIFF_TEMPLATE"
   state_set nfs_dir "$NFS_DIR"
   state_set remote_snapshot_parent "$REMOTE_SNAPSHOT_PARENT"
   state_set api_port "$API_PORT"
@@ -1460,6 +1492,7 @@ do_prepare() {
   : > "$STATEFILE"
   state_set phase prepared
   state_set namespace "$NS"
+  state_set workdir "$WORKDIR"
   state_set connector_path "$CONNECTOR"
   state_set node_path "$NODE_CTL"
   state_set bins "$BINS"
@@ -1470,6 +1503,8 @@ do_prepare() {
   state_set vswitch_ports "$VSWITCH_PORTS"
   state_set proxy_netns "$PROXY_NETNS"
   state_set manifest_config "$MANIFEST_CONFIG"
+  state_set overlay_diff_template "$OVERLAY_DIFF_TEMPLATE"
+  state_set builder_diff_template "$BUILDER_DIFF_TEMPLATE"
   state_set nfs_dir "$NFS_DIR"
   state_set remote_snapshot_parent "$REMOTE_SNAPSHOT_PARENT"
   state_set api_port "$API_PORT"
