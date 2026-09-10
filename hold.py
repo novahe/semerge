@@ -6,11 +6,12 @@
   ./hold.py openclaw-e2b-ws-balloon-q2-template.id
   ./hold.py e2b-snp-ZmlsZTovL...
 
-输出 sid 与现成的 proxy curl / SDK 连接命令，方便另开终端观测（debug_cold7s.py、
+输出 sid 与现成的 sandbox-ctl TTY exec / proxy curl / SDK 连接命令，方便另开终端观测（debug_cold7s.py、
 runner.log、guest 内 /tmp/gw.log 等）。沙箱空闲回收放宽到 1h；
 create 成功后任何路径退出（含崩溃）都会清理。
 """
 import os
+import shlex
 import signal
 import sys
 import time
@@ -23,6 +24,28 @@ e2b_env.load(os.environ.get("E2B_ENV_FILE")
              or "/root/sandbox/nova-work/etc/node-ctl-nova/tenant.env")
 
 HOLD_TIMEOUT = 3600  # 沙箱空闲回收上限（秒）
+
+
+def resolve_run_root():
+    """Resolve the node-local run root used by sandbox-ctl's ctl.sock."""
+    # Prefer an explicit CLI-compatible override.  E2B_RUN_ROOT is retained
+    # for older/local deployments that already export it in their env file.
+    configured = os.environ.get("SANDBOX_RUN_ROOT") or os.environ.get("E2B_RUN_ROOT")
+    if configured:
+        return configured
+
+    # Namespace deployments commonly put per-sandbox state under a nested
+    # `sandboxes` directory (older deployments used the namespace root
+    # directly).  The tenant domain is available after e2b_env.load().
+    domain = os.environ.get("E2B_DOMAIN", "")
+    if domain.startswith("sandboxes.") and domain.endswith(".local"):
+        namespace = domain[len("sandboxes."):-len(".local")]
+        if namespace:
+            nested = f"/run/sandbox-{namespace}/sandboxes"
+            if os.path.isdir(nested):
+                return nested
+            return f"/run/sandbox-{namespace}"
+    return "/run/sandbox"
 
 
 def resolve_template(arg):
@@ -48,6 +71,12 @@ def main():
     sys.stdout.flush()
 
     try:
+        run_root = resolve_run_root()
+        ctl = os.environ.get("SANDBOX_CTL", "sandbox-ctl")
+        exec_cmd = [ctl, "exec", "--sandbox-id", sid,
+                    "--run-root", run_root, "--tty", "--", "/bin/bash"]
+        print(f"  TTY exec : {shlex.join(exec_cmd)}")
+        print("              （需在承载该 sandbox 的 node 上执行；退出 shell 不会删除 sandbox）")
         print(f"  经 proxy : curl --noproxy '*' -s -o /dev/null "
               f"-w '%{{http_code}} %{{time_total}}s' --cacert $SSL_CERT_FILE \\")
         print(f"      -H 'E2b-Sandbox-Id: {sid}' -H 'E2b-Sandbox-Port: 18789' "
