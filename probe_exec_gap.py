@@ -5,7 +5,8 @@ v1 教训:envd /health 答的是 204(非 200),判定错导致 2×30s 假超时;
 晚发 commands.run 只要 ~1s。本版:
   1) running 时刻立即 commands.run → t_cmd1(复现 ~2.9s?)
   2) 同沙箱紧接第二条 → t_cmd2(暖命令对照)
-  3) 期间 5ms 轮询 envd.sock /health 的状态码序列,看 204 之外有没有跳变
+  3) 命令前后各采一次 envd.sock /health 状态码(确认全程 204=envd 活着,
+     不是重启/跳变;两次采样之间不做轮询,避免抢 exec 的 CPU)
   4) 第二个沙箱:running 后先 sleep 3s 再发命令 → 区分"envd 慢热"vs"首命令固定成本"
 """
 import os

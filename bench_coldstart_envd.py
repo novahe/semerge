@@ -12,12 +12,17 @@ vda RO=1 + vdb RW),非双盘直接报错退出。
 恢复路径内核不重新引导,无 kernel_init 阶段)。两条路径的模板 id 由
 resolve_template 自动识别(-img-/-snp-)。
 
-每轮拆解(冒烟实测口径,2026-11-03):
+每轮拆解(2026-11-03 修正 exec 锚点):
   t0 → Sandbox.create(模板) → t1   create_ms = SDK 建沙箱耗时。本栈 POST /sandboxes
                                     在 admission 即返回,SDK 2.x create 不等 envd——
                                     实测仅 ~5ms,冷启动等待不在此段
-  t1 → commands.run(cmd) → t2       exec_ms  = envd 首命令耗时,含 envd 就绪等待+
-                                    connect 建立——冷启动大头落在此段(冒烟 ~190ms)
+  (--breakdown:t1 → 10ms 轮询 state=running → 计 launch_wait_ms)
+  t_exec0 → commands.run(cmd) → t2  exec_ms = 命令发出→返回。锚点=发出时刻:
+                                    breakdown 下(running 后才发)= 纯首命令耗时;
+                                    非 breakdown 下 create 完即发,node proxy 对
+                                    Starting 沙箱会 parking 请求(proxyshm
+                                    ActivateRoute,park_timeout 默认 30s)再放行,
+                                    exec_ms 因此含剩余启动等待,勿当纯命令耗时读
   e2e_ms = t2 - t0                  事务完成 = cmd 成功(exit 0)= 用户场景口径
   launch_ms = GET /sandboxes/{sid} 的服务端精确 boot 耗时(需 timing patch,
               拿不到记 null,不影响样本)
@@ -322,16 +327,21 @@ def one_sample(index, template, cmd, breakdown=False):
 
         if breakdown:
             wait_ms, state, polls = wait_state_running(sample["sid"])
-            t1b = time.perf_counter()
             sample["launch_wait_ms"] = wait_ms
             sample["launch_polls"] = polls
             if state != "running":
                 sample["error"] = f"launch 未达 running(state={state})"
                 return sample
 
+        # exec 计时锚点 = commands.run 真正发出的时刻(修复:此前锚在 t1,
+        # breakdown 下 launch_wait 轮询被混进 exec_ms,汇总再靠
+        # exec−launch_wait 相减还原,轮询后算的 t1b 是死变量)。
+        # 两种模式的语义差异见文件头:非 breakdown 下 proxy parking 会让
+        # exec_ms 含启动等待——那是特性(= e2e−create),不是锚点错。
+        t_exec0 = time.perf_counter()
         result = sandbox.commands.run(cmd, user="root", cwd="/", timeout=60)
         t2 = time.perf_counter()
-        sample["exec_ms"] = round((t2 - t1) * 1000, 1)
+        sample["exec_ms"] = round((t2 - t_exec0) * 1000, 1)
         sample["e2e_ms"] = round((t2 - t0) * 1000, 1)
         sample["exit_code"] = result.exit_code
         if result.exit_code != 0:
@@ -462,9 +472,9 @@ def main():
     if args.breakdown:
         waits = [s["launch_wait_ms"] for s in ok if "launch_wait_ms" in s]
         result["launch_wait_ms"] = stats(waits)
-        result["exec_after_launch_ms"] = stats(
-            [round(s["exec_ms"] - s["launch_wait_ms"], 1)
-             for s in ok if "launch_wait_ms" in s])
+        # exec_ms 已锚在命令发出时刻(running 之后),本身就是 running 后首命令
+        # 耗时;保留 exec_after_launch_ms 键名仅为兼容既有报告,与 exec_ms 同值
+        result["exec_after_launch_ms"] = result["exec_ms"]
     if not args.no_server:
         for key in ("node_ctl_ms", "sandbox_ctl_ms", "sandbox_init_ms",
                     "runner_pre_ms", "vm_entry_ms", "kernel_boot_ms",
