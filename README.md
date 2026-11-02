@@ -352,60 +352,32 @@ build_bw_code_interpreter.py：
 | RUN_TIMEOUT | 60 | 单次 `commands.run` 或 `run_code` 执行超时秒数 |
 | BRIDGE_READY_TIMEOUT | 120 | 49999/health readiness 等待秒数 |
 
-## coldstart-envd 基准（bench_coldstart_envd.py）
+## coldstart 冷启动实验
 
-单模板冷启动事务基准：e2b create → envd 首命令 `true` 返回成功 = 一次。
-**默认走真·冷启动**（manifest KEY → `e2b-img-<b64>` 模板，内核真正重新引导，
-= build_bw 快照 pause 前的流程）。不启动 openclaw gateway。开班自动做一次不计时的
-lsblk 双盘检查（vda RO base + vdb RW overlay，`--no-check` 跳过）。
+bench、日志切分、单位/阶段口径、三组资源对照和历史统计统一放在
+[`cold_start/`](cold_start/README.md)，完整复现步骤见
+[`cold_start/EXPERIMENT.md`](cold_start/EXPERIMENT.md)。
 
-~~~bash
-python3 bench_coldstart_envd.py                # openclaw manifest 冷启 × 10
-python3 bench_coldstart_envd.py -n 50 -c 10    # 并发 10
-python3 bench_coldstart_envd.py --breakdown    # 拆 launch_wait(服务端启动) vs envd 首命令
-~~~
+```bash
+python3 cold_start/bench.py -n 10 --label baseline --out cold_start/results/baseline
+python3 cold_start/split_logs.py --input cold_start/results/baseline --out cold_start/results/recomputed
+```
 
-计时口径：POST /sandboxes 在 admission 即返回（create_ms 仅数 ms）；`--breakdown`
-用 10ms 轮询 state=running（见 dead/404 即断）拆出 launch_wait_ms 与
-exec_after_launch_ms。每样本后只读解析 conductor.log（launch phase 埋点）+
-journal（`-o json` µs 时间轴；v0.1.10 起标识是裸 sandbox-ctl/console，pid 在 _PID）
-输出服务端分段，并把该沙箱的 journal 切片落盘 `journal-<i>-<sid8>.log` 供离线分析。
-envd 命令需 `user="root", cwd="/"`（openclaw 镜像无 `user` 账号与 /home/user）。
+输出七项阶段及子阶段的 `n / min / p50 / p90 / p95 / max / avg`，包含 JSON、CSV、
+Markdown 与原始 journal。只改 startup 的优化对照由 `--compare` 自动输出变化率。
+缺测不补零，旧 exec 口径和不闭合的计时会报错。
 
-**v0.1.10 基线（2026-11-03，release-v0.1.10 全栈，openclaw 双盘）**：
-
-| 路径 | e2e p50 | 拆分 |
-|---|---|---|
-| img 真冷启（n=10） | ~3442ms | create 5.3 + launch_wait 840（node_ctl 8 + runner_pre 55 + **vm_entry 470** + kernel_boot 50 + guest_init 190 + envd 40）+ **exec_after_launch ~2500（envd 首命令冷缺页）** |
-
-分段语义：runner_pre = ctl 起进程→CH spawn（manifest fetch）；
-vm_entry = CH spawn→`Run /sbin/init`（VM 固件/内核解压/早期引导）；
-kernel_boot = 首条 console→/sbin/init；guest_init = /sbin/init→app fork
-（sandbox-init overlay 组装，单次观测 vdb ext4 mount ~186ms）。
-
-**大头归因（exec_after_launch ~2.5s，2026-11-03 实测链 + 代码坐实）**：envd 全程应答
-/health 204；running 后等 3s 再发首命令依旧 ~2.4s；同沙箱第二命令仅 15ms；
-HTTP 层 40ms 即 200，耗时在响应流收尾；guest 侧 sandbox-init 日志显示首命令
-envd 会话 T+316→T+3246ms；窗口内 [lazy] 遥测 uffd ~4000 fault/s、pgin ~32k 页/s
-而 blk0 仅 0.8MB/s。表层机制=冷内存首触换页（零页/CoW，非磁盘）；**深层原因
-（2026-11-03 代码级确认）=启动期 balloon 大规模回收风暴与 fault 同锁串行**：
-默认配置开机要求 balloon 充入 ~7GiB，guest 释放产生 26-28 万次 uffd
-EVENT_REMOVE，sandbox-ctl 的 reader 在全局 installMu 内逐批处理 REMOVE
-（pkg/uffd/handler.go drain/dispatchRelease，"before any installer can
-proceed"），首命令的 zeropage fault 排在后面——fault_queue_wait p50 ~12ms
-即此排队。本栈沙箱配置即风暴条件：capacity 8GiB / allocatable 256MiB /
-startup 1GiB（开机充 7GiB）。旁证：startup 改 8GiB（充入量骤减，REMOVE ~1.6 万）
-首命令 195ms，allocatable 也 8GiB（几乎无回收，REMOVE=2）82ms。
-
-逐步复现（环境前置 / img 冷启 / 归因探针 / journal 手工核对 /
-优化修改点验证）见 `docs/coldstart-envd-repro-2026-11-03.md`。
+注意：`fault_queue_wait_p50` 原始单位为 ns，12045ns 约为 12µs，不是 12ms。
+startup/balloon 对照已测到显著效果，但尚未测出 REMOVE、锁竞争、guest 文件页等待
+各自的独占耗时；不再将“零页/CoW 为主、非文件读取路径”作为已证明结论。
 
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
 | bench.py | 执行 B/W 基准，支持 health、exec、command、code 探针 |
-| bench_coldstart_envd.py | 单模板冷启动 → envd 首命令事务基准（create→true 计时/拆解；默认 manifest 真冷启） |
+| [cold_start/](cold_start/README.md) | 冷启动 bench、离线日志切分、七项阶段统计与优化前后对照 |
+| bench_coldstart_envd.py | 旧基准兼容入口及 cold_start 使用的模板/环境辅助逻辑 |
 | probe_exec_gap.py | 冷启首命令 ~2.5s 黑盒归因探针（envd 204/二次命令对照） |
 | build_bw_coldboot.py | 生成 openclaw e2b/bare B/W 快照 |
 | build_bw_code_interpreter.py | 从 manifest 生成 code-interpreter e2b B/W 快照 |
