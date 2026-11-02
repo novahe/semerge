@@ -2,10 +2,15 @@
 """bench_coldstart_envd.py — openclaw 冷启动 → envd 首命令(true) 事务基准。
 
 场景(2026-11-03 新增):e2b create 一个沙箱(**双盘模式**:vda 只读 base erofs
-+ vdb RW overlay diff;默认 openclaw32-e2b-snp 冷模板,overlay 32GiB,与产线
-overlay-32G 形态一致,drop-caches=true)+ 调用 envd 执行 `true` 返回成功
-(exit 0)= 完成一次;后续冷启动耗时优化以此为准。开班先做一次不计时的
-磁盘形态检查(lsblk 应见 vda RO=1 + vdb RW),非双盘直接报错退出。
++ vdb RW overlay diff)+ 调用 envd 执行 `true` 返回成功(exit 0)= 完成一次;
+后续冷启动耗时优化以此为准。开班先做一次不计时的磁盘形态检查(lsblk 应见
+vda RO=1 + vdb RW),非双盘直接报错退出。
+
+默认走**真·冷启动**路径:模板 id = `e2b-img-<b64url("manifest://KEY")>`
+(manifest 直接冷启,内核真正重新引导,= build_bw_coldboot 快照 pause 前的
+流程),KEY 默认 openclaw 镜像。`--template` 可换 snp 快照模板做对照(快照
+恢复路径内核不重新引导,无 kernel_init 阶段)。两条路径的模板 id 由
+resolve_template 自动识别(-img-/-snp-)。
 
 每轮拆解(冒烟实测口径,2026-11-03):
   t0 → Sandbox.create(模板) → t1   create_ms = SDK 建沙箱耗时。本栈 POST /sandboxes
@@ -23,10 +28,10 @@ endAt 秒数】且缺省只发 300s——样本即起即删 300s 足够,勿当�
 commands.run 的 timeout 才是客户端超时。
 
 用法:
-  python3 bench_coldstart_envd.py                             # openclaw32-e2b-snp × 10
+  python3 bench_coldstart_envd.py                             # openclaw manifest 冷启 × 10
   python3 bench_coldstart_envd.py -n 50 -c 10                 # 50 样本,并发 10
   python3 bench_coldstart_envd.py --breakdown                 # 拆 launch_wait vs envd 首命令
-  python3 bench_coldstart_envd.py --template openclaw32-e2b-ws-template.id # 暖模板对照
+  python3 bench_coldstart_envd.py --template openclaw32-e2b-snp-template.id # 快照恢复对照
   python3 bench_coldstart_envd.py --cmd 'uname -a'            # 换首命令
 
 结果:repro-results/coldstart-envd-<ts>/{samples.jsonl,result.json}
@@ -37,6 +42,7 @@ exec_after_launch_ms ≈ 该固定成本 + envd 真实执行,launch_wait_ms ≈ 
 启动/恢复耗时。两段分别对应数据面与 runtime 侧的优化方向。
 """
 import argparse
+import base64
 import json
 import os
 import re
@@ -49,6 +55,12 @@ from datetime import datetime
 
 import e2b_env
 
+# 默认钉到 nova 租户:仓库根 e2b-env.sh 是 10 月的老 demo 环境(:4443,
+# 指向已删目录 e2b-bench-file-bare),漏设 E2B_ENV_FILE 时会让 SDK 报
+# "No CA certificates were loaded from the system"。
+NOVA_TENANT_ENV = "/root/sandbox/nova-work/etc/node-ctl-nova/tenant.env"
+if not os.environ.get("E2B_ENV_FILE") and os.path.isfile(NOVA_TENANT_ENV):
+    os.environ["E2B_ENV_FILE"] = NOVA_TENANT_ENV
 e2b_env.load()
 e2b_env.require("E2B_DOMAIN", "E2B_API_KEY", "SSL_CERT_FILE")
 
@@ -56,8 +68,18 @@ import bench  # noqa: E402  复用 _delete_sandbox/cleanup_sandbox_directories/w
 from e2b import Sandbox  # noqa: E402
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_TEMPLATE_FILE = "openclaw32-e2b-snp-template.id"  # 双盘:vda RO base + vdb 32G RW overlay
+DEFAULT_TEMPLATE_FILE = "openclaw32-e2b-snp-template.id"  # 快照恢复对照模板(-template 指定)
+DEFAULT_MANIFEST_KEY = "7e78b050c65691f01b3aed6eb593f00f2286b7c08aa4dd84e3b1fd823a66ba20"  # openclaw
 CONDUCTOR_LOG = "/root/sandbox/nova-work/var/lib/logs/conductor.log"
+DEAD_STATES = {"dead", "failed", "error", "exited"}  # wait_state_running 见到即断,不再傻等
+
+
+def manifest_template(key, profile="e2b"):
+    """manifest KEY → 真冷启模板 id:<profile>-img-<b64url("manifest://KEY")>。
+    与 build_bw_coldboot.py 的 tid 构造完全一致。"""
+    ref = "manifest://" + key.removeprefix("manifest://")
+    enc = base64.urlsafe_b64encode(ref.encode()).decode().rstrip("=")
+    return f"{profile}-img-{enc}"
 
 
 def _conductor_sid_lines(sid):
@@ -76,7 +98,7 @@ def _dur_to_ms(value, unit):
     return v / 1000.0 if unit == "µs" else (v * 1000.0 if unit == "s" else v)
 
 
-def server_phases(sid, since, until):
+def server_phases(sid, since, until, journal_dump=None):
     """样本完成后只读抽取该 sid 的服务端分阶段耗时(不影响事务计时)。
 
     conductor.log『sandbox launch phase』给 node-ctl 侧各段与 runtime_ready/envd_init;
@@ -86,7 +108,9 @@ def server_phases(sid, since, until):
       sandbox_init_ms   = restore notify ack 时长(VM resume→guest 握手完成)
       sandbox_ctl_ms    = runtime_ready − sandbox_init(runner 侧:进程起/manifest/
                           CH spawn/uffd/vhost;与 node-ctl prepare 部分并行)
-      kernel_init       = 快照恢复路径下不存在(内核不重新引导,vCPU 直接 resume)
+      kernel_init       = 快照恢复路径下不存在(vCPU 直接 resume);真冷启
+                          (img)路径 = console 首条用户态行 − 首条内核行
+      (img 路径另有 runner_pre / vm_entry / guest_ready 三个 journal 派生段)
       envd_ms           = envd_init_duration
     """
     out = {}
@@ -111,33 +135,87 @@ def server_phases(sid, since, until):
         out["envd_ms"] = round(phases.get("envd_init_duration", 0), 1)
         out["server_total_ms"] = round(phases.get("terminal_total", 0), 1)
 
+    def _journal_rows():
+        try:
+            r = subprocess.run(["journalctl", "--since", since, "--until", until,
+                                "--no-pager", "-o", "json"],
+                               capture_output=True, text=True, timeout=30)
+            rows = []
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+            return rows
+        except Exception:
+            return []
+
     try:
-        # journald 有秒级可见性延迟:沙箱刚 kill 完立刻查可能拿不到,带重试
+        # journald 有秒级可见性延迟:沙箱刚 kill 完立刻查可能拿不到,带重试。
+        # v0.1.10 起标识是裸 sandbox-ctl / console(pid 在 _PID 字段),
+        # sid 只出现在部分消息里(如 CH args 的 socket 路径)→ 先定位 pid。
         for attempt in range(5):
-            j = subprocess.run(["journalctl", "--since", since, "--until", until,
-                                "--no-pager"], capture_output=True, text=True,
-                               timeout=30).stdout
+            rows = _journal_rows()
             pid = None
-            for line in j.splitlines():
-                if sid in line:
-                    m = re.search(r'sandbox-ctl\[(\d+)\]', line)
-                    if m:
-                        pid = m.group(1)
+            for row in rows:
+                if sid in (row.get("MESSAGE") or "") \
+                        and row.get("SYSLOG_IDENTIFIER") == "sandbox-ctl":
+                    pid = str(row.get("_PID") or "")
+                    if pid:
                         break
+            if not pid:
+                if attempt < 4:
+                    time.sleep(1.5)
+                continue
+            ctl, con = [], []
+            for row in rows:
+                ident = row.get("SYSLOG_IDENTIFIER") or ""
+                msg = row.get("MESSAGE") or ""
+                ts_us = row.get("__REALTIME_TIMESTAMP")
+                if not ts_us or str(row.get("_PID") or "") != pid:
+                    continue
+                if ident == "sandbox-ctl":
+                    ctl.append((int(ts_us), msg))
+                elif ident == "console":
+                    con.append((int(ts_us), msg))
+            ctl.sort(key=lambda x: x[0])
+            con.sort(key=lambda x: x[0])
+            if journal_dump and (ctl or con):
+                with open(journal_dump, "w") as f:
+                    for ts, msg in ctl + con:
+                        t = datetime.fromtimestamp(ts / 1e6).strftime("%H:%M:%S.%f")
+                        f.write(f"{t} {msg[:500]}\n")
             ack_us = None
-            if pid:
-                for line in j.splitlines():
-                    if f"[{pid}]" not in line:
-                        continue
-                    m = re.search(r'restore notify acked in (\d+)µs', line)
-                    if m:
-                        ack_us = int(m.group(1))
-                        break
-            if ack_us is not None:
-                out["sandbox_init_ms"] = round(ack_us / 1000.0, 1)
-                rr = phases.get("runtime_ready_duration")
-                if rr:
-                    out["sandbox_ctl_ms"] = round(rr - ack_us / 1000.0, 1)
+            for _, msg in ctl:
+                m = re.search(r"restore notify acked in (\d+)µs", msg)
+                if m:
+                    ack_us = int(m.group(1))
+                    break
+            ch_spawn = next((ts for ts, msg in ctl if "CH started pid=" in msg), None)
+            first_con = con[0][0] if con else None
+            init_start = next((ts for ts, msg in con
+                               if "Run /sbin/init as init process" in msg), None)
+            app_started = next((ts for ts, msg in ctl
+                                if "launch: app_started" in msg), None)
+            have_snp = ack_us is not None
+            have_img = ch_spawn is not None and init_start is not None
+            if have_snp or have_img:
+                if have_snp:  # 快照恢复路径:guest 握手 ack 即 sandbox-init
+                    out["sandbox_init_ms"] = round(ack_us / 1000.0, 1)
+                    rr = phases.get("runtime_ready_duration")
+                    if rr:
+                        out["sandbox_ctl_ms"] = round(rr - ack_us / 1000.0, 1)
+                else:  # 真冷启路径:按 journal µs 时间轴切 VM/内核/sandbox-init
+                    ctl_first = ctl[0][0]
+                    out["runner_pre_ms"] = round((ch_spawn - ctl_first) / 1000.0, 1)
+                    out["vm_entry_ms"] = round((init_start - ch_spawn) / 1000.0, 1)
+                    if first_con is not None:
+                        out["kernel_boot_ms"] = round((init_start - first_con) / 1000.0, 1)
+                    if app_started is not None:
+                        out["guest_init_ms"] = round((app_started - init_start) / 1000.0, 1)
                 break
             if attempt < 4:
                 time.sleep(1.5)
@@ -173,10 +251,14 @@ def check_dual_disk(template):
 
 
 def resolve_template(name):
-    """模板参数可以是 .id 文件名(仓库惯例)或完整模板 id。"""
+    """模板参数可以是 .id 文件名(仓库惯例)、64-hex manifest KEY、
+    manifest://KEY 前缀、或完整模板 id;KEY 自动编码成真冷启 img 模板。"""
     path = os.path.join(PARENT, name)
     if os.path.isfile(path):
         return open(path).read().strip()
+    key = name.removeprefix("manifest://")
+    if re.fullmatch(r"[0-9a-fA-F]{64}", key):
+        return manifest_template(key)
     return name
 
 
@@ -205,7 +287,8 @@ def stats(values):
 def wait_state_running(sid, timeout=60, interval=0.01):
     """轮询 GET /sandboxes/{sid} 到 state=running(--breakdown 用)。
     返回 (elapsed_ms, state, polls);10ms 粒度,把 exec 段拆成
-    『服务端 launch 完成』+『envd 首命令(含 SDK connect+数据面固定成本)』。"""
+    『服务端 launch 完成』+『envd 首命令(含 SDK connect+数据面固定成本)』。
+    见到 dead/failed 等终态立即返回,不烧满 timeout。"""
     start = time.perf_counter()
     polls, state = 0, None
     while time.perf_counter() - start < timeout:
@@ -214,8 +297,11 @@ def wait_state_running(sid, timeout=60, interval=0.01):
             r = e2b_env.api_request("GET", f"/sandboxes/{sid}", timeout=5)
             if r.status_code == 200:
                 state = r.json().get("state")
-                if state == "running":
+                if state == "running" or state in DEAD_STATES:
                     break
+            elif r.status_code == 404:
+                state = "404"
+                break
         except Exception:
             pass
         time.sleep(interval)
@@ -274,8 +360,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-n", "--samples", type=int, default=10, help="样本数(默认 10)")
     ap.add_argument("-c", "--concurrency", type=int, default=1, help="并发(默认 1)")
-    ap.add_argument("--template", default=DEFAULT_TEMPLATE_FILE,
-                    help=f"模板 .id 文件或完整 id(默认 {DEFAULT_TEMPLATE_FILE})")
+    ap.add_argument("--template", default=DEFAULT_MANIFEST_KEY,
+                    help=f"模板 .id 文件/完整 id/64-hex manifest KEY(默认 openclaw "
+                         f"manifest KEY → 真冷启 e2b-img- 模板;对照实验传 "
+                         f"{DEFAULT_TEMPLATE_FILE})")
     ap.add_argument("--cmd", default="true", help="envd 首命令(默认 true)")
     ap.add_argument("--no-check", action="store_true",
                     help="跳过开班双盘检查(默认先做一次不计时的 create+lsblk 验证)")
@@ -306,7 +394,9 @@ def main():
             if not args.no_server and s["sid"]:
                 s["server"] = server_phases(
                     s["sid"], s["wall_start"],
-                    datetime.now().isoformat(timespec="seconds"))
+                    datetime.now().isoformat(timespec="seconds"),
+                    journal_dump=os.path.join(
+                        outdir, f"journal-{s['i']}-{s['sid'][:8]}.log"))
             samples.append(s)
             with open(os.path.join(outdir, "samples.jsonl"), "a") as f:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
@@ -323,11 +413,17 @@ def main():
             print(line, flush=True)
             srv = s.get("server") or {}
             if srv:
-                print(f"      server: node_ctl={srv.get('node_ctl_ms')}"
-                      f" sandbox_ctl={srv.get('sandbox_ctl_ms')}"
-                      f" sandbox_init={srv.get('sandbox_init_ms')}"
-                      f" envd={srv.get('envd_ms')}"
-                      f" total={srv.get('server_total_ms')}", flush=True)
+                parts = [f"node_ctl={srv.get('node_ctl_ms')}",
+                         f"sandbox_ctl={srv.get('sandbox_ctl_ms')}",
+                         f"sandbox_init={srv.get('sandbox_init_ms')}"]
+                if "guest_init_ms" in srv:  # img 真冷启路径的内核时间轴
+                    parts += [f"runner_pre={srv.get('runner_pre_ms')}",
+                              f"vm_entry={srv.get('vm_entry_ms')}",
+                              f"kernel_boot={srv.get('kernel_boot_ms')}",
+                              f"guest_init={srv.get('guest_init_ms')}"]
+                parts += [f"envd={srv.get('envd_ms')}",
+                          f"total={srv.get('server_total_ms')}"]
+                print("      server: " + " ".join(parts), flush=True)
 
     # 收尾补齐:conductor 写缓冲/journald 延迟可能导致个别样本缺键,统一重抽后重写 jsonl
     if not args.no_server:
@@ -371,7 +467,8 @@ def main():
              for s in ok if "launch_wait_ms" in s])
     if not args.no_server:
         for key in ("node_ctl_ms", "sandbox_ctl_ms", "sandbox_init_ms",
-                    "envd_ms", "server_total_ms"):
+                    "runner_pre_ms", "vm_entry_ms", "kernel_boot_ms",
+                    "guest_init_ms", "envd_ms", "server_total_ms"):
             vals = [s["server"][key] for s in ok
                     if s.get("server") and s["server"].get(key) is not None]
             if vals:
