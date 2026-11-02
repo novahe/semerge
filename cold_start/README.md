@@ -16,6 +16,8 @@ cold_start/
 
 复现三组资源配置、历史实测和未完成边界见 [EXPERIMENT.md](EXPERIMENT.md)；可核对的历史汇总在 `examples/`。
 
+已完成的 balloon/零页预填 PoC、四组各 10 次分布和验证结果见 [BALLOON_POC.md](BALLOON_POC.md)，补丁与复现命令见 [poc/README.md](poc/README.md)。源码分析与正确性约束见 [BALLOON_OPTIMIZATION.md](BALLOON_OPTIMIZATION.md)。
+
 脚本沿用 `bench_coldstart_envd.py` 的环境加载器和 manifest 模板解析。默认使用 Nova tenant.env；如需其他租户，显式设置 `E2B_ENV_FILE`。仅本进程将租户域名加入大小写 no_proxy，避免 requests 状态轮询走外部代理。需要能读取节点的 conductor.log 和 journal。
 
 ## 一次运行拿到七项耗时

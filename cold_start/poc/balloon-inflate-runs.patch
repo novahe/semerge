@@ -1,0 +1,273 @@
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index 2cfed19..aa62a9e 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -58,6 +58,39 @@ const REPORTING_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+ // Size of a PFN in the balloon interface.
+ const VIRTIO_BALLOON_PFN_SHIFT: u64 = 12;
+ 
++// Bound logical release publication and keep temporary state constant-sized.
++const MAX_INFLATE_RUN_BYTES: usize = 256 << VIRTIO_BALLOON_PFN_SHIFT;
++
++#[derive(Debug)]
++struct InflateRun {
++    base: GuestAddress,
++    len: usize,
++    region_start: GuestAddress,
++}
++
++impl InflateRun {
++    fn new(base: GuestAddress, region_start: GuestAddress) -> Self {
++        Self { base, len: 1 << VIRTIO_BALLOON_PFN_SHIFT, region_start }
++    }
++
++    fn extend(&mut self, base: GuestAddress, region_start: GuestAddress) -> bool {
++        let page = 1 << VIRTIO_BALLOON_PFN_SHIFT;
++        if self.region_start != region_start || self.len >= MAX_INFLATE_RUN_BYTES {
++            return false;
++        }
++        if self.base.checked_add(self.len as u64) == Some(base) {
++            self.len += page;
++            return true;
++        }
++        if base.checked_add(page as u64) == Some(self.base) {
++            self.base = base;
++            self.len += page;
++            return true;
++        }
++        false
++    }
++}
++
+ // Deflate balloon on OOM
+ const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u64 = 2;
+ // Enable an additional virtqueue to let the guest notify the host about free
+@@ -276,6 +309,41 @@ impl BalloonEpollHandler {
+         Ok(())
+     }
+ 
++    fn flush_inflate_run(
++        memory: &GuestMemoryMmap,
++        pending: &mut Option<InflateRun>,
++    ) -> result::Result<(), Error> {
++        if let Some(run) = pending.take() {
++            Self::release_memory_range(memory, run.base, run.len)?;
++        }
++        Ok(())
++    }
++
++    fn release_inflate_pfn(
++        pbp: &mut Option<PartiallyBalloonedPage>,
++        pending: &mut Option<InflateRun>,
++        memory: &GuestMemoryMmap,
++        pfn: u32,
++    ) -> result::Result<(), Error> {
++        // A larger host page may contain PFNs the guest has not returned.
++        // Preserve its existing partial-page ownership tracking unchanged.
++        if get_page_size() != 1 << VIRTIO_BALLOON_PFN_SHIFT {
++            return Self::release_memory_range_4k(pbp, memory, pfn);
++        }
++        let base = GuestAddress((pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT);
++        let region = memory.find_region(base).ok_or(Error::GuestMemory(
++            GuestMemoryError::InvalidGuestAddress(base),
++        ))?;
++        if let Some(run) = pending.as_mut()
++            && run.extend(base, region.start_addr())
++        {
++            return Ok(());
++        }
++        Self::flush_inflate_run(memory, pending)?;
++        *pending = Some(InflateRun::new(base, region.start_addr()));
++        Ok(())
++    }
++
+     fn process_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
+         let mut used_descs = false;
+         while let Some(mut desc_chain) =
+@@ -296,6 +364,7 @@ impl BalloonEpollHandler {
+             }
+ 
+             let mut offset = 0u64;
++            let mut inflate_run = None;
+             while offset < desc.len() as u64 {
+                 let addr = desc.addr().checked_add(offset).unwrap();
+                 let pfn: u32 = desc_chain
+@@ -306,7 +375,9 @@ impl BalloonEpollHandler {
+ 
+                 match queue_index {
+                     0 => {
+-                        Self::release_memory_range_4k(&mut self.pbp, desc_chain.memory(), pfn)?;
++                        Self::release_inflate_pfn(
++                            &mut self.pbp, &mut inflate_run, desc_chain.memory(), pfn,
++                        )?;
+                     }
+                     1 => {
+                         let page_size = get_page_size() as usize;
+@@ -323,6 +394,9 @@ impl BalloonEpollHandler {
+                 }
+             }
+ 
++            // Never acknowledge a descriptor before all its release ranges
++            // have completed, and never retain them across descriptors.
++            Self::flush_inflate_run(desc_chain.memory(), &mut inflate_run)?;
+             self.queues[queue_index]
+                 .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
+                 .map_err(Error::QueueAddUsed)?;
+@@ -703,6 +777,29 @@ mod release_tests {
+     use std::os::fd::FromRawFd;
+     use vm_memory::FileOffset;
+ 
++    #[test]
++    fn test_inflate_run_contiguity_and_ownership() {
++        let page = 4096;
++        let mut run = InflateRun::new(GuestAddress(2 * page), GuestAddress(0));
++        assert!(run.extend(GuestAddress(3 * page), GuestAddress(0)));
++        assert!(run.extend(GuestAddress(page), GuestAddress(0)));
++        assert_eq!(run.base, GuestAddress(page));
++        assert_eq!(run.len, 3 * page as usize);
++        assert!(!run.extend(GuestAddress(3 * page), GuestAddress(0))); // duplicate
++        assert!(!run.extend(GuestAddress(5 * page), GuestAddress(0))); // gap
++        assert!(!run.extend(GuestAddress(4 * page), GuestAddress(4 * page))); // new region
++    }
++
++    #[test]
++    fn test_inflate_run_is_bounded() {
++        let mut run = InflateRun::new(GuestAddress(0), GuestAddress(0));
++        for page in 1..256 {
++            assert!(run.extend(GuestAddress(page * 4096), GuestAddress(0)));
++        }
++        assert_eq!(run.len, MAX_INFLATE_RUN_BYTES);
++        assert!(!run.extend(GuestAddress(256 * 4096), GuestAddress(0)));
++    }
++
+     #[test]
+     fn test_release_empty_madvise_and_punch_error() {
+         // SAFETY: static NUL-terminated name, returned fd transferred once.
+@@ -746,17 +843,25 @@ mod release_tests {
+     #[ignore = "requires userfaultfd shmem MISSING and REMOVE"]
+     fn test_release_unmaterialized_source_with_real_uffd() {
+         for trailing_data in [false, true] {
+-            release_with_real_uffd(false, trailing_data);
++            release_with_real_uffd(false, trailing_data, false);
+         }
+     }
+ 
+     #[test]
+     #[ignore = "requires userfaultfd shmem MISSING and REMOVE"]
+     fn test_release_resident_source_with_real_uffd() {
+-        release_with_real_uffd(true, false);
++        release_with_real_uffd(true, false, false);
++    }
++
++    #[test]
++    fn test_batched_release_keeps_logical_remove_and_neighbor() {
++        if get_page_size() != 4096 { return; }
++        for resident in [false, true] {
++            release_with_real_uffd(resident, false, true);
++        }
+     }
+ 
+-    fn release_with_real_uffd(resident: bool, trailing_data: bool) {
++    fn release_with_real_uffd(resident: bool, trailing_data: bool, batched: bool) {
+         use std::sync::Arc;
+         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+         #[repr(C)]
+@@ -785,22 +890,24 @@ mod release_tests {
+         const REGISTER: libc::c_ulong = 0xc020_aa00;
+         const COPY: libc::c_ulong = 0xc028_aa03;
+         let page = get_page_size() as usize;
++        let release_len = if batched { 2 * page } else { page };
++        let memory_len = release_len + page;
+         let guest = GuestAddress(4 * page as u64);
+         // SAFETY: the static name is terminated; each returned fd has one owner.
+         let fd = unsafe { libc::memfd_create(c"balloon-uffd-release".as_ptr(), 0) };
+         assert!(fd >= 0);
+         let backing = unsafe { File::from_raw_fd(fd) };
+-        backing.set_len((3 * page) as u64).unwrap();
++        backing.set_len((memory_len + page) as u64).unwrap();
+         let mem = GuestMemoryMmap::from_ranges_with_files(&[(
+             guest,
+-            2 * page,
++            memory_len,
+             Some(FileOffset::new(backing, page as u64)),
+         )])
+         .unwrap();
+         // Test a nonzero backing offset, including SEEK_DATA succeeding only
+         // beyond the released range rather than returning ENXIO.
+         if trailing_data {
+-            mem.write_slice(&vec![0x77; page], guest.unchecked_add(page as u64))
++            mem.write_slice(&vec![0x77; page], guest.unchecked_add(release_len as u64))
+                 .unwrap();
+         }
+         let host = mem.get_host_address(guest).unwrap() as u64;
+@@ -822,7 +929,7 @@ mod release_tests {
+         );
+         let mut reg = Register {
+             start: host,
+-            len: (2 * page) as u64,
++            len: memory_len as u64,
+             mode: 1,
+             ioctls: 0,
+         };
+@@ -866,14 +973,14 @@ mod release_tests {
+                 match msg[0] {
+                     0x15 => {
+                         // UFFD_EVENT_REMOVE: range.start, range.end
+-                        assert_eq!((first, second), (host, host + page as u64));
++                        assert_eq!((first, second), (host, host + release_len as u64));
+                         worker_removed.fetch_add(1, Ordering::Release);
+                     }
+                     0x12 => {
+                         // UFFD_EVENT_PAGEFAULT: flags, address
+                         let dst = second & !((page as u64) - 1);
+-                        assert!(dst == host || dst == host + page as u64);
+-                        let zero = dst == host && worker_removed.load(Ordering::Acquire) > 0;
++                        assert!(dst >= host && dst < host + memory_len as u64);
++                        let zero = dst < host + release_len as u64 && worker_removed.load(Ordering::Acquire) > 0;
+                         let src = source
+                             .get_host_address(GuestAddress(if zero { 0 } else { page as u64 }))
+                             .unwrap() as u64;
+@@ -896,14 +1003,25 @@ mod release_tests {
+                 }
+             }
+         });
+-        let mut actual = vec![0u8; 2 * page];
++        let mut actual = vec![0u8; memory_len];
+         if resident {
+-            mem.read_slice(&mut actual[..page], guest).unwrap();
+-            assert!(actual[..page].iter().all(|b| *b == 0x77));
++            mem.read_slice(&mut actual[..release_len], guest).unwrap();
++            assert!(actual[..release_len].iter().all(|b| *b == 0x77));
+         }
+         // Inflate consumes 4 KiB PFNs even on hosts with a larger page size.
+         // Free-page reporting uses release_memory_range directly.
+-        let release = if trailing_data {
++        let release = if batched {
++            let mut partial = None;
++            let mut pending = None;
++            // Descending PFNs exercise prepend coalescing in the production path.
++            for offset in (0..release_len).step_by(4096).rev() {
++                BalloonEpollHandler::release_inflate_pfn(
++                    &mut partial, &mut pending, &mem,
++                    ((guest.0 + offset as u64) >> 12) as u32,
++                ).unwrap();
++            }
++            BalloonEpollHandler::flush_inflate_run(&mem, &mut pending)
++        } else if trailing_data {
+             BalloonEpollHandler::release_memory_range(&mem, guest, page)
+         } else {
+             let mut partial = None;
+@@ -929,11 +1047,11 @@ mod release_tests {
+             "sparse release lost REMOVE"
+         );
+         assert!(
+-            actual[..page].iter().all(|b| *b == 0),
++            actual[..release_len].iter().all(|b| *b == 0),
+             "released page resurrected its lazy source"
+         );
+         assert!(
+-            actual[page..].iter().all(|b| *b == 0x77),
++            actual[release_len..].iter().all(|b| *b == 0x77),
+             "release changed the neighboring page"
+         );
+     }

@@ -1,0 +1,2 @@
+# Unified diff context contains literal space/tab prefixes. Source worktrees are checked separately.
+*.patch -whitespace

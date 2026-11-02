@@ -1,0 +1,171 @@
+diff --git a/pkg/uffd/fault.go b/pkg/uffd/fault.go
+index 1f24d49..8043a65 100644
+--- a/pkg/uffd/fault.go
++++ b/pkg/uffd/fault.go
+@@ -102,10 +102,16 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+ }
+ 
+ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {
+-	// Check the common 64 KiB state boundary before resolving source metadata.
+-	// This rejects a stale Absent event without allocating a Run. ChunkRun alone
++	// Check the state boundary before resolving source metadata. Only the
++	// authoritative cold-start ZeroSource uses the larger speculative window.
++	maxFillBytes := uint64(ordinaryDataFaultFillBytes)
++	coldZero := isZeroSource(h.cfg.Source)
++	if coldZero {
++		maxFillBytes = coldZeroFaultFillBytes
++	}
++	// This rejects a stale Absent event without allocating a Run. ChunkRun
+ 	// performs a second, wider state scan after the single metadata lookup.
+-	commonHardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, ordinaryDataFaultFillBytes)
++	commonHardEnd := h.stateHardEnd(pageOffset, pageIdx, StateAbsent, maxFillBytes)
+ 	if commonHardEnd-pageOffset < PageSize {
+ 		// The fault was classified as Absent before entering this method,
+ 		// but a concurrent urgent or tail completion may have populated it
+@@ -122,8 +128,9 @@ func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint
+ 	}
+ 
+ 	// Cold-start memory is authoritative zero. Avoid constructing a sparse.Run
+-	// interface value on every fault and retain the same 1+15 page fill policy.
+-	if isZeroSource(h.cfg.Source) {
++	// interface value on every fault. The urgent page still completes first;
++	// only its best-effort tail can use the larger bounded window.
++	if coldZero {
+ 		h.handleResolvedZeroFault(uffdFD, pageVA, pageOffset, pageIdx, StateAbsent, commonHardEnd)
+ 		return
+ 	}
+@@ -523,8 +530,8 @@ func (h *Handler) urgentZeroLocked(fd int, dst uint64, pageIdx uint64, expected
+ 	return h.finishUrgent(fd, dst, pageIdx, expected, completed, err, zero)
+ }
+ 
+-// Bounded to the existing zero-tail policy, independent of guest RAM size.
+-var zeroScratch [zeroFaultFillBytes]byte
++// Bounded to the largest zero-tail policy, independent of guest RAM size.
++var zeroScratch [coldZeroFaultFillBytes]byte
+ 
+ func (h *Handler) finishUrgent(fd int, dst, pageIdx uint64, expected PageState, completed int64, ioctlErr error, zero bool) (urgentOutcome, error) {
+ 	done, err := checkedCompletion(completed, PageSize)
+@@ -685,6 +692,9 @@ func (h *Handler) processTail(task tailTask) {
+ 		maxTailBytes = ordinaryDataNeighborTailBytes
+ 	case tailZero:
+ 		maxTailBytes = zeroNeighborTailBytes
++		if task.expected == StateAbsent && isZeroSource(h.cfg.Source) {
++			maxTailBytes = coldZeroFaultFillBytes - PageSize
++		}
+ 	default:
+ 		return
+ 	}
+diff --git a/pkg/uffd/fault_test.go b/pkg/uffd/fault_test.go
+index 0aa2f29..5825586 100644
+--- a/pkg/uffd/fault_test.go
++++ b/pkg/uffd/fault_test.go
+@@ -647,6 +647,69 @@ func TestZeroTailStopsAtStateBoundary(t *testing.T) {
+ 	}
+ }
+ 
++func TestColdZeroTailUsesBoundedWindow(t *testing.T) {
++	for _, tt := range []struct {
++		name        string
++		pages       uint64
++		boundary    uint64
++		regionPages uint64
++		fallback    bool
++		wantPages   uint64
++	}{
++		{name: "full window", pages: 260, wantPages: 256},
++		{name: "RAM end", pages: 20, wantPages: 20},
++		{name: "loaded boundary", pages: 68, boundary: 40, wantPages: 40},
++		{name: "CH region boundary", pages: 68, regionPages: 32, wantPages: 32},
++		{name: "copy fallback", pages: 260, fallback: true, wantPages: 256},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			h := newUnitHandlerWithoutMap(t, tt.pages*PageSize, ZeroSource{})
++			regionPages := tt.pages
++			if tt.regionPages != 0 {
++				regionPages = tt.regionPages
++			}
++			if err := registerUnitRegion(h, ProcessCH, unitCHVA, regionPages*PageSize, 0); err != nil {
++				t.Fatal(err)
++			}
++			if tt.boundary != 0 {
++				h.state.Set(tt.boundary, StateLoaded)
++			}
++			ioctls := newFakeIoctls()
++			if tt.fallback {
++				ioctls.zeroHook = func(int, uint64, uint64) (int64, error) { return 0, unix.EOPNOTSUPP }
++			}
++			h.ops = ioctls.ops()
++			h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
++			startUnitTail(t, h)
++			waitUnitTail(t, h)
++			calls := ioctls.snapshot()
++			if tt.fallback {
++				filtered := calls[:0]
++				for _, call := range calls {
++					if call.kind == "copy" {
++						if !bytes.Equal(call.data, make([]byte, len(call.data))) {
++							t.Fatal("fallback copied nonzero bytes")
++						}
++						filtered = append(filtered, call)
++					}
++				}
++				calls = filtered
++			}
++			if len(calls) != 2 || calls[0].length != PageSize || calls[1].length != (tt.wantPages-1)*PageSize {
++				t.Fatalf("cold zero call count = %d, want 1+%d pages", len(calls), tt.wantPages-1)
++			}
++			for page := uint64(0); page < tt.wantPages; page++ {
++				if h.state.Get(page) != StateLoaded {
++					t.Fatalf("page %d not loaded", page)
++				}
++			}
++			if tt.wantPages < tt.pages && tt.wantPages != tt.boundary && h.state.Get(tt.wantPages) != StateAbsent {
++				t.Fatal("cold prefill crossed its bound")
++			}
++		})
++	}
++}
++
+ func TestZeroAndReleasedFaultsUseSerialZeroTail(t *testing.T) {
+ 	for _, tt := range []struct {
+ 		name     string
+@@ -657,7 +720,7 @@ func TestZeroAndReleasedFaultsUseSerialZeroTail(t *testing.T) {
+ 	} {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			const pages = 20
+-			h := newUnitHandler(t, pages*PageSize, ZeroSource{})
++			h := newUnitHandler(t, pages*PageSize, newRecordingSnapshot(pages*PageSize, sparse.Zero, 0))
+ 			if tt.expected == StateReleased {
+ 				h.state.SetRange(0, pages, StateReleased)
+ 			}
+@@ -955,7 +1018,7 @@ func TestDataTailCommitsPositivePartialPrefix(t *testing.T) {
+ 
+ func TestZeroTailCommitsPositivePartialPrefix(t *testing.T) {
+ 	const pages = 20
+-	h := newUnitHandler(t, pages*PageSize, ZeroSource{})
++	h := newUnitHandler(t, pages*PageSize, newRecordingSnapshot(pages*PageSize, sparse.Zero, 0))
+ 	ioctls := newFakeIoctls()
+ 	ioctls.zeroHook = func(_ int, dst, length uint64) (int64, error) {
+ 		if dst == unitCHVA+PageSize {
+diff --git a/pkg/uffd/handler.go b/pkg/uffd/handler.go
+index 3253152..4cdd8b5 100755
+--- a/pkg/uffd/handler.go
++++ b/pkg/uffd/handler.go
+@@ -27,11 +27,15 @@ const (
+ 	ordinaryDataNeighborTailBytes = ordinaryDataFaultFillBytes - PageSize
+ 
+ 	// zeroFaultFillBytes is the fixed total bound for Hole, Zero, and Released
+-	// runs. These paths issue no source read and use the same one-plus-fifteen
+-	// page wake/fill shape as ordinary Data.
++	// runs. These paths issue no source read; keep one urgent page and a
++	// bounded 15-page best-effort tail.
+ 	zeroFaultFillBytes    = 64 << 10
+ 	zeroNeighborTailBytes = zeroFaultFillBytes - PageSize
+ 
++	// Cold ZeroSource has no snapshot data to resolve. Keep its speculative
++	// zero population bounded independently of restored Hole/Zero runs.
++	coldZeroFaultFillBytes = 1024 << 10
++
+ 	// chunkFaultFillBytes caps one buffered ChunkRun read and its guest
+ 	// population. Current manifests use chunks no larger than 1 MiB. The
+ 	// final-visible window is independently clipped by PageState, RAM size, and
