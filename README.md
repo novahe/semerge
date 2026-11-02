@@ -356,15 +356,13 @@ build_bw_code_interpreter.py：
 
 单模板冷启动事务基准：e2b create → envd 首命令 `true` 返回成功 = 一次。
 **默认走真·冷启动**（manifest KEY → `e2b-img-<b64>` 模板，内核真正重新引导，
-= build_bw 快照 pause 前的流程）；`--template` 可换 snp 快照模板对照（vCPU 直接
-resume，无内核引导段）。不启动 openclaw gateway。开班自动做一次不计时的 lsblk
-双盘检查（vda RO base + vdb RW overlay，`--no-check` 跳过）。
+= build_bw 快照 pause 前的流程）。不启动 openclaw gateway。开班自动做一次不计时的
+lsblk 双盘检查（vda RO base + vdb RW overlay，`--no-check` 跳过）。
 
 ~~~bash
 python3 bench_coldstart_envd.py                # openclaw manifest 冷启 × 10
 python3 bench_coldstart_envd.py -n 50 -c 10    # 并发 10
 python3 bench_coldstart_envd.py --breakdown    # 拆 launch_wait(服务端启动) vs envd 首命令
-python3 bench_coldstart_envd.py --template openclaw32-v010-snp-template.id  # 快照对照
 ~~~
 
 计时口径：POST /sandboxes 在 admission 即返回（create_ms 仅数 ms）；`--breakdown`
@@ -379,27 +377,25 @@ envd 命令需 `user="root", cwd="/"`（openclaw 镜像无 `user` 账号与 /hom
 | 路径 | e2e p50 | 拆分 |
 |---|---|---|
 | img 真冷启（n=10） | ~3442ms | create 5.3 + launch_wait 840（node_ctl 8 + runner_pre 55 + **vm_entry 470** + kernel_boot 50 + guest_init 190 + envd 40）+ **exec_after_launch ~2500（envd 首命令冷缺页）** |
-| snp 暖快照恢复（n=5，openclaw32-v010） | ~215ms | create 4.4 + launch_wait 182（node_ctl 19 + sandbox_ctl 90 + sandbox_init 54 + envd 22）+ exec_after_launch 25 |
 
-img 路径分段语义：runner_pre = ctl 起进程→CH spawn（manifest fetch）；
+分段语义：runner_pre = ctl 起进程→CH spawn（manifest fetch）；
 vm_entry = CH spawn→`Run /sbin/init`（VM 固件/内核解压/早期引导）；
 kernel_boot = 首条 console→/sbin/init；guest_init = /sbin/init→app fork
 （sandbox-init overlay 组装，单次观测 vdb ext4 mount ~186ms）。
-snp 路径内核初始化不存在（vCPU 直接 resume）。
 
-**大头归因（exec_after_launch ~2.5s，2026-11-03 实测链）**：envd 全程应答
+**大头归因（exec_after_launch ~2.5s，2026-11-03 实测链 + 代码坐实）**：envd 全程应答
 /health 204；running 后等 3s 再发首命令依旧 ~2.4s；同沙箱第二命令仅 15ms；
 HTTP 层 40ms 即 200，耗时在响应流收尾；guest 侧 sandbox-init 日志显示首命令
 envd 会话 T+316→T+3246ms；窗口内 [lazy] 遥测 uffd ~4000 fault/s、pgin ~32k 页/s
-而 blk0 仅 0.8MB/s——**冷内存首触换页（零页/CoW 为主，非磁盘）**。
-快照路径因内存镜像已热，同段仅 25ms。优化抓手见 `probe_exec_gap.py` 复现脚本。
-
-**兼容性注意**：快照与宿主 sandboxer 协议强耦合——main 栈(3fa03fc)建的 snp 模板
-在 v0.1.10 下 restore 5/5 `readiness event 1 (control_ready): unexpected EOF`
-（反向亦然：main 宿主 + 旧 runtime bundle 冷启报
-`initial_launch_state_v1 is required for Launch`）。换 sandboxer 版本需用当前栈
-重建 snp 模板（参考 `openclaw32-v010-snp-template.id` 的生成方式：暖 envd 首命令
-→ pause → export toTemplate）。
+而 blk0 仅 0.8MB/s。表层机制=冷内存首触换页（零页/CoW，非磁盘）；**深层原因
+（2026-11-03 代码级确认）=启动期 balloon 大规模回收风暴与 fault 同锁串行**：
+默认配置开机要求 balloon 充入 ~7GiB，guest 释放产生 26-28 万次 uffd
+EVENT_REMOVE，sandbox-ctl 的 reader 在全局 installMu 内逐批处理 REMOVE
+（pkg/uffd/handler.go drain/dispatchRelease，"before any installer can
+proceed"），首命令的 zeropage fault 排在后面——fault_queue_wait p50 ~12ms
+即此排队。本栈沙箱配置即风暴条件：capacity 8GiB / allocatable 256MiB /
+startup 1GiB（开机充 7GiB）。旁证：startup 改 8GiB（充入量骤减，REMOVE ~1.6 万）
+首命令 195ms，allocatable 也 8GiB（几乎无回收，REMOVE=2）82ms。
 
 逐步复现（环境前置 / img 冷启 / 归因探针 / journal 手工核对 /
 优化修改点验证）见 `docs/coldstart-envd-repro-2026-11-03.md`。
