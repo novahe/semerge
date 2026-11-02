@@ -366,8 +366,15 @@ python3 bench_coldstart_envd.py --breakdown    # 拆 launch_wait(服务端启动
 
 计时口径：本栈 POST /sandboxes 在 admission 即返回（create_ms 仅数 ms），冷启动等待
 落在 exec 段；`--breakdown` 用 10ms 轮询 state=running 把 exec 段拆为
-launch_wait_ms 与 exec_after_launch_ms。2026-11-03 冒烟（v0.1.9，n=2）：
-e2e ≈ 200ms，launch_wait ≈ 160-180ms（大头），exec_after_launch ≈ 30-50ms。
+launch_wait_ms 与 exec_after_launch_ms。每样本完成后默认只读解析 conductor.log
+（sandbox launch phase 埋点）+ journal（sandbox-ctl 微秒行）输出服务端分段：
+node_ctl / sandbox_ctl（runner 侧）/ sandbox_init（guest restore 握手）/ envd；
+**快照恢复路径下内核初始化不存在**（内核不重新引导，vCPU 直接 resume）——
+`sandbox_ctl_ms = runtime_ready − restore-notify-ack`，与 node-ctl prepare 部分并行。
+2026-11-03 基线（v0.1.9，n=5，p50）：e2e 210.5 = create 4.2 + 服务端 165.8
+（node_ctl 21.3 + **sandbox_ctl 99.0（大头）** + sandbox_init 22.9 + envd 25.8）
++ exec_after_launch 27.5。conductor 写缓冲/journald 可见性有秒级延迟，内置重试
++收尾补齐（`--no-server` 关闭）。
 envd 命令需 `user="root", cwd="/"`（openclaw 镜像无 `user` 账号与 /home/user）。
 
 ## 文件说明

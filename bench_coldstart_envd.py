@@ -39,7 +39,9 @@ exec_after_launch_ms ≈ 该固定成本 + envd 真实执行,launch_wait_ms ≈ 
 import argparse
 import json
 import os
+import re
 import statistics
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,6 +57,93 @@ from e2b import Sandbox  # noqa: E402
 
 PARENT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TEMPLATE_FILE = "openclaw32-e2b-snp-template.id"  # 双盘:vda RO base + vdb 32G RW overlay
+CONDUCTOR_LOG = "/root/sandbox/nova-work/var/lib/logs/conductor.log"
+
+
+def _conductor_sid_lines(sid):
+    """grep 整个 conductor.log 取该 sid 的行。conductor 自身写盘有秒级缓冲,
+    增量偏移读会漏段;整文件 grep(~14MB)每次仅几十 ms,稳。"""
+    try:
+        r = subprocess.run(["grep", "-F", sid, CONDUCTOR_LOG],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.splitlines()
+    except Exception:
+        return []
+
+
+def _dur_to_ms(value, unit):
+    v = float(value)
+    return v / 1000.0 if unit == "µs" else (v * 1000.0 if unit == "s" else v)
+
+
+def server_phases(sid, since, until):
+    """样本完成后只读抽取该 sid 的服务端分阶段耗时(不影响事务计时)。
+
+    conductor.log『sandbox launch phase』给 node-ctl 侧各段与 runtime_ready/envd_init;
+    journal 的 sandbox-ctl 微秒行给 VM resume 时点与『restore notify acked』(guest 侧
+    sandbox-init 握手)。阶段口径:
+      node_ctl_ms       = admission + runner_commit + prepare(含 artifact/网络)
+      sandbox_init_ms   = restore notify ack 时长(VM resume→guest 握手完成)
+      sandbox_ctl_ms    = runtime_ready − sandbox_init(runner 侧:进程起/manifest/
+                          CH spawn/uffd/vhost;与 node-ctl prepare 部分并行)
+      kernel_init       = 快照恢复路径下不存在(内核不重新引导,vCPU 直接 resume)
+      envd_ms           = envd_init_duration
+    """
+    out = {}
+    phases = {}
+    for line in _conductor_sid_lines(sid):
+        m = re.search(r'phase=(\w+) duration=([\d.]+)(µs|ms|s)', line)
+        if m:
+            phases[m.group(1)] = _dur_to_ms(m.group(2), m.group(3))
+            continue
+        m = re.search(r'artifact_prepare_handoff_duration=([\d.]+)(µs|ms|s)', line)
+        if m:
+            phases["artifact_prepare"] = _dur_to_ms(m.group(1), m.group(2))
+            continue
+        m = re.search(r'starting_total_duration=([\d.]+)(µs|ms|s)', line)
+        if m:
+            phases["terminal_total"] = _dur_to_ms(m.group(1), m.group(2))
+    if phases:
+        out["phases"] = {k: round(v, 1) for k, v in phases.items()}
+        out["node_ctl_ms"] = round(phases.get("admission_duration", 0)
+                                   + phases.get("runner_commit_duration", 0)
+                                   + phases.get("prepare_duration", 0), 1)
+        out["envd_ms"] = round(phases.get("envd_init_duration", 0), 1)
+        out["server_total_ms"] = round(phases.get("terminal_total", 0), 1)
+
+    try:
+        # journald 有秒级可见性延迟:沙箱刚 kill 完立刻查可能拿不到,带重试
+        for attempt in range(5):
+            j = subprocess.run(["journalctl", "--since", since, "--until", until,
+                                "--no-pager"], capture_output=True, text=True,
+                               timeout=30).stdout
+            pid = None
+            for line in j.splitlines():
+                if sid in line:
+                    m = re.search(r'sandbox-ctl\[(\d+)\]', line)
+                    if m:
+                        pid = m.group(1)
+                        break
+            ack_us = None
+            if pid:
+                for line in j.splitlines():
+                    if f"[{pid}]" not in line:
+                        continue
+                    m = re.search(r'restore notify acked in (\d+)µs', line)
+                    if m:
+                        ack_us = int(m.group(1))
+                        break
+            if ack_us is not None:
+                out["sandbox_init_ms"] = round(ack_us / 1000.0, 1)
+                rr = phases.get("runtime_ready_duration")
+                if rr:
+                    out["sandbox_ctl_ms"] = round(rr - ack_us / 1000.0, 1)
+                break
+            if attempt < 4:
+                time.sleep(1.5)
+    except Exception as exc:
+        out["journal_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    return out
 
 
 def check_dual_disk(template):
@@ -135,7 +224,8 @@ def wait_state_running(sid, timeout=60, interval=0.01):
 
 def one_sample(index, template, cmd, breakdown=False):
     """一次完整事务:create → envd cmd → (launchMs) → kill+清理。返回样本 dict。"""
-    sample = {"i": index, "ok": False, "sid": None, "error": None}
+    sample = {"i": index, "ok": False, "sid": None, "error": None,
+              "wall_start": datetime.now().isoformat(timespec="seconds")}
     sandbox = None
     try:
         t0 = time.perf_counter()
@@ -192,6 +282,9 @@ def main():
     ap.add_argument("--breakdown", action="store_true",
                     help="拆解 exec 段:admission 后 10ms 轮询 state=running,"
                          "分出 launch_wait_ms(服务端启动)与剩余(envd connect+首命令)")
+    ap.add_argument("--no-server", action="store_true",
+                    help="跳过服务端阶段抽取(默认每样本后只读解析 conductor.log"
+                         "+journal,输出 node_ctl/sandbox_ctl/sandbox_init/envd 分段)")
     args = ap.parse_args()
 
     template = resolve_template(args.template)
@@ -210,6 +303,10 @@ def main():
                    for i in range(args.samples)]
         for fut in as_completed(futures):
             s = fut.result()
+            if not args.no_server and s["sid"]:
+                s["server"] = server_phases(
+                    s["sid"], s["wall_start"],
+                    datetime.now().isoformat(timespec="seconds"))
             samples.append(s)
             with open(os.path.join(outdir, "samples.jsonl"), "a") as f:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
@@ -224,6 +321,32 @@ def main():
             if s["error"]:
                 line += f" err={s['error'][:120]}"
             print(line, flush=True)
+            srv = s.get("server") or {}
+            if srv:
+                print(f"      server: node_ctl={srv.get('node_ctl_ms')}"
+                      f" sandbox_ctl={srv.get('sandbox_ctl_ms')}"
+                      f" sandbox_init={srv.get('sandbox_init_ms')}"
+                      f" envd={srv.get('envd_ms')}"
+                      f" total={srv.get('server_total_ms')}", flush=True)
+
+    # 收尾补齐:conductor 写缓冲/journald 延迟可能导致个别样本缺键,统一重抽后重写 jsonl
+    if not args.no_server:
+        changed = False
+        for s in samples:
+            sp = s.get("server") or {}
+            if s["sid"] and (sp.get("node_ctl_ms") is None
+                             or sp.get("sandbox_init_ms") is None):
+                fixed = server_phases(
+                    s["sid"], s["wall_start"],
+                    datetime.now().isoformat(timespec="seconds"))
+                merged = dict(sp)
+                merged.update({k: v for k, v in fixed.items() if v is not None})
+                s["server"] = merged
+                changed = True
+        if changed:
+            with open(os.path.join(outdir, "samples.jsonl"), "w") as f:
+                for s in samples:
+                    f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     ok = [s for s in samples if s["ok"]]
     result = {
@@ -246,6 +369,13 @@ def main():
         result["exec_after_launch_ms"] = stats(
             [round(s["exec_ms"] - s["launch_wait_ms"], 1)
              for s in ok if "launch_wait_ms" in s])
+    if not args.no_server:
+        for key in ("node_ctl_ms", "sandbox_ctl_ms", "sandbox_init_ms",
+                    "envd_ms", "server_total_ms"):
+            vals = [s["server"][key] for s in ok
+                    if s.get("server") and s["server"].get(key) is not None]
+            if vals:
+                result[key] = stats(vals)
     with open(os.path.join(outdir, "result.json"), "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
