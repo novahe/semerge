@@ -352,11 +352,30 @@ build_bw_code_interpreter.py：
 | RUN_TIMEOUT | 60 | 单次 `commands.run` 或 `run_code` 执行超时秒数 |
 | BRIDGE_READY_TIMEOUT | 120 | 49999/health readiness 等待秒数 |
 
+## coldstart-envd 基准（bench_coldstart_envd.py）
+
+单模板冷启动事务基准：e2b create（双盘 openclaw32-e2b-snp，vda RO base + vdb 32G RW
+overlay）→ envd 首命令 `true` 返回成功 = 一次。不启动 openclaw gateway，不构建模板。
+开班自动做一次不计时的 lsblk 双盘检查（`--no-check` 跳过）。
+
+~~~bash
+python3 bench_coldstart_envd.py                # 默认 10 样本串行
+python3 bench_coldstart_envd.py -n 50 -c 10    # 并发 10
+python3 bench_coldstart_envd.py --breakdown    # 拆 launch_wait(服务端启动) vs envd 首命令
+~~~
+
+计时口径：本栈 POST /sandboxes 在 admission 即返回（create_ms 仅数 ms），冷启动等待
+落在 exec 段；`--breakdown` 用 10ms 轮询 state=running 把 exec 段拆为
+launch_wait_ms 与 exec_after_launch_ms。2026-11-03 冒烟（v0.1.9，n=2）：
+e2e ≈ 200ms，launch_wait ≈ 160-180ms（大头），exec_after_launch ≈ 30-50ms。
+envd 命令需 `user="root", cwd="/"`（openclaw 镜像无 `user` 账号与 /home/user）。
+
 ## 文件说明
 
 | 文件 | 作用 |
 |---|---|
 | bench.py | 执行 B/W 基准，支持 health、exec、command、code 探针 |
+| bench_coldstart_envd.py | 单模板冷启动 → envd 首命令事务基准（create→true 计时/拆解） |
 | build_bw_coldboot.py | 生成 openclaw e2b/bare B/W 快照 |
 | build_bw_code_interpreter.py | 从 manifest 生成 code-interpreter e2b B/W 快照 |
 | openclaw_net.py | node-proxy 与 gateway 请求辅助 |
