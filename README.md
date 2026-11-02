@@ -401,7 +401,7 @@ envd 会话 T+316→T+3246ms；窗口内 [lazy] 遥测 uffd ~4000 fault/s、pgin
 重建 snp 模板（参考 `openclaw32-v010-snp-template.id` 的生成方式：暖 envd 首命令
 → pause → export toTemplate）。
 
-逐步复现（环境前置 / img 冷启 / snp 模板重建 / 归因探针 / journal 手工核对 /
+逐步复现（环境前置 / img 冷启 / 归因探针 / journal 手工核对 /
 优化修改点验证）见 `docs/coldstart-envd-repro-2026-11-03.md`。
 
 ## 文件说明

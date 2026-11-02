@@ -3,12 +3,11 @@
 - 日期:2026-11-03 / 栈:kuasar-sandbox **release-v0.1.10 全栈**(sandboxer 含 #378 修复)
 - 场景:e2b create 双盘沙箱(openclaw manifest)→ envd 首命令 `true` 返回 = 一次
 - 结论先行:img 真冷启 e2e p50 **3442ms**,其中 **exec_after_launch ~2.5s = 冷内存首触换页**
-  (零页/CoW 为主,非磁盘);snp 暖快照对照同段仅 25ms。完整数据见 README「coldstart-envd 基准」。
+  (零页/CoW 为主,非磁盘)。完整数据见 README「coldstart-envd 基准」。
 
 ## 0. 环境前置
 
-1. nova 节点跑 release-v0.1.10 全栈(部署/回滚见 `deploy/deploy-ns.sh replace`;
-   注意:**snp 模板与 sandboxer 协议强耦合**,换版本须用当前栈重建,见步骤 ②)。
+1. nova 节点跑 release-v0.1.10 全栈(部署/回滚见 `deploy/deploy-ns.sh replace`)。
 2. 环境变量钉住 nova tenant(bench 已内置同样兜底,手工操作时必须显式设):
 
    ```bash
@@ -20,7 +19,7 @@
 3. 确认 manifest 源里存在 openclaw manifest(KEY `7e78b050c656…`,bench 默认值)。
 4. envd 命令必须 `user="root", cwd="/"`(openclaw 镜像无 `user` 账号与 /home/user)。
 
-## ① img 真冷启基准(主路径)
+## ① img 真冷启基准
 
 ```bash
 cd /root/sandbox/semerge
@@ -46,41 +45,7 @@ python3 bench_coldstart_envd.py --breakdown          # 默认 manifest KEY 冷�
 | kernel_boot | 内核→init | 首 console→`Run /sbin/init` |
 | guest_init | overlay 组装等 | `Run /sbin/init`→`launch: app_started` |
 
-## ② snp 暖快照对照(模板重建配方 + 对照跑)
-
-v0.1.10 下旧栈建的 snp 模板 restore 必死(`readiness event 1: unexpected EOF`),
-须用当前栈重建:
-
-```python
-# 重建脚本骨架(完整实现参考 build_bw_coldboot.py 的 pause_sandbox/export_sandbox)
-import e2b_env, time
-e2b_env.load()  # 已设 E2B_ENV_FILE
-
-sb = Sandbox.create(template=<manifest img 模板>, timeout=300)  # 等 state=running
-sid = sb.sandbox_id
-sb.commands.run("true", user="root", cwd="/", timeout=60)       # ① 暖:跑一次 true
-r = e2b_env.api_request("POST", f"/sandboxes/{sid}/pause", timeout=1800)  # ② 204
-time.sleep(3)        # checkpoint 落盘
-r = e2b_env.api_request("POST", f"/sandboxes/{sid}/export",
-                        json={"toTemplate": True, "keepSource": True}, timeout=1800)  # ③
-template_id = r.json()["template_id"]   # e2b-snp-file://… 写入 xxx.id 文件
-```
-
-要点:export 必带 `keepSource: True`(#197 起默认删源);pause 可选
-`X-Kuasar-Sandbox-Checkpoint` 头控 drop_caches/merge_ref(暖快照用
-`{"drop_caches":false,"merge_ref":false}`,本对照用默认即可)。
-
-对照跑:
-
-```bash
-python3 bench_coldstart_envd.py --breakdown -n 5 --template openclaw32-v010-snp-template.id
-```
-
-**预期(n=5)**:e2e ~215ms = create 4.4 + launch_wait 182(sandbox_ctl 90 +
-sandbox_init 54 + envd 22)+ **exec_after_launch 25**。与 ① 的 exec 段差(~2.5s)
-即"冷内存"的代价。
-
-## ③ exec_after_launch ~2.5s 归因复现
+## ② exec_after_launch ~2.5s 归因复现
 
 ```bash
 python3 probe_exec_gap.py     # 自动两轮:A running 即发;B running 后等 3s 再发
@@ -103,7 +68,7 @@ grep '\[lazy\]' $D/journal-1-*.log
 结论链:envd 全程 204 → 等 3s 无效 → 二次命令 15ms → HTTP 40ms → guest 首命令
 会话 2.9s → uffd/pgin 高而盘读≈0 ⇒ **冷内存首触换页(零页/CoW),非磁盘、非 envd 慢热、非网络**。
 
-## ④ journal 手工核对(v0.1.10 格式)
+## ③ journal 手工核对(v0.1.10 格式)
 
 v0.1.10 起 `SYSLOG_IDENTIFIER` 是裸 `sandbox-ctl`/`console`(pid 在 `_PID`,sid 只在
 消息文本里),µs 时间轴用 JSON 输出:
@@ -116,8 +81,7 @@ journalctl -o json _PID=<pid> --since <起点> | jq -r '[..__REALTIME_TIMESTAMP,
 ```
 
 关键标记行:`CH started pid=`(runner_pre 终点)、`Run /sbin/init as init process`
-(vm_entry 终点)、`launch: app_started`(guest_init 终点)、
-`restore notify acked in Nµs`(仅 snp 路径)。
+(vm_entry 终点)、`launch: app_started`(guest_init 终点)。
 
 ## 优化修改点(按收益排序,验证方式 = 重跑 ① 看对应段)
 
