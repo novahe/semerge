@@ -7,8 +7,12 @@
 | balloon-inflate-runs.patch | 应用到 v51.1 + sandboxer 现有 12 个 native patches 后的 CH 源码 |
 | cold-zero-prefill-256k.patch | 应用到 sandboxer 185f50b 的 256KiB 对照 |
 | cold-zero-prefill-1m.patch | 应用到 sandboxer 185f50b 的 1MiB 对照；与 256KiB 二选一 |
+| cold-start-scope-tests.patch | 仅补充测试：全零快照、非零父源及 Released 保持原策略；可应用到 baseline 或预填 PoC |
+| probe_cold_uffd_wp.c | 冷启动 WP 注册但不保护的独立内核机制 probe，尚非 VM 集成 |
 | Cargo.lock | 本次 CH 构建的依赖锁，SHA256 `da048c19408bebd62dbb76f5ef94fe8836bd54b5bfabfba0be0cb2e14e740b2d` |
 | validate_runtime.py | 实际二进制身份、完整回收、pause/resume 活性与内容校验 |
+
+后续冷启动范围约束、策略调研及 probe 使用方式见 [COLD_ONLY_STRATEGIES.md](../COLD_ONLY_STRATEGIES.md)。
 
 ## 本机已有构件
 

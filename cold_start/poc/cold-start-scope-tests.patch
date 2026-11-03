@@ -1,0 +1,102 @@
+diff --git a/pkg/uffd/cold_start_scope_test.go b/pkg/uffd/cold_start_scope_test.go
+new file mode 100644
+index 0000000..5e278dd
+--- /dev/null
++++ b/pkg/uffd/cold_start_scope_test.go
+@@ -0,0 +1,96 @@
++package uffd
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
++	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
++	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
++)
++
++// All-zero logical snapshot contents do not turn a restore into a cold boot.
++func TestRestoreAllZeroKeepsLegacyZeroWindow(t *testing.T) {
++	const pages = 80
++	const size = pages * PageSize
++	stream, _ := openSnapshotManifest(t, &codec.Manifest{
++		Version:   codec.Version1,
++		ImageSize: size,
++		Entries:   []codec.ChunkEntry{{Offset: 0, Size: size, IsZero: true}},
++	}, nil)
++	source, err := NewStreamSnapshotSource(stream, size)
++	if err != nil {
++		t.Fatal(err)
++	}
++	run, err := source.RunAt(0, size)
++	if err != nil || run.Kind() != sparse.Zero {
++		t.Fatalf("fixture is not an all-zero snapshot: %v", err)
++	}
++	h := newUnitHandler(t, size, source)
++	ioctls := newFakeIoctls()
++	h.ops = ioctls.ops()
++	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
++	startUnitTail(t, h)
++	waitUnitTail(t, h)
++	calls := ioctls.snapshot()
++	if len(calls) != 2 || calls[0].length != PageSize || calls[1].length != 15*PageSize {
++		t.Fatalf("restore zero window changed: call count=%d", len(calls))
++	}
++	if h.state.Get(16) != StateAbsent {
++		t.Fatal("restore prefetched beyond legacy 64KiB")
++	}
++}
++
++func TestRestoreSparseUpperKeepsNonzeroParent(t *testing.T) {
++	const size = 80 * PageSize
++	payload := bytes.Repeat([]byte{0x77}, size)
++	parent, err := sparse.NewSource(bytes.NewReader(payload), size, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	upper, err := sparse.NewSource(bytes.NewReader(make([]byte, size)), size,
++		[]sparse.Extent{{Offset: 0, Size: size}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	source, err := NewStreamSnapshotSource(fetch.NewLayered(testStream{Source: upper}, testStream{Source: parent}), size)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h := newUnitHandler(t, size, source)
++	ioctls := newFakeIoctls()
++	h.ops = ioctls.ops()
++	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
++	startUnitTail(t, h)
++	waitUnitTail(t, h)
++	calls := ioctls.snapshot()
++	if len(calls) != 2 || calls[0].length != PageSize || calls[1].length != 15*PageSize {
++		t.Fatalf("restore data window changed: call count=%d", len(calls))
++	}
++	for _, call := range calls {
++		if call.kind != "copy" || !bytes.Equal(call.data, bytes.Repeat([]byte{0x77}, int(call.length))) {
++			t.Fatal("sparse snapshot upper hid nonzero parent data")
++		}
++	}
++	if h.state.Get(16) != StateAbsent {
++		t.Fatal("ordinary restore data exceeded legacy 64KiB")
++	}
++}
++
++func TestColdReleasedPagesKeepLegacyZeroWindow(t *testing.T) {
++	const pages = 80
++	h := newUnitHandler(t, pages*PageSize, ZeroSource{})
++	h.state.SetRange(0, pages, StateReleased)
++	ioctls := newFakeIoctls()
++	h.ops = ioctls.ops()
++	h.handleFault(faultEvent{address: unitCHVA, uffdFD: unitFD}, make([]byte, PageSize))
++	startUnitTail(t, h)
++	waitUnitTail(t, h)
++	calls := ioctls.snapshot()
++	if len(calls) != 2 || calls[0].length != PageSize || calls[1].length != 15*PageSize {
++		t.Fatalf("Released window changed: call count=%d", len(calls))
++	}
++	if h.state.Get(16) != StateReleased {
++		t.Fatal("Released prefetch exceeded legacy 64KiB")
++	}
++}

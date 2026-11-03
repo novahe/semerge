@@ -1,5 +1,7 @@
 # 冷启动优化 PoC：balloon range 合并 + 冷启动零页预填
 
+后续范围约束与官方资料调研见 [COLD_ONLY_STRATEGIES.md](COLD_ONLY_STRATEGIES.md)：零页优化限定冷启动；当前 CH balloon 合并 PoC 仍作用于共享路径，严格隔离恢复需要补充冷启动开关。新候选仅完成内核机制验证。
+
 2026-11-03，隔离 namespace `balpoc` 实测。**两项优化均已实现并验证有效**，资源参数保持 capacity=8GiB、allocatable=256MiB、startup=1GiB、2 vCPU。
 
 组合方案的端到端 p50 从 **3449.220ms 降到 582.601ms（-83.11%）**；首条 exec 从 **2698.794ms 降到 126.809ms（-95.30%）**。每组 10 次，新建 img 沙箱，首命令 `true`，无 strace/perf；四组全部成功、七项齐全、客户端计时闭合、删除最终为 HTTP 404。

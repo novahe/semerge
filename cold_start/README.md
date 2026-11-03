@@ -1,6 +1,12 @@
 # 冷启动各级耗时：采集、离线重算和优化前后对照
 
+后续范围约束与官方资料调研见 [COLD_ONLY_STRATEGIES.md](COLD_ONLY_STRATEGIES.md)：零页优化限定冷启动；当前 CH balloon 合并 PoC 仍作用于共享路径，严格隔离恢复需要补充冷启动开关。新候选仅完成内核机制验证。
+
+两项代码修改与实验过程见 [OPTIMIZATION_PROCESS.md](OPTIMIZATION_PROCESS.md)。
+
 `cold_start/bench.py` 在 Nova 节点上直接创建真实 img 冷启动沙箱，等待 running，执行首条 `true`，删除并确认 GET 404 后，自动汇总七个必需阶段。每个样本是新沙箱，不先运行命令预热。测量对象为 envd 首命令，不包括 OpenClaw gateway 就绪。
+
+本轮优化结论汇总见 [SUMMARY.md](SUMMARY.md)。
 
 目录结构：
 
