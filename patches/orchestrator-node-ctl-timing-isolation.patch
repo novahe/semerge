@@ -1,11 +1,11 @@
 diff --git a/internal/api/api.go b/internal/api/api.go
-index 2f37fc9e65a9e2c5c661b49ebc41bd5ca2a0a401..57c2e9591c3a34a0d80b04b1ff1a19fdd72e885f 100644
+index 48c0a4c..855b447 100644
 --- a/internal/api/api.go
 +++ b/internal/api/api.go
-@@ -1202,6 +1202,12 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
- 	d["startedAt"] = isoUnix(sb.CreatedUnix)
+@@ -1433,6 +1433,12 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
  	d["endAt"] = isoUnix(sandboxEndUnix(sb))
  	d["metadata"] = sb.Metadata
+ 	addSandboxTerminalFields(d, sb)
 +	if sb.LaunchDurationMs > 0 {
 +		d["launchMs"] = sb.LaunchDurationMs // server-measured accepted→terminal launch wall (ms)
 +	}
@@ -16,7 +16,7 @@ index 2f37fc9e65a9e2c5c661b49ebc41bd5ca2a0a401..57c2e9591c3a34a0d80b04b1ff1a19fd
  }
  
 diff --git a/internal/configsock/readiness.go b/internal/configsock/readiness.go
-index d9c03a7118d22646ad1ef6b5cf5f2bda4ad33cbb..71b8c8aa522810f64092fb63141e0ac2747702ec 100644
+index 485fb7e..9a0f075 100644
 --- a/internal/configsock/readiness.go
 +++ b/internal/configsock/readiness.go
 @@ -2,10 +2,12 @@ package configsock
@@ -29,10 +29,10 @@ index d9c03a7118d22646ad1ef6b5cf5f2bda4ad33cbb..71b8c8aa522810f64092fb63141e0ac2
  	"io"
  	"path/filepath"
 +	"strings"
- )
  
- const (
-@@ -13,9 +15,21 @@ const (
+ 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
+ )
+@@ -15,9 +17,21 @@ const (
  	ReadinessReady        = "ready"
  
  	readinessSocketName = "ready.sock"
@@ -54,8 +54,8 @@ index d9c03a7118d22646ad1ef6b5cf5f2bda4ad33cbb..71b8c8aa522810f64092fb63141e0ac2
 +
  // ReadinessSocketPath is the one-shot runtime readiness socket shared by the
  // orchestrator and node-ctl. It deliberately is not part of LaunchSpec: the
- // assigned sandbox ID and run root already define the path for both processes.
-@@ -27,17 +41,50 @@ func ReadinessSocketPath(runRoot, sandboxID string) string {
+ // assigned SandboxID and node RunRoot already define the SandboxRunDir for both
+@@ -30,17 +44,50 @@ func ReadinessSocketPath(runRoot, sandboxID string) string {
  // deliberately tiny and closed: exactly control_ready, ready, then EOF. Keeping
  // the parser here makes the UDS bridge and builder pipe enforce one protocol.
  func ReadReadiness(r io.Reader) error {
@@ -109,7 +109,7 @@ index d9c03a7118d22646ad1ef6b5cf5f2bda4ad33cbb..71b8c8aa522810f64092fb63141e0ac2
  	switch {
  	case errors.Is(err, io.EOF):
 diff --git a/internal/configsock/readiness_test.go b/internal/configsock/readiness_test.go
-index 419f7ebdcb167c9f08b656478137796978cef334..301622ff9aa60ee6a367be3acc0f46e3a8f4735a 100644
+index 42b8e70..1c3bc6c 100644
 --- a/internal/configsock/readiness_test.go
 +++ b/internal/configsock/readiness_test.go
 @@ -12,6 +12,21 @@ func TestReadinessSocketPath(t *testing.T) {
@@ -135,20 +135,20 @@ index 419f7ebdcb167c9f08b656478137796978cef334..301622ff9aa60ee6a367be3acc0f46e3
  	tests := []struct {
  		name    string
 diff --git a/internal/orch/orch.go b/internal/orch/orch.go
-index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c48a61e90 100644
+index 677189e..db1be51 100644
 --- a/internal/orch/orch.go
 +++ b/internal/orch/orch.go
-@@ -65,6 +65,9 @@ type Orchestrator struct {
+@@ -76,6 +76,9 @@ type Orchestrator struct {
  	mu  sync.Mutex
  	reg map[string]*types.Sandbox // in-memory immutable snapshots (hot path: Route/LaunchSpecFor)
  
 +	launchDur    sync.Map // sid -> float64 ms: server-measured accepted→terminal launch wall (exposed via GET launchMs)
 +	launchTiming sync.Map // sid -> *types.LaunchTiming: in-memory launch points/phases
 +
- 	launches    launchGroup            // sole process-local owner of create and resume attempts
- 	acceptedOps acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
- 	buildOps    acceptedOperationGroup // claimed/recovered Builds drain before store/launcher close
-@@ -517,8 +520,87 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
+ 	launches          launchGroup            // sole process-local owner of create and resume attempts
+ 	acceptedOps       acceptedOperationGroup // accepted pauses/exports drain before shared dependencies close
+ 	buildWake         chan struct{}
+@@ -520,8 +523,87 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
  		"duration", duration)
  }
  
@@ -237,7 +237,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	result := "success"
  	failureStage := ""
  	if err != nil {
-@@ -528,10 +610,13 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+@@ -531,10 +613,13 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  			err = errors.Join(err, rollbackErr)
  		}
  	}
@@ -255,7 +255,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	o.log.Info("sandbox launch terminal",
  		"sid", sb.ID,
  		"run_id", attempt.RunID(),
-@@ -539,7 +624,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+@@ -542,7 +627,9 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  		"profile", sb.Profile,
  		"result", result,
  		"failure_stage", failureStage,
@@ -264,9 +264,9 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
 +		"launch_timing", timing,
 +
  		"err", err)
- 	return err
- }
-@@ -547,7 +634,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
+ 	if err == nil {
+ 		o.requestDiskCheckpointRelease(sb.ID)
+@@ -553,7 +640,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
  // launchSandbox prepares all runner handoff inputs, then spends separate runner
  // assignment and runtime readiness budgets. The durable starting row already
  // exists and is never replaced by a stale whole-row Put.
@@ -275,16 +275,16 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	if sb == nil || attempt == nil || sb.State != types.StateStarting || sb.ID != attempt.SID() {
  		return launchFailed("prepare", fmt.Errorf("orch: launch requires its claimed starting sandbox"))
  	}
-@@ -555,7 +642,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -561,7 +648,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  		return launchFailed("prepare", errors.New("orch: launch resources were not preflighted"))
  	}
- 	if preparation.RestoreRef != "" {
--		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation)
-+		return o.launchRestoreSandbox(ctx, attempt, sb, tmpl, preparation, timeline)
+ 	if !preparation.Source.Empty() {
+-		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation)
++		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation, timeline)
  	}
  	prepareStarted := time.Now()
  	prepareLogged := false
-@@ -634,14 +721,17 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -640,14 +727,17 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  	}
  	o.logLaunchPhase(attempt, sb, "prepare_duration", time.Since(prepareStarted))
  	prepareLogged = true
@@ -296,30 +296,30 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
 +	timeline.point("runner_assign_start", assignStarted)
  	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
  	var commitStarted, commitFinished time.Time
- 	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+ 	runID, err := o.assignSandboxRunner(assignmentCtx, sb, preparation.Resources, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
  		commitStarted = time.Now()
 +		timeline.point("runner_commit_start", commitStarted)
  		// Serialize the runner-binding linearization point with Kill/Delete and
  		// other lifecycle mutations. If deletion wins, the exact CAS below misses
  		// and the pool never hands the task to this runner; if binding wins, the
-@@ -671,6 +761,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
- 		// worker can mint tokens during mandatory envd initialization.
+@@ -678,6 +768,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  		o.publishUpsert(bound)
+ 		o.observeSandboxUpsert(bound)
  		commitFinished = time.Now()
 +		timeline.point("runner_commit_done", commitFinished)
  		return nil
  	})
  	cancelAssignment()
-@@ -696,6 +787,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+@@ -703,6 +794,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
  		commitFinished = assignStarted
  	}
  	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
 +	timeline.point("runner_handoff_done", time.Now())
- 	launchTimeout := o.sandboxReadyTimeout
- 	if launchTimeout <= 0 {
- 		launchTimeout = 60 * time.Second
-@@ -706,18 +798,35 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
- 	launchCtx, cancelLaunch := context.WithTimeout(ctx, launchTimeout)
+ 	// Readiness and mandatory /init follow the accepted attempt owner. A
+ 	// positive explicitly supplied budget bounds both phases; ordinary launches
+ 	// have no extra overall deadline. Assignment and running TTL are separate.
+@@ -713,18 +805,35 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
+ 	}
  	defer cancelLaunch()
  	runtimeStarted := time.Now()
 -	err = waitRuntimeReadiness(launchCtx, readyListener)
@@ -356,7 +356,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	}
  	unlock = o.lifecycle.Lock(sb.ID)
  	defer unlock()
-@@ -970,6 +1079,13 @@ func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandb
+@@ -1131,6 +1240,13 @@ func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandb
  	if !ownsSandbox(sb, apiKey) {
  		return nil, api.ErrNotFound
  	}
@@ -370,7 +370,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	return sb, nil
  }
  
-@@ -2309,7 +2425,7 @@ func envdInitRetryDelay(failures int) time.Duration {
+@@ -3307,7 +3423,7 @@ func envdInitRetryDelay(failures int) time.Duration {
  // and the proxy already enforces X-Access-Token as the sole gate. With MMDS enabled
  // (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
  // to it — giving forks fresh per-identity tokens with envd-side enforcement too.
@@ -379,7 +379,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  	cl := udsClient(sb.EnvdUDS)
  	defer cl.CloseIdleConnections()
  
-@@ -2332,7 +2448,23 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
+@@ -3330,7 +3446,23 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
  			return fmt.Errorf("orch: create envd /init for %s: %w", sb.ID, err)
  		}
  		req.Header.Set("Content-Type", "application/json")
@@ -404,7 +404,7 @@ index 363bda2aa1e1001e88d98c52c4ddaa21420dddac..bed63585726920bdf2a074d7baa8e01c
  			resp.Body.Close()
  			if resp.StatusCode == http.StatusNoContent {
 diff --git a/internal/orch/readiness.go b/internal/orch/readiness.go
-index a21cd7161ffd63ee2fa4f12f7d05fecdac9efcf5..025bdec32bcadd6cb48c6b11aefbe9d20be15ee9 100644
+index a21cd71..025bdec 100644
 --- a/internal/orch/readiness.go
 +++ b/internal/orch/readiness.go
 @@ -50,14 +50,19 @@ func (l *runtimeReadinessListener) Close() {
@@ -448,10 +448,10 @@ index a21cd7161ffd63ee2fa4f12f7d05fecdac9efcf5..025bdec32bcadd6cb48c6b11aefbe9d2
 +	return timing, nil
  }
 diff --git a/internal/orch/readiness_test.go b/internal/orch/readiness_test.go
-index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77f4d6375a 100644
+index 5d79482..fbcbd32 100644
 --- a/internal/orch/readiness_test.go
 +++ b/internal/orch/readiness_test.go
-@@ -30,6 +30,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
+@@ -31,6 +31,7 @@ func TestWaitRuntimeReadinessProtocolAndCleanup(t *testing.T) {
  		wantCtxErr bool
  	}{
  		{name: "exact", wire: "control_ready\nready\n"},
@@ -459,7 +459,7 @@ index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77
  		{name: "EOF before control", wire: "", wantErr: true},
  		{name: "EOF before ready", wire: "control_ready\n", wantErr: true},
  		{name: "unknown", wire: "unknown\nready\n", wantErr: true},
-@@ -346,7 +347,7 @@ func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
+@@ -391,7 +392,7 @@ func TestEnvdInitPayloadPreservesMMDSCredentialPolicy(t *testing.T) {
  
  			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
  			defer cancel()
@@ -468,7 +468,16 @@ index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77
  				t.Fatal(err)
  			}
  			got := <-observed
-@@ -406,7 +407,7 @@ func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
+@@ -444,7 +445,7 @@ func TestEnvdInitAllowsSlowRequestWithinSharedDeadline(t *testing.T) {
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+ 	defer cancel()
+-	if err := o.envdInit(ctx, sb); err != nil {
++	if err := o.envdInit(ctx, sb, newLaunchTimeline(sb.Profile, time.Now())); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if got := attempts.Load(); got != 1 {
+@@ -477,7 +478,7 @@ func TestEnvdInitRetriesOnlyTransportErrors(t *testing.T) {
  
  	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
  	defer cancel()
@@ -477,7 +486,7 @@ index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77
  		t.Fatal(err)
  	}
  	select {
-@@ -432,7 +433,7 @@ func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
+@@ -503,7 +504,7 @@ func TestEnvdInitNon204FailsWithoutRetryOrResponseDetail(t *testing.T) {
  
  	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
  	defer cancel()
@@ -487,21 +496,21 @@ index 2f8a9de2a5598cac0e6f89abb3a2a2f553262f1c..b7dfd540bb6561fd2040b51af070aa77
  		t.Fatalf("envd /init error = %v", err)
  	}
 diff --git a/internal/orch/sandbox_task_prepare.go b/internal/orch/sandbox_task_prepare.go
-index aa92900c643eb008774ad72bd6561ccf1b70ed44..1483d69324a9af2dede57d7d0bea2d94fe24862c 100644
+index 8d6e3c4..c7698a9 100644
 --- a/internal/orch/sandbox_task_prepare.go
 +++ b/internal/orch/sandbox_task_prepare.go
-@@ -31,7 +31,7 @@ type prepareWaitResult struct {
- // launchRestoreSandbox owns the host half of the exact-run two-stage protocol.
+@@ -53,7 +53,7 @@ func awaitArtifactReadinessResult(ctx context.Context, result <-chan error) erro
+ // launchArtifactSandbox owns the host half of the exact-run two-stage protocol.
  // The conductor consumes only the task's non-secret summary; it never opens or
- // parses a snapshot artifact.
--func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
-+func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation, timeline *launchTimeline) (retErr error) {
+ // parses a tenant Artifact.
+-func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) (retErr error) {
++func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation, timeline *launchTimeline) (retErr error) {
  	prepareStarted := time.Now()
  	for _, dir := range []string{sb.RunDir, sb.BaseDir} {
  		if err := os.MkdirAll(dir, 0o700); err != nil {
-@@ -41,6 +41,9 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+@@ -63,6 +63,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
  	if err := os.Chmod(sb.RunDir, 0o700); err != nil {
- 		return launchFailed("snapshot_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
+ 		return launchFailed("artifact_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
  	}
 +	// restore 路径 host 侧入口准备极短，先落 node_prepare_done 锚点；
 +	// 两段式 snapshot prepare 归入后续 dispatch/pre_ch 相位。
@@ -509,51 +518,65 @@ index aa92900c643eb008774ad72bd6561ccf1b70ed44..1483d69324a9af2dede57d7d0bea2d94
  
  	// The listener exists before assignment becomes visible. node-ctl connects
  	// immediately after WaitAssignment, making a task exit during root reading an
-@@ -52,10 +55,12 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+@@ -74,6 +77,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
  	defer readyListener.Close()
  
  	assignStarted := time.Now()
 +	timeline.point("runner_assign_start", assignStarted)
  	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
  	var commitStarted, commitFinished time.Time
- 	runID, err := o.runnerPool.Assign(assignmentCtx, sb.ID, func(runID string) error {
+ 	resourcePool := ""
+@@ -82,6 +86,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
+ 	}
+ 	runID, err := o.runnerPool.assignInResourcePool(assignmentCtx, resourcePool, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
  		commitStarted = time.Now()
 +		timeline.point("runner_commit_start", commitStarted)
  		unlock := o.lifecycle.Lock(sb.ID)
  		defer unlock()
  		changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
-@@ -79,6 +84,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
- 		}
+@@ -104,6 +109,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
  		o.publishUpsert(bound)
+ 		o.observeSandboxUpsert(bound)
  		commitFinished = time.Now()
 +		timeline.point("runner_commit_done", commitFinished)
  		return nil
  	})
  	cancelAssignment()
-@@ -101,6 +107,7 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+@@ -126,6 +132,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
  		attempt.SetRunID(runID)
  	}
  	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
 +	timeline.point("runner_handoff_done", time.Now())
  
- 	deadline := attempt.Deadline()
- 	if deadline.IsZero() {
-@@ -116,8 +123,10 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
+ 	launchCtx, cancelLaunch := context.WithCancel(ctx)
+ 	if deadline := attempt.Deadline(); !deadline.IsZero() {
+@@ -141,10 +148,10 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
  	}()
  
  	readinessResult := make(chan error, 1)
 +	var runtimeTiming *configsock.ReadinessTiming // 与 readinessResult 的通道收发构成 happens-before，读侧安全
  	go func() {
 -		readyErr := waitRuntimeReadiness(launchCtx, readyListener)
+-		// Publication must precede cancellation; awaitArtifactReadinessResult
+-		// relies on this boundary to preserve the concrete readiness failure.
 +		t, readyErr := waitRuntimeReadinessTiming(launchCtx, readyListener)
 +		runtimeTiming = t
  		readinessResult <- readyErr
  		if readyErr != nil {
  			cancelLaunch()
-@@ -224,17 +233,33 @@ func (o *Orchestrator) launchRestoreSandbox(ctx context.Context, attempt *launch
- 	case <-launchCtx.Done():
- 		err = launchCtx.Err()
- 	}
+@@ -259,7 +266,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
+ 				next := *preparation
+ 				next.Placement = &claim
+ 				next.Prepared = &summary
+-				return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, &next)
++				return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, &next, timeline)
+ 			}
+ 			preparation.Placement = &claim
+ 		}
+@@ -338,17 +345,33 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
+ 
+ 	runtimeStarted := time.Now()
+ 	err = awaitArtifactReadinessResult(launchCtx, readinessResult)
 +	timeline.point("runtime_ready_received", time.Now())
 +	if runtimeTiming != nil {
 +		if runtimeTiming.SandboxCtlStartUnixNs != 0 {
@@ -587,7 +610,7 @@ index aa92900c643eb008774ad72bd6561ccf1b70ed44..1483d69324a9af2dede57d7d0bea2d94
  	unlock = o.lifecycle.Lock(sb.ID)
 diff --git a/internal/orch/timing_test.go b/internal/orch/timing_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..351aea587179dfedf5b76159cb6702a29c22da21
+index 0000000..351aea5
 --- /dev/null
 +++ b/internal/orch/timing_test.go
 @@ -0,0 +1,54 @@
@@ -646,10 +669,10 @@ index 0000000000000000000000000000000000000000..351aea587179dfedf5b76159cb6702a2
 +	}
 +}
 diff --git a/internal/types/types.go b/internal/types/types.go
-index 242ae89e4cb9c4874d88c8415753f499c10c535d..768dde7a5e5b6ef151d551aafff8c8ef9d7112a1 100644
+index 12a9cf9..abc1c85 100644
 --- a/internal/types/types.go
 +++ b/internal/types/types.go
-@@ -46,6 +46,18 @@ const (
+@@ -225,6 +225,18 @@ const (
  	StateDead     State = "dead"
  )
  
@@ -668,12 +691,12 @@ index 242ae89e4cb9c4874d88c8415753f499c10c535d..768dde7a5e5b6ef151d551aafff8c8ef
  // MaxLocalSandboxIDBytes keeps <port>-<sandbox-id> within one 63-byte DNS label.
  const MaxLocalSandboxIDBytes = 57
  
-@@ -171,6 +183,8 @@ type Sandbox struct {
- 	Metadata           map[string]string
- 	Env                map[string]string
- 	CreatedUnix        int64
-+	LaunchDurationMs   float64       // accepted→terminal wall (server-measured); in-memory only, merged into GET responses
-+	LaunchTiming       *LaunchTiming // in-memory launch points/phases, merged into GET responses
+@@ -417,6 +429,8 @@ type Sandbox struct {
+ 	CreatedUnix           int64
+ 	DeadUnix              int64 // first durable dead commit; retries never extend retention
+ 	ExecutionResult       *SandboxExecutionResult
++	LaunchDurationMs      float64       // accepted→terminal wall (server-measured); in-memory only, merged into GET responses
++	LaunchTiming          *LaunchTiming // in-memory launch points/phases, merged into GET responses
  }
  
  // ClusterSandboxContext is trusted node-local ownership state supplied by the
