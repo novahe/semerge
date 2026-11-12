@@ -1,0 +1,8 @@
+# 运行产物与本地配置, 不入库
+bench.env
+bench-run*.log
+bench-soak-index.tsv
+run-loop.out
+run-loop.pid
+work/
+__pycache__/
